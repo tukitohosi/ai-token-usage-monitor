@@ -1,5 +1,7 @@
 # AI Token 用量监控
 
+简体中文 | [English](README.en.md)
+
 > 简明安装与使用说明见 [项目介绍与使用指南](项目介绍与使用指南.md)。
 
 一个面向 Windows 的本地优先 AI Token 活动工具。它把两类数据明确分开：
