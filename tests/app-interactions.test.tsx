@@ -37,6 +37,28 @@ describe("dashboard interactions", () => {
     }
   });
 
+  it("shows three identified quota cards and two local metric cards", async () => {
+    render(<App adapter={new MockDashboardAdapter("ready", 0)} />);
+    await screen.findByRole("heading", { name: "总览" });
+    expect(screen.getByText("Codex 5 小时")).toBeTruthy();
+    expect(screen.getByText("Codex 7 天")).toBeTruthy();
+    expect(screen.getByText("GPT-5.6 Luna 储备 7 天")).toBeTruthy();
+    expect(document.querySelectorAll(".overview-grid__quota")).toHaveLength(3);
+    expect(document.querySelectorAll(".overview-grid__local")).toHaveLength(2);
+  });
+
+  it("shows backend price rates and marks unpublished cache writes unpriced", async () => {
+    const user = userEvent.setup();
+    render(<App adapter={new MockDashboardAdapter("ready", 0)} />);
+    await user.click(await screen.findByRole("button", { name: "费用" }));
+    await user.click(screen.getByRole("button", { name: "查看定价口径" }));
+    expect(screen.getByText("GPT-6 Astra")).toBeTruthy();
+    expect(screen.getByText("DeepSeek V4.1 Flash")).toBeTruthy();
+    expect(screen.getByText("Tencent Hy4 preview")).toBeTruthy();
+    expect(screen.getAllByText("未公布/未计价").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("¥18")).toBeTruthy();
+  });
+
   it("supports selecting multiple AI sources", async () => {
     const user = userEvent.setup();
     render(<App adapter={new MockDashboardAdapter("ready", 0)} />);

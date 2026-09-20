@@ -22,6 +22,7 @@ describe("rate-limit normalization", () => {
         codex: {
           limitId: "inconsistent-inner-id",
           limitName: "Codex",
+          normalModelSlug: "gpt-5.6-sol",
           primary: {
             usedPercent: 40,
             windowDurationMins: 300,
@@ -53,6 +54,7 @@ describe("rate-limit normalization", () => {
       limitId: "codex",
       usedPercent: 40,
       remainingPercent: 60,
+      normalModelSlug: "gpt-5.6-sol",
     });
     expect(windows[1]).toMatchObject({
       key: "codex:secondary",
@@ -63,6 +65,35 @@ describe("rate-limit normalization", () => {
     expect(
       windows.some((window) => window.limitId === "inconsistent-inner-id"),
     ).toBe(false);
+  });
+
+  it("preserves Luna reserve model identity even when its bucket is first", () => {
+    const windows = normalizeRateLimits({
+      rateLimitsByLimitId: {
+        base_model_inference: {
+          limitName: "gpt-reserve",
+          normalModelSlug: "gpt-5.6-luna",
+          primary: { usedPercent: 100, windowDurationMins: 10_080, resetsAt: 20 },
+        },
+        codex: {
+          primary: { usedPercent: 15, windowDurationMins: 300, resetsAt: 10 },
+          secondary: { usedPercent: 21, windowDurationMins: 10_080, resetsAt: 20 },
+        },
+      },
+    });
+    expect(windows).toHaveLength(3);
+    expect(windows.map((window) => window.key)).toEqual([
+      "codex:primary",
+      "codex:secondary",
+      "base_model_inference:primary",
+    ]);
+    expect(windows[2]).toMatchObject({
+      limitId: "base_model_inference",
+      limitName: "gpt-reserve",
+      normalModelSlug: "gpt-5.6-luna",
+      remainingPercent: 0,
+    });
+    expect(windows.filter((window) => window.limitId === "codex")).toHaveLength(2);
   });
 
   it("falls back to the historical bucket when the multi-bucket map is empty", () => {

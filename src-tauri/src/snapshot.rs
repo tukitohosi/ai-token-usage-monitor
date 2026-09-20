@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
+use std::time::Instant;
 
 use crate::app_server::{
     version_from_user_agent, AccountUsageReadResult, AppServerClient, AppServerError,
@@ -89,11 +90,20 @@ pub(crate) struct RefreshSchedule {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct AccountReadDiagnostics {
+    pub(crate) read_at: String,
+    pub(crate) duration_ms: u64,
+    pub(crate) methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DashboardSnapshot {
     pub(crate) status: &'static str,
     pub(crate) fetched_at: Option<String>,
     pub(crate) codex_version: Option<String>,
     pub(crate) quota_windows: Vec<NormalizedQuotaWindow>,
+    pub(crate) account_diagnostics: Option<AccountReadDiagnostics>,
     // App Server does not expose subscription renewal dates. Never substitute a
     // quota-window reset timestamp here.
     pub(crate) plan_renewal_at: Option<String>,
@@ -116,6 +126,7 @@ impl DashboardSnapshot {
             fetched_at: Some(fetched_at),
             codex_version: None,
             quota_windows: Vec::new(),
+            account_diagnostics: None,
             plan_renewal_at: None,
             plan_renewal_source: None,
             reset_credits: None,
@@ -132,29 +143,47 @@ impl DashboardSnapshot {
 }
 
 pub(crate) fn read_dashboard_snapshot() -> DashboardSnapshot {
+    let read_started = Instant::now();
     let fetched_at = Utc::now().to_rfc3339();
     let mut client = match AppServerClient::connect() {
         Ok(client) => client,
-        Err(error) => return connection_failure(error, fetched_at),
+        Err(error) => {
+            return with_account_diagnostics(
+                connection_failure(error, fetched_at.clone()),
+                fetched_at,
+                read_started,
+                Vec::new(),
+            )
+        }
     };
     let codex_version = version_from_user_agent(&client.server_user_agent);
 
     let account = match client.account_read() {
         Ok(account) => account,
         Err(error) => {
-            let mut snapshot = connection_failure(error, fetched_at);
+            let mut snapshot = connection_failure(error, fetched_at.clone());
             snapshot.codex_version = codex_version;
-            return snapshot;
+            return with_account_diagnostics(
+                snapshot,
+                fetched_at,
+                read_started,
+                client.account_rpc_methods(),
+            );
         }
     };
     if account.requires_openai_auth && !account.account_present {
         let mut snapshot = DashboardSnapshot::empty(
             "unauthenticated",
-            fetched_at,
+            fetched_at.clone(),
             "Codex 尚未登录；登录后可读取账号额度，本机历史统计仍可使用。",
         );
         snapshot.codex_version = codex_version;
-        return snapshot;
+        return with_account_diagnostics(
+            snapshot,
+            fetched_at,
+            read_started,
+            client.account_rpc_methods(),
+        );
     }
 
     let rate_limits = client.rate_limits_read();
@@ -168,7 +197,7 @@ pub(crate) fn read_dashboard_snapshot() -> DashboardSnapshot {
                 .is_err_and(AppServerError::is_unsupported_method);
         let mut snapshot = DashboardSnapshot::empty(
             if unsupported { "unsupported" } else { "error" },
-            fetched_at,
+            fetched_at.clone(),
             if unsupported {
                 "当前 Codex 版本不支持所需的账号用量接口；本机历史统计仍可使用。"
             } else {
@@ -176,28 +205,53 @@ pub(crate) fn read_dashboard_snapshot() -> DashboardSnapshot {
             },
         );
         snapshot.codex_version = codex_version;
-        return snapshot;
+        return with_account_diagnostics(
+            snapshot,
+            fetched_at,
+            read_started,
+            client.account_rpc_methods(),
+        );
     }
 
     let partial = rate_limits.is_err() || account_usage.is_err();
     let (quota_windows, reset_credits) = rate_limits.unwrap_or_default();
-    DashboardSnapshot {
-        status: "ready",
-        fetched_at: Some(fetched_at.clone()),
-        codex_version,
-        quota_windows,
-        plan_renewal_at: None,
-        plan_renewal_source: None,
-        reset_credits,
-        account_usage: account_usage.ok(),
-        device_usage: None,
-        last_successful_at: Some(fetched_at.clone()),
-        refresh_progress: None,
-        refresh_schedule: None,
-        source_health: Vec::new(),
-        index_diagnostics: None,
-        message: partial.then(|| "部分账号用量暂不可用。".to_owned()),
-    }
+    with_account_diagnostics(
+        DashboardSnapshot {
+            status: "ready",
+            fetched_at: Some(fetched_at.clone()),
+            codex_version,
+            quota_windows,
+            account_diagnostics: None,
+            plan_renewal_at: None,
+            plan_renewal_source: None,
+            reset_credits,
+            account_usage: account_usage.ok(),
+            device_usage: None,
+            last_successful_at: Some(fetched_at.clone()),
+            refresh_progress: None,
+            refresh_schedule: None,
+            source_health: Vec::new(),
+            index_diagnostics: None,
+            message: partial.then(|| "部分账号用量暂不可用。".to_owned()),
+        },
+        fetched_at,
+        read_started,
+        client.account_rpc_methods(),
+    )
+}
+
+fn with_account_diagnostics(
+    mut snapshot: DashboardSnapshot,
+    read_at: String,
+    started: Instant,
+    methods: Vec<String>,
+) -> DashboardSnapshot {
+    snapshot.account_diagnostics = Some(AccountReadDiagnostics {
+        read_at,
+        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        methods,
+    });
+    snapshot
 }
 
 fn connection_failure(error: AppServerError, fetched_at: String) -> DashboardSnapshot {
@@ -229,6 +283,7 @@ mod tests {
         let snapshot = connection_failure(AppServerError::NotFound, "now".to_owned());
         assert_eq!(snapshot.status, "unsupported");
         assert_eq!(snapshot.plan_renewal_at, None);
+        assert!(snapshot.account_diagnostics.is_none());
     }
 
     #[test]

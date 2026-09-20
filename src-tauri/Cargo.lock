@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "codex-usage-monitor"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "blake3",
  "chrono",

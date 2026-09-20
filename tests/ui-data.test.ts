@@ -10,6 +10,7 @@ import {
   toEpochMilliseconds,
 } from "../src/ui/format.js";
 import { createMockDashboardSnapshot } from "../src/ui/mock-data.js";
+import { selectOverviewQuotas } from "../src/ui/quota-view-model.js";
 
 describe("UI data safety and formatting", () => {
   it("formats trend tooltips with only rounded 万/亿 units", () => {
@@ -35,10 +36,50 @@ describe("UI data safety and formatting", () => {
 
     expect(snapshot.message).toContain("演示模式");
     expect(snapshot.message).toContain("不是您的真实");
-    expect(snapshot.quotaWindows).toHaveLength(2);
+    expect(snapshot.quotaWindows).toHaveLength(3);
     expect(snapshot.quotaWindows.some((quota) => quota.limitName === "弹性调用")).toBe(false);
     expect(snapshot.planRenewalAt).toBeNull();
     expect(snapshot.planRenewalSource).toBeNull();
+  });
+
+  it("selects Codex and Luna quota cards by identity regardless of bucket order", () => {
+    const snapshot = createMockDashboardSnapshot("ready");
+    const unknown = {
+      ...snapshot.quotaWindows[0],
+      key: "future:primary",
+      limitId: "future",
+      limitName: "Future quota",
+      normalModelSlug: null,
+    };
+    const shuffled = [
+      snapshot.quotaWindows[2],
+      unknown,
+      snapshot.quotaWindows[0],
+      snapshot.quotaWindows[1],
+    ];
+
+    const selected = selectOverviewQuotas(shuffled);
+    expect(selected.map(({ title, quota }) => [title, quota.key])).toEqual([
+      ["Codex 5 小时", "codex-primary"],
+      ["Codex 7 天", "codex-secondary"],
+      ["GPT-5.6 Luna 储备 7 天", "base_model_inference:primary"],
+    ]);
+    expect(selected[1].quota.remainingPercent).toBe(61.5);
+    expect(selected[2].quota.remainingPercent).toBe(0);
+  });
+
+  it("does not invent missing quota cards and tolerates partial Luna identity", () => {
+    const snapshot = createMockDashboardSnapshot("ready");
+    const reserve = {
+      ...snapshot.quotaWindows[0],
+      limitId: "future-id",
+      limitName: null,
+      normalModelSlug: "gpt-5.6-luna",
+    };
+    expect(selectOverviewQuotas([reserve]).map((item) => item.title)).toEqual([
+      "GPT-5.6 Luna 储备 7 天",
+    ]);
+    expect(selectOverviewQuotas([])).toEqual([]);
   });
 
   it("presents remaining quota as primary and warns only when little remains", () => {

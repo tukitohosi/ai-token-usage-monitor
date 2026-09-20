@@ -100,6 +100,70 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const ACCOUNT_READ_METHODS = new Set([
+  "account/read",
+  "account/rateLimits/read",
+  "account/usage/read",
+]);
+
+function normalizeAccountDiagnostics(value: unknown): DashboardSnapshot["accountDiagnostics"] {
+  if (value === undefined || value === null) return null;
+  if (
+    !isRecord(value)
+    || typeof value.readAt !== "string"
+    || typeof value.durationMs !== "number"
+    || !Number.isFinite(value.durationMs)
+    || value.durationMs < 0
+    || !Array.isArray(value.methods)
+    || !value.methods.every((method) => typeof method === "string" && ACCOUNT_READ_METHODS.has(method))
+  ) {
+    throw new Error("桌面端返回了无法识别的账号读取诊断。");
+  }
+  return {
+    readAt: value.readAt,
+    durationMs: value.durationMs,
+    methods: [...value.methods],
+  };
+}
+
+function normalizeDeviceUsage(value: unknown): DashboardSnapshot["deviceUsage"] {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw new Error("桌面端返回了无法识别的本机用量数据。");
+  const rawCatalog = value.priceCatalog;
+  if (!(rawCatalog === undefined || Array.isArray(rawCatalog))) {
+    throw new Error("桌面端返回了无法识别的价格目录。");
+  }
+  const priceCatalog = (rawCatalog ?? []).map((entry) => {
+    if (
+      !isRecord(entry)
+      || typeof entry.displayName !== "string"
+      || typeof entry.modelId !== "string"
+      || !Array.isArray(entry.aliases)
+      || !entry.aliases.every((alias) => typeof alias === "string")
+      || (entry.currency !== "USD" && entry.currency !== "CNY")
+      || typeof entry.sourceLabel !== "string"
+      || !Array.isArray(entry.tiers)
+    ) throw new Error("桌面端返回了无法识别的价格目录条目。");
+    const tiers = entry.tiers.map((tier) => {
+      if (!isRecord(tier)) throw new Error("桌面端返回了无法识别的价格阶梯。");
+      const optionalRate = (rate: unknown) => rate === null || (typeof rate === "number" && Number.isFinite(rate));
+      if (
+        typeof tier.label !== "string"
+        || typeof tier.condition !== "string"
+        || typeof tier.inputPerMillion !== "number"
+        || !Number.isFinite(tier.inputPerMillion)
+        || !optionalRate(tier.cachedInputPerMillion)
+        || !optionalRate(tier.cacheWritePerMillion)
+        || typeof tier.outputPerMillion !== "number"
+        || !Number.isFinite(tier.outputPerMillion)
+      ) throw new Error("桌面端返回了无法识别的价格阶梯。");
+      return tier;
+    });
+    return { ...entry, tiers };
+  });
+  return { ...value, priceCatalog } as unknown as NonNullable<DashboardSnapshot["deviceUsage"]>;
+}
+
 /**
  * Applies a small IPC boundary check before data reaches React. It deliberately
  * does not synthesize quota data when the backend response is unavailable or
@@ -130,12 +194,16 @@ export function normalizeDashboardSnapshot(value: unknown): DashboardSnapshot {
     ? value.planRenewalSource
     : null;
   const refreshSchedule = normalizeRefreshSchedule(value.refreshSchedule);
+  const accountDiagnostics = normalizeAccountDiagnostics(value.accountDiagnostics);
+  const deviceUsage = normalizeDeviceUsage(value.deviceUsage);
 
   return {
     ...(value as unknown as DashboardSnapshot),
     planRenewalAt,
     planRenewalSource,
     refreshSchedule,
+    accountDiagnostics,
+    deviceUsage,
   };
 }
 
@@ -415,6 +483,7 @@ class UnavailableBridgeAdapter implements DashboardAdapter {
       fetchedAt: new Date().toISOString(),
       codexVersion: null,
       quotaWindows: [],
+      accountDiagnostics: null,
       planRenewalAt: null,
       planRenewalSource: null,
       resetCredits: null,

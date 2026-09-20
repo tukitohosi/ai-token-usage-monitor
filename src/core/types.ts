@@ -13,6 +13,7 @@ export interface CreditBalance {
 export interface RateLimitBucket {
   limitId: string;
   limitName: string | null;
+  normalModelSlug?: string | null;
   primary: QuotaWindow | null;
   secondary: QuotaWindow | null;
   credits?: CreditBalance | null;
@@ -182,6 +183,7 @@ export interface UsageSourceSummary {
 export interface DeviceUsageSummary {
   generatedAt: string;
   priceSnapshotDate: string;
+  priceCatalog: PriceCatalogEntry[];
   total: DeviceTokenUsage;
   today: DeviceTokenUsage;
   cost: TokenCost;
@@ -192,6 +194,24 @@ export interface DeviceUsageSummary {
   byProject: DeviceUsageDimension[];
   warnings: string[];
   ranges?: DeviceUsageRanges;
+}
+
+export interface PriceCatalogTier {
+  label: string;
+  condition: string;
+  inputPerMillion: number;
+  cachedInputPerMillion: number | null;
+  cacheWritePerMillion: number | null;
+  outputPerMillion: number;
+}
+
+export interface PriceCatalogEntry {
+  displayName: string;
+  modelId: string;
+  aliases: string[];
+  currency: "USD" | "CNY";
+  sourceLabel: string;
+  tiers: PriceCatalogTier[];
 }
 
 export interface SourceHealthSummary {
@@ -275,6 +295,7 @@ export interface NormalizedQuotaWindow extends QuotaWindow {
   key: string;
   limitId: string;
   limitName: string | null;
+  normalModelSlug: string | null;
   lane: "primary" | "secondary";
   label: string;
   remainingPercent: number;
@@ -283,11 +304,19 @@ export interface NormalizedQuotaWindow extends QuotaWindow {
   reachedType: string | null;
 }
 
+export interface AccountReadDiagnostics {
+  readAt: string;
+  durationMs: number;
+  methods: string[];
+}
+
 export interface DashboardSnapshot {
   status: "ready" | "loading" | "offline" | "unauthenticated" | "unsupported" | "error";
   fetchedAt: string | null;
   codexVersion: string | null;
   quotaWindows: NormalizedQuotaWindow[];
+  /** Sanitized account-read audit; never contains identifiers, parameters or credentials. */
+  accountDiagnostics?: AccountReadDiagnostics | null;
   /**
    * The account plan renewal time, when supplied by a future trusted source.
    * Codex App Server does not currently expose this value, so `null` is the

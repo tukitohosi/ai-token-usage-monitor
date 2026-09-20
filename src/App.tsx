@@ -40,6 +40,7 @@ const INITIAL_SNAPSHOT: DashboardSnapshot = {
   fetchedAt: null,
   codexVersion: null,
   quotaWindows: [],
+  accountDiagnostics: null,
   planRenewalAt: null,
   planRenewalSource: null,
   resetCredits: null,

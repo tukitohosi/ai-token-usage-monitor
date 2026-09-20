@@ -53,6 +53,7 @@ import {
   getQuotaPresentation,
   toEpochMilliseconds,
 } from "./format";
+import { selectOverviewQuotas } from "./quota-view-model";
 
 export type AppView = "overview" | "activity" | "cost" | "settings";
 export type IconName =
@@ -207,16 +208,16 @@ export function StatusPopover({
           <dd>{statusLabel(snapshot.status)}</dd>
         </div>
         <div>
-          <dt>最近读取</dt>
-          <dd>{formatRelativeTime(snapshot.fetchedAt, now)}</dd>
+          <dt>账号最近读取</dt>
+          <dd>{formatRelativeTime(snapshot.accountDiagnostics?.readAt ?? snapshot.fetchedAt, now)}</dd>
         </div>
         <div>
-          <dt>最后成功</dt>
-          <dd>
-            {snapshot.lastSuccessfulAt
-              ? formatDateTime(snapshot.lastSuccessfulAt)
-              : "尚无记录"}
-          </dd>
+          <dt>账号读取 RPC</dt>
+          <dd>{snapshot.accountDiagnostics?.methods.join(" · ") || "尚无记录"}</dd>
+        </div>
+        <div>
+          <dt>本机最近索引</dt>
+          <dd>{formatRelativeTime(snapshot.deviceUsage?.generatedAt ?? null, now)}</dd>
         </div>
         <div>
           <dt>刷新阶段</dt>
@@ -348,6 +349,7 @@ export function OverviewView({
   onOpenActivity: () => void;
 }) {
   const localTrend = buildFifteenDaySourceTrend(snapshot.deviceUsage?.sources ?? [], now);
+  const overviewQuotas = selectOverviewQuotas(snapshot.quotaWindows);
   return (
     <section className="view-panel">
       <PageHeading
@@ -365,10 +367,11 @@ export function OverviewView({
         }
       />
       <div className="overview-grid">
-        {snapshot.quotaWindows.slice(0, 2).map((quota) => (
-          <QuotaSummaryCard key={quota.key} quota={quota} now={now} />
+        {overviewQuotas.map(({ quota, title }) => (
+          <QuotaSummaryCard key={quota.key} quota={quota} title={title} now={now} />
         ))}
         <MetricCard
+          className="overview-grid__local"
           eyebrow="今日本机 Token"
           value={formatTokens(snapshot.deviceUsage?.today.totalTokens ?? null)}
           detail="仅此设备可读取的本地活动"
@@ -376,6 +379,7 @@ export function OverviewView({
           tone="cyan"
         />
         <MetricCard
+          className="overview-grid__local"
           eyebrow="今日估算费用"
           value={formatCostCompact(snapshot.deviceUsage?.todayCost)}
           detail={
@@ -482,20 +486,22 @@ function StackedSourceTrendCard({
 
 function QuotaSummaryCard({
   quota,
+  title,
   now,
 }: {
   quota: NormalizedQuotaWindow;
+  title: string;
   now: number;
 }) {
   const value = getQuotaPresentation(quota);
   return (
     <article
-      className={`metric-card quota-summary quota-summary--${value.tone}`}
+      className={`metric-card overview-grid__quota quota-summary quota-summary--${value.tone}`}
     >
       <header>
         <span>
           <Icon name="clock" />
-          {formatWindowDuration(quota.windowDurationMins)}
+          {title}
         </span>
         <small>{quota.label || "额度窗口"}</small>
       </header>
@@ -509,7 +515,7 @@ function QuotaSummaryCard({
       <div
         className="quota-track"
         role="progressbar"
-        aria-label={`${formatWindowDuration(quota.windowDurationMins)}额度剩余`}
+        aria-label={`${title}额度剩余`}
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={value.remainingPercent}
@@ -525,12 +531,14 @@ function QuotaSummaryCard({
 }
 
 function MetricCard({
+  className,
   eyebrow,
   value,
   detail,
   icon,
   tone,
 }: {
+  className?: string;
   eyebrow: string;
   value: string;
   detail: string;
@@ -538,7 +546,7 @@ function MetricCard({
   tone: "cyan" | "green";
 }) {
   return (
-    <article className={`metric-card metric-card--${tone}`}>
+    <article className={`metric-card metric-card--${tone}${className ? ` ${className}` : ""}`}>
       <header>
         <span>
           <Icon name={icon} />
@@ -1609,7 +1617,7 @@ export function CostView({
       <PageHeading
         eyebrow="COST ESTIMATE"
         title="费用"
-        description="固定离线价格快照只用于估算，不代表订阅、Credits 或实际账单。"
+        description="固定离线 Standard API 价格快照只用于估算，不代表订阅、Credits 或实际账单。"
         actions={<button className="secondary-button" type="button" aria-expanded={showPricingDetails} onClick={() => setShowPricingDetails((value) => !value)}>{showPricingDetails ? "收起定价口径" : "查看定价口径"}</button>}
       />
       <UnifiedFilters
@@ -1675,7 +1683,38 @@ export function CostView({
           <div className="pricing-rules">
             <p><strong>不会自动换汇：</strong>USD 与 CNY 始终分开累计。</p>
             <p><strong>不会把缺失当免费：</strong>未知模型、缺少必要事件时间或特殊长上下文会保留为未定价。</p>
-            <p><strong>不是实际账单：</strong>这里不代表订阅、OAuth、代理 Credits 或工作区结算金额。</p>
+            <p><strong>只按 Standard API：</strong>不套用订阅、Credits、Fast、Batch、Flex 或数据驻留等其他计费条件。</p>
+            <p><strong>不是实际账单：</strong>这里不代表 OAuth、代理 Credits 或工作区结算金额。</p>
+          </div>
+          <div className="pricing-catalog" aria-label="每百万 Token 价格目录">
+            {usage.priceCatalog.map((entry) => (
+              <section className="pricing-catalog__entry" key={entry.modelId}>
+                <header>
+                  <div>
+                    <h3>{entry.displayName}</h3>
+                    <code>{entry.modelId}</code>
+                  </div>
+                  <span>{entry.sourceLabel} · {entry.currency}</span>
+                </header>
+                {entry.aliases.length > 0 && <p>兼容别名：{entry.aliases.join("、")}</p>}
+                <div className="pricing-table-wrap">
+                  <table>
+                    <thead><tr><th>档位与条件</th><th>输入</th><th>缓存输入</th><th>缓存写入</th><th>输出</th></tr></thead>
+                    <tbody>
+                      {entry.tiers.map((tier) => (
+                        <tr key={`${entry.modelId}:${tier.label}`}>
+                          <td><strong>{tier.label}</strong><small>{tier.condition}</small></td>
+                          <td>{formatCatalogRate(tier.inputPerMillion, entry.currency)}</td>
+                          <td>{formatCatalogRate(tier.cachedInputPerMillion, entry.currency)}</td>
+                          <td>{formatCatalogRate(tier.cacheWritePerMillion, entry.currency)}</td>
+                          <td>{formatCatalogRate(tier.outputPerMillion, entry.currency)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            ))}
           </div>
           <ol>
             {summary.byModel.slice(0, 8).map((model) => (
@@ -2646,6 +2685,11 @@ function createDonutGradient(
 function formatMoney(symbol: "$" | "¥", value: number): string {
   return `${symbol}${new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(value)}`;
 }
+function formatCatalogRate(value: number | null, currency: "USD" | "CNY"): string {
+  if (value === null) return "未公布/未计价";
+  const symbol = currency === "USD" ? "$" : "¥";
+  return `${symbol}${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 4 }).format(value)}`;
+}
 function formatCostCompact(
   cost: { usd: number; cny: number; unpricedTokens: number } | null | undefined,
 ): string {
@@ -2735,7 +2779,10 @@ function createDiagnostics(
     "AI Token 用量监控诊断",
     `状态: ${snapshot.status}`,
     `Codex 版本: ${snapshot.codexVersion ?? "未知"}`,
-    `最后读取: ${snapshot.fetchedAt ?? "无"}`,
+    `账号最近读取: ${snapshot.accountDiagnostics?.readAt ?? snapshot.fetchedAt ?? "无"}`,
+    `账号读取耗时: ${snapshot.accountDiagnostics ? `${snapshot.accountDiagnostics.durationMs}ms` : "无"}`,
+    `账号读取 RPC: ${snapshot.accountDiagnostics?.methods.join(", ") || "无"}`,
+    `本机最近索引: ${snapshot.deviceUsage?.generatedAt ?? "无"}`,
     `刷新间隔: ${preferences.refreshIntervalMinutes} 分钟`,
     `关闭行为: ${preferences.closeBehavior}`,
     `系统通知: ${preferences.notificationsEnabled ? "enabled" : "disabled"}`,

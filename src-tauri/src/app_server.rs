@@ -13,6 +13,13 @@ use serde_json::{json, Map, Value};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_TEXT_LIMIT: usize = 256;
+const ALLOWED_REQUEST_METHODS: &[&str] = &[
+    "initialize",
+    "account/read",
+    "account/rateLimits/read",
+    "account/usage/read",
+];
+const ALLOWED_NOTIFICATION_METHODS: &[&str] = &["initialized"];
 
 #[derive(Debug)]
 pub(crate) enum AppServerError {
@@ -46,6 +53,7 @@ pub(crate) struct NormalizedQuotaWindow {
     pub(crate) key: String,
     pub(crate) limit_id: String,
     pub(crate) limit_name: Option<String>,
+    pub(crate) normal_model_slug: Option<String>,
     pub(crate) lane: &'static str,
     pub(crate) label: String,
     pub(crate) remaining_percent: f64,
@@ -117,6 +125,7 @@ pub(crate) struct AppServerClient {
     stdin: ChildStdin,
     receiver: Receiver<ReaderMessage>,
     next_request_id: u64,
+    rpc_methods: Vec<String>,
     pub(crate) server_user_agent: String,
 }
 
@@ -181,6 +190,7 @@ impl AppServerClient {
             stdin,
             receiver,
             next_request_id: 1,
+            rpc_methods: Vec::new(),
             server_user_agent: String::new(),
         };
         let initialized = client.request(
@@ -232,7 +242,19 @@ impl AppServerClient {
         Ok(sanitize_account_usage(&value))
     }
 
+    pub(crate) fn account_rpc_methods(&self) -> Vec<String> {
+        self.rpc_methods
+            .iter()
+            .filter(|method| method.starts_with("account/"))
+            .cloned()
+            .collect()
+    }
+
     fn notify(&mut self, method: &str, params: Option<Value>) -> Result<(), AppServerError> {
+        if !ALLOWED_NOTIFICATION_METHODS.contains(&method) {
+            return Err(AppServerError::Protocol);
+        }
+        self.rpc_methods.push(method.to_owned());
         let mut message = Map::new();
         message.insert("method".to_owned(), Value::String(method.to_owned()));
         if let Some(params) = params {
@@ -242,6 +264,10 @@ impl AppServerClient {
     }
 
     fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value, AppServerError> {
+        if !ALLOWED_REQUEST_METHODS.contains(&method) {
+            return Err(AppServerError::Protocol);
+        }
+        self.rpc_methods.push(method.to_owned());
         let id = self.next_request_id;
         self.next_request_id += 1;
         let mut message = Map::new();
@@ -404,6 +430,7 @@ fn normalize_rate_limits(
             .filter(|inner| inner == &fallback_limit_id)
             .unwrap_or(fallback_limit_id);
         let limit_name = safe_text(bucket.get("limitName"));
+        let normal_model_slug = safe_text(bucket.get("normalModelSlug"));
         let credits = sanitize_credits(bucket.get("credits"));
         let plan_type = safe_text(bucket.get("planType"));
         let reached_type = safe_text(bucket.get("rateLimitReachedType"));
@@ -435,6 +462,7 @@ fn normalize_rate_limits(
                 key: format!("{limit_id}:{lane}"),
                 limit_id: limit_id.clone(),
                 limit_name: limit_name.clone(),
+                normal_model_slug: normal_model_slug.clone(),
                 lane,
                 label: format_window_duration(window_duration_mins),
                 remaining_percent: 100.0 - bounded_used,
@@ -444,11 +472,44 @@ fn normalize_rate_limits(
             });
         }
     }
+    windows.sort_by(|left, right| {
+        quota_window_priority(left)
+            .cmp(&quota_window_priority(right))
+            .then_with(|| left.key.cmp(&right.key))
+    });
 
     (
         windows,
         sanitize_reset_credits(value.get("rateLimitResetCredits")),
     )
+}
+
+fn quota_window_priority(window: &NormalizedQuotaWindow) -> u8 {
+    let codex = window.limit_id.eq_ignore_ascii_case("codex")
+        || window
+            .limit_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("codex"));
+    if codex && window.window_duration_mins == 300.0 {
+        return 0;
+    }
+    if codex && window.window_duration_mins == 10_080.0 {
+        return 1;
+    }
+    let luna_reserve = window.limit_id.eq_ignore_ascii_case("base_model_inference")
+        || window
+            .limit_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("gpt-reserve"))
+        || window
+            .normal_model_slug
+            .as_deref()
+            .is_some_and(|model| model.eq_ignore_ascii_case("gpt-5.6-luna"));
+    if luna_reserve {
+        2
+    } else {
+        3
+    }
 }
 
 fn sanitize_credits(value: Option<&Value>) -> Option<CreditBalance> {
@@ -554,6 +615,7 @@ mod tests {
             "codex": {
               "limitId": "inconsistent",
               "limitName": "Codex",
+              "normalModelSlug": "gpt-5.6-sol",
               "planType": "plus",
               "primary": { "usedPercent": 38.5, "windowDurationMins": 300, "resetsAt": 1_800_000_000 },
               "secondary": { "usedPercent": 12, "windowDurationMins": 10080, "resetsAt": 1_800_000_100 }
@@ -564,7 +626,58 @@ mod tests {
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].limit_id, "codex");
         assert_eq!(windows[0].remaining_percent, 61.5);
+        assert_eq!(windows[0].normal_model_slug.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(windows[1].label, "7 天");
+    }
+
+    #[test]
+    fn sorts_known_quota_windows_ahead_of_unknown_buckets() {
+        let response = json!({
+          "rateLimitsByLimitId": {
+            "base_model_inference": {
+              "limitName": "gpt-reserve",
+              "normalModelSlug": "gpt-5.6-luna",
+              "primary": { "usedPercent": 100, "windowDurationMins": 10080, "resetsAt": 30 }
+            },
+            "future": {
+              "primary": { "usedPercent": 1, "windowDurationMins": 60, "resetsAt": 40 }
+            },
+            "codex": {
+              "primary": { "usedPercent": 15, "windowDurationMins": 300, "resetsAt": 10 },
+              "secondary": { "usedPercent": 21, "windowDurationMins": 10080, "resetsAt": 20 }
+            }
+          }
+        });
+        let (windows, _) = normalize_rate_limits(&response);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "codex:primary",
+                "codex:secondary",
+                "base_model_inference:primary",
+                "future:primary"
+            ]
+        );
+    }
+
+    #[test]
+    fn rpc_allowlist_excludes_inference_and_credit_mutation() {
+        for method in ["thread/start", "turn/start", "account/rateLimits/reset"] {
+            assert!(!ALLOWED_REQUEST_METHODS.contains(&method));
+            assert!(!ALLOWED_NOTIFICATION_METHODS.contains(&method));
+        }
+        assert_eq!(
+            ALLOWED_REQUEST_METHODS,
+            &[
+                "initialize",
+                "account/read",
+                "account/rateLimits/read",
+                "account/usage/read"
+            ]
+        );
     }
 
     #[test]

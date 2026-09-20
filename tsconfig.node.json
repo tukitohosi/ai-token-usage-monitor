@@ -20,6 +20,7 @@
     "src/ui/format.ts",
     "src/ui/mock-data.ts",
     "src/ui/device-usage-view-model.ts",
+    "src/ui/quota-view-model.ts",
     "tests/**/*.test.ts"
   ]
 }

@@ -39,6 +39,7 @@ function emptySnapshot(
     fetchedAt,
     codexVersion: null,
     quotaWindows: [],
+    accountDiagnostics: null,
     planRenewalAt: null,
     planRenewalSource: null,
     resetCredits: null,
@@ -102,6 +103,16 @@ export async function readDashboardSnapshot(
 ): Promise<DashboardSnapshot> {
   const now = options.now ?? (() => new Date());
   const fetchedAt = now().toISOString();
+  const accountReadStartedAt = Date.now();
+  const methods: string[] = [];
+  const withAccountDiagnostics = (snapshot: DashboardSnapshot): DashboardSnapshot => ({
+    ...snapshot,
+    accountDiagnostics: {
+      readAt: fetchedAt,
+      durationMs: Math.max(0, Date.now() - accountReadStartedAt),
+      methods: [...methods],
+    },
+  });
   const localPromise = safelyReadLocalUsage(options.readLocalUsage);
   const connect = options.connect ?? (() => AppServerClient.connect());
   let client: DashboardAppServerClient | null = null;
@@ -111,24 +122,27 @@ export async function readDashboardSnapshot(
   } catch (error) {
     const local = await localPromise;
     const failure = connectionFailureStatus(error);
-    return emptySnapshot(failure.status, fetchedAt, local.usage, failure.message);
+    return withAccountDiagnostics(
+      emptySnapshot(failure.status, fetchedAt, local.usage, failure.message),
+    );
   }
 
   try {
     const local = await localPromise;
     let account: AccountReadResult;
     try {
+      methods.push("account/read");
       account = await client.accountRead(false);
     } catch (error) {
       const failure = connectionFailureStatus(error);
-      return {
+      return withAccountDiagnostics({
         ...emptySnapshot(failure.status, fetchedAt, local.usage, failure.message),
         codexVersion: codexVersionFromUserAgent(client.serverUserAgent),
-      };
+      });
     }
 
     if (account.requiresOpenaiAuth && account.account === null) {
-      return {
+      return withAccountDiagnostics({
         ...emptySnapshot(
           "unauthenticated",
           fetchedAt,
@@ -136,9 +150,10 @@ export async function readDashboardSnapshot(
           "Codex 尚未登录；登录后可读取账号额度，本机历史统计仍可使用。",
         ),
         codexVersion: codexVersionFromUserAgent(client.serverUserAgent),
-      };
+      });
     }
 
+    methods.push("account/rateLimits/read", "account/usage/read");
     const [rateLimitsResult, accountUsageResult] = await Promise.allSettled([
       client.rateLimitsRead(),
       client.usageRead(),
@@ -155,7 +170,7 @@ export async function readDashboardSnapshot(
 
     if (failures.length === 2) {
       const unsupported = failures.every((failure) => isUnsupportedMethod(failure.reason));
-      return {
+      return withAccountDiagnostics({
         ...emptySnapshot(
           unsupported ? "unsupported" : "error",
           fetchedAt,
@@ -165,14 +180,14 @@ export async function readDashboardSnapshot(
             : "账号用量接口读取失败；未记录原始错误内容。",
         ),
         codexVersion: codexVersionFromUserAgent(client.serverUserAgent),
-      };
+      });
     }
 
     const messages: string[] = [];
     if (failures.length > 0) messages.push("部分账号用量暂不可用。");
     if (local.failed) messages.push("本机日志索引暂不可用。");
 
-    return {
+    return withAccountDiagnostics({
       status: "ready",
       fetchedAt,
       codexVersion: codexVersionFromUserAgent(client.serverUserAgent),
@@ -185,7 +200,7 @@ export async function readDashboardSnapshot(
       accountUsage,
       localUsage: local.usage,
       message: messages.length > 0 ? messages.join(" ") : null,
-    };
+    });
   } finally {
     client.close();
   }

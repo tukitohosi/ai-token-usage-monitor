@@ -81,6 +81,7 @@ function coerceBucket(
   return {
     limitId: optionalString(value.limitId) ?? fallbackLimitId,
     limitName: optionalString(value.limitName),
+    normalModelSlug: optionalString(value.normalModelSlug),
     primary: coerceWindow(value.primary),
     secondary: coerceWindow(value.secondary),
     credits: coerceCredits(value.credits),
@@ -203,6 +204,7 @@ export function normalizeRateLimits(value: unknown): NormalizedQuotaWindow[] {
         key: `${limitId}:${lane}`,
         limitId,
         limitName: bucket.limitName,
+        normalModelSlug: bucket.normalModelSlug ?? null,
         lane,
         label: formatWindowDurationLabel(window.windowDurationMins),
         remainingPercent: 100 - boundedUsedPercent,
@@ -213,7 +215,24 @@ export function normalizeRateLimits(value: unknown): NormalizedQuotaWindow[] {
     }
   }
 
-  return windows;
+  return windows.sort((left, right) => {
+    const priority = quotaWindowPriority(left) - quotaWindowPriority(right);
+    return priority || left.key.localeCompare(right.key);
+  });
+}
+
+function quotaWindowPriority(window: NormalizedQuotaWindow): number {
+  const limitId = window.limitId.toLocaleLowerCase();
+  const limitName = window.limitName?.toLocaleLowerCase() ?? "";
+  const model = window.normalModelSlug?.toLocaleLowerCase() ?? "";
+  const codex = limitId === "codex" || limitName === "codex";
+  if (codex && window.windowDurationMins === 300) return 0;
+  if (codex && window.windowDurationMins === 10_080) return 1;
+  const lunaReserve = limitId === "base_model_inference"
+    || limitName === "gpt-reserve"
+    || model === "gpt-5.6-luna";
+  if (lunaReserve) return 2;
+  return 3;
 }
 
 function coerceUsageSummary(value: unknown): AccountUsageSummary | null {

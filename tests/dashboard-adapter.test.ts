@@ -98,6 +98,18 @@ describe("Tauri dashboard adapter", () => {
     expect(fixture.unsubscribe).toHaveBeenCalledOnce();
   });
 
+  it("rejects account diagnostics containing non-read RPC methods", () => {
+    const snapshot = createMockDashboardSnapshot("ready");
+    expect(() => normalizeDashboardSnapshot({
+      ...snapshot,
+      accountDiagnostics: {
+        readAt: snapshot.fetchedAt,
+        durationMs: 3,
+        methods: ["account/read", "turn/start"],
+      },
+    })).toThrow(/账号读取诊断/);
+  });
+
   it("stores a manual renewal through the typed local command", async () => {
     const snapshot = createMockDashboardSnapshot("ready");
     const setting = {

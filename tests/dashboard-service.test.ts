@@ -88,6 +88,11 @@ describe("readDashboardSnapshot", () => {
     expect(snapshot.planRenewalSource).toBeNull();
     expect(snapshot.localUsage).toBe(LOCAL_USAGE);
     expect(snapshot.fetchedAt).toBe("2026-08-27T01:02:03.000Z");
+    expect(snapshot.accountDiagnostics).toMatchObject({
+      readAt: "2026-08-27T01:02:03.000Z",
+      methods: ["account/read", "account/rateLimits/read", "account/usage/read"],
+    });
+    expect(snapshot.accountDiagnostics?.durationMs).toBeGreaterThanOrEqual(0);
     expect(client.close).toHaveBeenCalledOnce();
   });
 
@@ -101,6 +106,10 @@ describe("readDashboardSnapshot", () => {
     expect(snapshot.status).toBe("unsupported");
     expect(snapshot.localUsage).toBe(LOCAL_USAGE);
     expect(snapshot.message).not.toContain("C:\\");
+    expect(snapshot.accountDiagnostics).toMatchObject({
+      readAt: "2026-08-27T01:02:03.000Z",
+      methods: [],
+    });
   });
 
   it("reports unauthenticated without calling protected usage methods", async () => {
@@ -112,7 +121,19 @@ describe("readDashboardSnapshot", () => {
     expect(snapshot.status).toBe("unauthenticated");
     expect(client.rateLimitsRead).not.toHaveBeenCalled();
     expect(client.usageRead).not.toHaveBeenCalled();
+    expect(snapshot.accountDiagnostics?.methods).toEqual(["account/read"]);
     expect(client.close).toHaveBeenCalledOnce();
+  });
+
+  it("audits only the three account-read methods", async () => {
+    const snapshot = await readDashboardSnapshot({ connect: async () => fakeClient() });
+    expect(snapshot.accountDiagnostics?.methods).toEqual([
+      "account/read",
+      "account/rateLimits/read",
+      "account/usage/read",
+    ]);
+    expect(snapshot.accountDiagnostics?.methods).not.toContain("thread/start");
+    expect(snapshot.accountDiagnostics?.methods).not.toContain("turn/start");
   });
 
   it("keeps a ready partial snapshot when only one server method fails", async () => {

@@ -206,6 +206,7 @@ pub(crate) struct SourceCreditBalance {
 pub(crate) struct DeviceUsageSummary {
     pub(crate) generated_at: String,
     pub(crate) price_snapshot_date: String,
+    pub(crate) price_catalog: Vec<pricing::PriceCatalogEntry>,
     pub(crate) total: DeviceTokenUsage,
     pub(crate) today: DeviceTokenUsage,
     pub(crate) cost: CostSummary,
@@ -685,6 +686,7 @@ impl MultiSourceIndex {
         DeviceUsageSummary {
             generated_at: Utc::now().to_rfc3339(),
             price_snapshot_date: pricing::PRICE_SNAPSHOT_DATE.to_owned(),
+            price_catalog: pricing::catalog(),
             total: ranges.total.usage,
             today: ranges.today.usage,
             cost: ranges.total.cost.clone(),

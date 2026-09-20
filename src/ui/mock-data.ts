@@ -35,9 +35,25 @@ function createDailyBuckets(now: number): DailyUsageBucket[] {
 function createQuotaWindows(now: number): NormalizedQuotaWindow[] {
   return [
     {
+      key: "base_model_inference:primary",
+      limitId: "base_model_inference",
+      limitName: "gpt-reserve",
+      normalModelSlug: "gpt-5.6-luna",
+      lane: "primary",
+      label: "7 天",
+      usedPercent: 100,
+      remainingPercent: 0,
+      windowDurationMins: 10_080,
+      resetsAt: now + (2 * 24 * 60 + 23 * 60) * 60_000,
+      credits: null,
+      planType: "plus",
+      reachedType: "rate_limit",
+    },
+    {
       key: "codex-primary",
       limitId: "codex",
       limitName: "Codex",
+      normalModelSlug: null,
       lane: "primary",
       label: "短周期额度",
       usedPercent: 64,
@@ -52,6 +68,7 @@ function createQuotaWindows(now: number): NormalizedQuotaWindow[] {
       key: "codex-secondary",
       limitId: "codex",
       limitName: "Codex",
+      normalModelSlug: null,
       lane: "secondary",
       label: "长周期额度",
       usedPercent: 38.5,
@@ -440,7 +457,41 @@ function createDeviceUsage(now: number, local: LocalUsageSummary): DeviceUsageSu
 
   return {
     generatedAt: new Date(now - 18_000).toISOString(),
-    priceSnapshotDate: "2026-08-29",
+    priceSnapshotDate: "2026-09-20",
+    priceCatalog: [
+      {
+        displayName: "GPT-6 Astra",
+        modelId: "gpt-6-astra",
+        aliases: ["gpt6-astra"],
+        currency: "USD",
+        sourceLabel: "OpenAI 官方 Standard API",
+        tiers: [
+          { label: "短上下文", condition: "单次输入不超过 272K", inputPerMillion: 10, cachedInputPerMillion: 1, cacheWritePerMillion: 12.5, outputPerMillion: 50 },
+          { label: "长上下文", condition: "单次输入超过 272K", inputPerMillion: 20, cachedInputPerMillion: 2, cacheWritePerMillion: 25, outputPerMillion: 75 },
+        ],
+      },
+      {
+        displayName: "DeepSeek V4.1 Flash",
+        modelId: "deepseek-flash",
+        aliases: ["deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"],
+        currency: "USD",
+        sourceLabel: "DeepSeek 官方 API",
+        tiers: [
+          { label: "谷值", condition: "周末、中国法定节假日及非峰值 UTC 时段", inputPerMillion: 0.15, cachedInputPerMillion: 0.003, cacheWritePerMillion: null, outputPerMillion: 0.6 },
+          { label: "峰值", condition: "工作日 01:00-04:00、06:00-10:00 UTC", inputPerMillion: 0.3, cachedInputPerMillion: 0.006, cacheWritePerMillion: null, outputPerMillion: 1.2 },
+        ],
+      },
+      {
+        displayName: "Tencent Hy4 preview",
+        modelId: "hy4-preview",
+        aliases: [],
+        currency: "CNY",
+        sourceLabel: "腾讯云官方 Standard API",
+        tiers: [
+          { label: "标准", condition: "缓存写入价格未公布", inputPerMillion: 6, cachedInputPerMillion: 0.3, cacheWritePerMillion: null, outputPerMillion: 18 },
+        ],
+      },
+    ],
     total: addDeviceUsage(sources.map((source) => source.total)),
     today: addDeviceUsage(sources.map((source) => source.today)),
     cost: cost(89.61, 0, sources.filter((source) => source.id !== "codex").reduce((sum, source) => sum + source.total.totalTokens, 0)),
@@ -482,6 +533,11 @@ export function createMockDashboardSnapshot(state: MockDashboardState = "ready")
     fetchedAt,
     codexVersion: "0.150.0-alpha.8",
     quotaWindows,
+    accountDiagnostics: {
+      readAt: fetchedAt,
+      durationMs: 91,
+      methods: ["account/read", "account/rateLimits/read", "account/usage/read"],
+    },
     // The official App Server has no subscription-renewal field. Keep the
     // demo honest and exercise the prominent "not provided" UI state.
     planRenewalAt: null,
@@ -564,6 +620,7 @@ export function createMockDashboardSnapshot(state: MockDashboardState = "ready")
         status: "unauthenticated",
         fetchedAt: new Date(now).toISOString(),
         quotaWindows: [],
+        accountDiagnostics: null,
         resetCredits: null,
         accountUsage: null,
         message: "Codex 尚未登录。登录后可读取账号额度；本机日志统计仍可使用。",
