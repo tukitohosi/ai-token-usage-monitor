@@ -22,9 +22,10 @@ use crate::{
         PARSER_SEMANTICS_VERSION, SCHEMA_VERSION,
     },
     multisource::{
-        build_day_detail, codex_day_tasks, DeviceUsageSummary, MultiSourceIndex,
-        SourceScanProgress, UsageDayDetail, MULTI_SOURCE_SCHEMA_VERSION,
+        build_day_detail, codex_day_tasks, codex_day_tasks_with_pricing, DeviceUsageSummary,
+        MultiSourceIndex, SourceScanProgress, UsageDayDetail, MULTI_SOURCE_SCHEMA_VERSION,
     },
+    pricing::PricingSettings,
     settings,
     snapshot::{self, DashboardSnapshot},
 };
@@ -462,6 +463,25 @@ impl UsageRuntime {
         settings::write_project_merge_rules(&self.settings_path, rules)
     }
 
+    pub(crate) fn read_pricing_settings(&self) -> Result<PricingSettings, settings::SettingsError> {
+        let _refresh_guard = self
+            .refresh_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        settings::read_pricing_settings(&self.settings_path)
+    }
+
+    pub(crate) fn set_pricing_settings(
+        &self,
+        pricing_settings: &PricingSettings,
+    ) -> Result<PricingSettings, settings::SettingsError> {
+        let _refresh_guard = self
+            .refresh_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        settings::write_pricing_settings(&self.settings_path, pricing_settings)
+    }
+
     pub(crate) fn set_app_preferences(
         &self,
         input: &settings::AppPreferencesInput,
@@ -524,9 +544,11 @@ impl UsageRuntime {
         let mut multi = MultiSourceIndex::open(&self.multi_source_database_path).map_err(|_| ())?;
         // Re-scan the derived indexes before detail is read.  This only reads
         // source logs and keeps the day drawer consistent with Refresh.
-        let _ = multi.collect(&self.user_home, Ok((summary, all_events, None)));
-        let mut tasks = multi.day_tasks(date)?;
-        tasks.extend(codex_day_tasks(day_events));
+        let pricing = settings::read_pricing_settings(&self.settings_path).unwrap_or_default();
+        let _ =
+            multi.collect_with_pricing(&self.user_home, Ok((summary, all_events, None)), &pricing);
+        let mut tasks = multi.day_tasks_with_pricing(date, &pricing)?;
+        tasks.extend(codex_day_tasks_with_pricing(day_events, &pricing));
         let threshold =
             settings::read_app_preferences(&self.settings_path, &self.app_data_directory, false)
                 .map(|value| f64::from(value.cache_warning_percent) / 100.0)
@@ -693,7 +715,13 @@ impl UsageRuntime {
         F: FnMut(SourceScanProgress),
     {
         let mut index = MultiSourceIndex::open(&self.multi_source_database_path).map_err(|_| ())?;
-        Ok(index.collect_with_progress(&self.user_home, codex_usage, on_source))
+        let pricing = settings::read_pricing_settings(&self.settings_path).unwrap_or_default();
+        Ok(index.collect_with_progress_and_pricing(
+            &self.user_home,
+            codex_usage,
+            &pricing,
+            on_source,
+        ))
     }
 
     fn cached_low_cache_task_count(&self, date: &str, threshold: f64) -> Result<i64, ()> {

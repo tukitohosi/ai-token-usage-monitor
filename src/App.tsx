@@ -12,6 +12,7 @@ import type {
   AppPreferences,
   DashboardSnapshot,
   IndexMaintenanceReport,
+  PricingSettings,
   ProjectMergeRule,
   RefreshProgress,
   ThemePreference,
@@ -26,6 +27,7 @@ import {
   CostView,
   Icon,
   OverviewView,
+  PricingView,
   SettingsView,
   StatusNotice,
   StatusPopover,
@@ -68,6 +70,12 @@ const DEFAULT_PREFERENCES: AppPreferences = {
   quietHoursEnd: "08:00",
 };
 
+const DEFAULT_PRICING_SETTINGS: PricingSettings = {
+  updatedAt: null,
+  peak: { startTime: "18:00", endTime: "23:00", multiplier: 1.5 },
+  models: [],
+};
+
 function runtimePreferencesEqual(left: AppPreferences, right: AppPreferences): boolean {
   return left.refreshIntervalMinutes === right.refreshIntervalMinutes
     && left.closeBehavior === right.closeBehavior
@@ -84,6 +92,7 @@ const VIEW_ITEMS: Array<{ id: AppView; label: string; icon: IconName }> = [
   { id: "overview", label: "总览", icon: "overview" },
   { id: "activity", label: "本机活动", icon: "activity" },
   { id: "cost", label: "费用", icon: "wallet" },
+  { id: "pricing", label: "模型定价", icon: "wallet" },
   { id: "settings", label: "设置", icon: "settings" },
 ];
 
@@ -178,6 +187,9 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
   const [isDayDetailLoading, setIsDayDetailLoading] = useState(false);
   const [projectMergeRules, setProjectMergeRules] = useState<ProjectMergeRule[]>([]);
   const [projectMergeMessage, setProjectMergeMessage] = useState<string | null>(null);
+  const [pricingSettings, setPricingSettings] = useState<PricingSettings>(DEFAULT_PRICING_SETTINGS);
+  const [pricingMessage, setPricingMessage] = useState<string | null>(null);
+  const [isSavingPricing, setIsSavingPricing] = useState(false);
   const requestSequence = useRef(0);
   const now = useClock();
   const systemTheme = useSystemTheme();
@@ -291,6 +303,20 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
   }, [adapter]);
 
   useEffect(() => {
+    if (!adapter.readPricingSettings) return;
+    let disposed = false;
+    void adapter.readPricingSettings().then((value) => {
+      if (!disposed) {
+        setPricingSettings(value);
+        setPricingMessage(null);
+      }
+    }).catch((error) => {
+      if (!disposed) setPricingMessage(error instanceof Error ? error.message : "无法读取模型定价；当前不会套用任何价格。");
+    });
+    return () => { disposed = true; };
+  }, [adapter]);
+
+  useEffect(() => {
     if (view !== "settings" || !adapter.readAppPreferences) return;
     let disposed = false;
     void adapter.readAppPreferences().then((value) => {
@@ -348,6 +374,26 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
     setSuccessToast("项目合并设置已保存；来源日志和 Token 索引未修改。");
     return saved;
   }, [adapter]);
+
+  const savePricingSettings = useCallback(async (value: PricingSettings) => {
+    if (!adapter.setPricingSettings) {
+      setPricingMessage("当前环境不支持保存模型定价。");
+      return;
+    }
+    setIsSavingPricing(true);
+    setPricingMessage(null);
+    try {
+      const saved = await adapter.setPricingSettings(value);
+      setPricingSettings(saved);
+      await refresh();
+      setPricingMessage("价格已保存，并已按新规则重新汇总本机费用。");
+      setSuccessToast("模型价格与高峰期规则已保存。");
+    } catch (error) {
+      setPricingMessage(error instanceof Error ? error.message : "无法保存模型定价。");
+    } finally {
+      setIsSavingPricing(false);
+    }
+  }, [adapter, refresh]);
 
   const saveTheme = useCallback(async (themePreference: ThemePreference) => {
     setSettingsMessage(null);
@@ -601,7 +647,8 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
         <StatusNotice snapshot={snapshot} stale={stale} progress={progress} onRefresh={() => void refresh()} onOpenSettings={() => requestViewChange("settings")} />
         {view === "overview" && <OverviewView snapshot={snapshot} now={now} onOpenDay={openDayDetail} onOpenActivity={() => requestViewChange("activity")} />}
         {view === "activity" && <ActivityView usage={effectiveDeviceUsage} sourceHealth={snapshot.sourceHealth ?? []} range={range} onRangeChange={setRange} selectedSources={activitySources} selectionMode={activitySourceMode} onSelectionModeChange={(mode) => { setActivitySourceMode(mode); if (mode === "single") setActivitySources((current) => current.slice(-1)); }} onSourcesChange={(source) => setActivitySources((current) => toggleSourceSelection(current, source, activitySourceMode))} onClearSources={() => setActivitySources([])} summary={activityRange} insightSummary={insightRange} now={now} onOpenDay={openDayDetail} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} projectMergeRules={projectMergeRules} projectMergeMessage={projectMergeMessage} onSaveProjectMergeRules={saveProjectMergeRules} />}
-        {view === "cost" && <CostView usage={effectiveDeviceUsage} range={range} onRangeChange={setRange} selectedSources={costSources} selectionMode={costSourceMode} onSelectionModeChange={(mode) => { setCostSourceMode(mode); if (mode === "single") setCostSources((current) => current.slice(-1)); }} onSourcesChange={(source) => setCostSources((current) => toggleSourceSelection(current, source, costSourceMode))} onClearSources={() => setCostSources([])} summary={costRange} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} />}
+        {view === "cost" && <CostView usage={effectiveDeviceUsage} range={range} onRangeChange={setRange} selectedSources={costSources} selectionMode={costSourceMode} onSelectionModeChange={(mode) => { setCostSourceMode(mode); if (mode === "single") setCostSources((current) => current.slice(-1)); }} onSourcesChange={(source) => setCostSources((current) => toggleSourceSelection(current, source, costSourceMode))} onClearSources={() => setCostSources([])} summary={costRange} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} onOpenPricing={() => requestViewChange("pricing")} />}
+        {view === "pricing" && <PricingView usage={snapshot.deviceUsage ?? null} settings={pricingSettings} isSaving={isSavingPricing} message={pricingMessage} onSave={savePricingSettings} />}
         {view === "settings" && <SettingsView snapshot={snapshot} preferences={preferences} indexMaintenance={indexMaintenance} onPreferencesChange={setPreferences} onSave={() => void savePreferences()} onTestNotification={() => void sendTestNotification()} onCheckIndexes={() => void checkIndexes()} onRebuildIndexes={() => void rebuildIndexes()} onThemeChange={(value) => void saveTheme(value)} onSelectWallpaper={() => void selectWallpaper()} onClearWallpaper={() => void clearWallpaper()} onUpdateRenewal={updatePlanRenewal} isSaving={isSavingSettings} isMaintainingIndexes={isMaintainingIndexes} hasUnsavedChanges={hasUnsavedRuntimePreferences} message={settingsMessage} />}
       </main>
       {pendingView && (

@@ -7,6 +7,7 @@ import type {
   IndexMaintenanceReport,
   IndexRebuildResult,
   PlanRenewalSetting,
+  PricingSettings,
   ProjectMergeRule,
   RefreshProgress,
   RefreshSchedule,
@@ -31,6 +32,8 @@ export const APP_PREFERENCES_COMMAND = "read_app_preferences";
 export const SET_APP_PREFERENCES_COMMAND = "set_app_preferences";
 export const PROJECT_MERGE_RULES_COMMAND = "read_project_merge_rules";
 export const SET_PROJECT_MERGE_RULES_COMMAND = "set_project_merge_rules";
+export const PRICING_SETTINGS_COMMAND = "read_pricing_settings";
+export const SET_PRICING_SETTINGS_COMMAND = "set_pricing_settings";
 export const TEST_NOTIFICATION_COMMAND = "send_test_notification";
 export const INDEX_MAINTENANCE_COMMAND = "read_index_maintenance_report";
 export const REBUILD_INDEXES_COMMAND = "rebuild_indexes";
@@ -65,6 +68,8 @@ export interface DashboardAdapter {
   setAppPreferences?(value: AppPreferences): Promise<AppPreferences>;
   readProjectMergeRules?(): Promise<ProjectMergeRule[]>;
   setProjectMergeRules?(value: ProjectMergeRule[]): Promise<ProjectMergeRule[]>;
+  readPricingSettings?(): Promise<PricingSettings>;
+  setPricingSettings?(value: PricingSettings): Promise<PricingSettings>;
   sendTestNotification?(): Promise<AppPreferences>;
   readIndexMaintenanceReport?(): Promise<IndexMaintenanceReport>;
   rebuildIndexes?(): Promise<IndexRebuildResult>;
@@ -150,12 +155,10 @@ function normalizeDeviceUsage(value: unknown): DashboardSnapshot["deviceUsage"] 
       if (
         typeof tier.label !== "string"
         || typeof tier.condition !== "string"
-        || typeof tier.inputPerMillion !== "number"
-        || !Number.isFinite(tier.inputPerMillion)
+        || !optionalRate(tier.inputPerMillion)
         || !optionalRate(tier.cachedInputPerMillion)
         || !optionalRate(tier.cacheWritePerMillion)
-        || typeof tier.outputPerMillion !== "number"
-        || !Number.isFinite(tier.outputPerMillion)
+        || !optionalRate(tier.outputPerMillion)
       ) throw new Error("桌面端返回了无法识别的价格阶梯。");
       return tier;
     });
@@ -329,6 +332,46 @@ export function normalizeProjectMergeRules(value: unknown): ProjectMergeRule[] {
   });
 }
 
+export function normalizePricingSettings(value: unknown): PricingSettings {
+  if (!isRecord(value) || !isRecord(value.peak) || !Array.isArray(value.models)) {
+    throw new Error("桌面端返回了无法识别的模型定价设置。");
+  }
+  const peak = value.peak;
+  if (
+    !(value.updatedAt === null || typeof value.updatedAt === "string")
+    || typeof peak.startTime !== "string"
+    || typeof peak.endTime !== "string"
+    || typeof peak.multiplier !== "number"
+    || !Number.isFinite(peak.multiplier)
+    || peak.multiplier < 1
+  ) throw new Error("桌面端返回了无法识别的高峰期设置。");
+  const optionalRate = (rate: unknown): rate is number | null => rate === null
+    || (typeof rate === "number" && Number.isFinite(rate) && rate >= 0);
+  const models = value.models.map((model) => {
+    if (
+      !isRecord(model)
+      || typeof model.modelId !== "string"
+      || typeof model.displayName !== "string"
+      || (model.currency !== "USD" && model.currency !== "CNY")
+      || !optionalRate(model.inputPerMillion)
+      || !optionalRate(model.cachedInputPerMillion)
+      || !optionalRate(model.cacheWritePerMillion)
+      || !optionalRate(model.outputPerMillion)
+      || typeof model.peakEnabled !== "boolean"
+    ) throw new Error("桌面端返回了无法识别的模型单价。");
+    return model as unknown as PricingSettings["models"][number];
+  });
+  return {
+    updatedAt: value.updatedAt,
+    peak: {
+      startTime: peak.startTime,
+      endTime: peak.endTime,
+      multiplier: peak.multiplier,
+    },
+    models,
+  };
+}
+
 function normalizeIndexRebuildResult(value: unknown): IndexRebuildResult {
   if (!isRecord(value) || !(value.backupCreatedAt === null || typeof value.backupCreatedAt === "string")) {
     throw new Error("桌面端返回了无法识别的索引重建结果。");
@@ -435,6 +478,16 @@ export class TauriDashboardAdapter implements DashboardAdapter {
     return normalizeProjectMergeRules(await this.bridge.invoke(SET_PROJECT_MERGE_RULES_COMMAND, { rules: value }));
   }
 
+  async readPricingSettings(): Promise<PricingSettings> {
+    return normalizePricingSettings(await this.bridge.invoke(PRICING_SETTINGS_COMMAND));
+  }
+
+  async setPricingSettings(value: PricingSettings): Promise<PricingSettings> {
+    return normalizePricingSettings(await this.bridge.invoke(SET_PRICING_SETTINGS_COMMAND, {
+      pricingSettings: value,
+    }));
+  }
+
   async sendTestNotification(): Promise<AppPreferences> {
     return normalizeAppPreferences(await this.bridge.invoke(TEST_NOTIFICATION_COMMAND));
   }
@@ -523,6 +576,14 @@ export class MockDashboardAdapter implements DashboardAdapter {
   private visualPreferences: VisualPreferences;
   private appPreferences: AppPreferences;
   private projectMergeRules: ProjectMergeRule[] = [];
+  private pricingSettings: PricingSettings = {
+    updatedAt: "2026-09-25T09:30:00Z",
+    peak: { startTime: "18:00", endTime: "23:00", multiplier: 1.5 },
+    models: [
+      { modelId: "GPT-5.6 Sol", displayName: "GPT-5.6 Sol", currency: "USD", inputPerMillion: 4, cachedInputPerMillion: 0.4, cacheWritePerMillion: 5, outputPerMillion: 20, peakEnabled: true },
+      { modelId: "默认模型", displayName: "默认模型", currency: "USD", inputPerMillion: null, cachedInputPerMillion: null, cacheWritePerMillion: null, outputPerMillion: null, peakEnabled: false },
+    ],
+  };
 
   constructor(
     private readonly state: MockDashboardState = "ready",
@@ -616,6 +677,18 @@ export class MockDashboardAdapter implements DashboardAdapter {
   async setProjectMergeRules(value: ProjectMergeRule[]): Promise<ProjectMergeRule[]> {
     this.projectMergeRules = normalizeProjectMergeRules(value);
     return this.projectMergeRules;
+  }
+
+  async readPricingSettings(): Promise<PricingSettings> {
+    return this.pricingSettings;
+  }
+
+  async setPricingSettings(value: PricingSettings): Promise<PricingSettings> {
+    this.pricingSettings = normalizePricingSettings({
+      ...value,
+      updatedAt: new Date().toISOString(),
+    });
+    return this.pricingSettings;
   }
 
   async sendTestNotification(): Promise<AppPreferences> {

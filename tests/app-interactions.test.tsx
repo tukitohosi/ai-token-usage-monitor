@@ -32,7 +32,7 @@ describe("dashboard interactions", () => {
   it("keeps explicit names on every primary navigation button", async () => {
     render(<App adapter={new MockDashboardAdapter("ready", 0)} />);
     await screen.findByRole("heading", { name: "总览" });
-    for (const name of ["总览", "本机活动", "费用", "设置"]) {
+    for (const name of ["总览", "本机活动", "费用", "模型定价", "设置"]) {
       expect(screen.getByRole("button", { name }).getAttribute("aria-label")).toBe(name);
     }
   });
@@ -47,16 +47,35 @@ describe("dashboard interactions", () => {
     expect(document.querySelectorAll(".overview-grid__local")).toHaveLength(2);
   });
 
-  it("shows backend price rates and marks unpublished cache writes unpriced", async () => {
+  it("lets the user explicitly whitelist models for peak pricing", async () => {
     const user = userEvent.setup();
     render(<App adapter={new MockDashboardAdapter("ready", 0)} />);
-    await user.click(await screen.findByRole("button", { name: "费用" }));
-    await user.click(screen.getByRole("button", { name: "查看定价口径" }));
-    expect(screen.getByText("GPT-6 Astra")).toBeTruthy();
-    expect(screen.getByText("DeepSeek V4.1 Flash")).toBeTruthy();
-    expect(screen.getByText("Tencent Hy4 preview")).toBeTruthy();
-    expect(screen.getAllByText("未公布/未计价").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("¥18")).toBeTruthy();
+    await user.click(await screen.findByRole("button", { name: "模型定价" }));
+    expect(await screen.findByRole("heading", { name: "模型定价" })).toBeTruthy();
+    expect(screen.getByText("高峰期定价")).toBeTruthy();
+    expect((screen.getByLabelText("GPT-5.6 Sol 新输入") as HTMLInputElement).value).toBe("4");
+    expect((screen.getByLabelText("默认模型 新输入") as HTMLInputElement).value).toBe("");
+    const peakModels = screen.getByRole("group", { name: "高峰定价适用模型" });
+    const solPeak = within(peakModels).getByRole("checkbox", { name: "GPT-5.6 Sol 高峰定价" }) as HTMLInputElement;
+    const defaultPeak = within(peakModels).getByRole("checkbox", { name: "默认模型 高峰定价" }) as HTMLInputElement;
+    expect(solPeak.checked).toBe(true);
+    expect(defaultPeak.checked).toBe(false);
+    await user.click(defaultPeak);
+    expect(defaultPeak.checked).toBe(true);
+    expect(screen.getAllByText("高峰白名单")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "保存价格并重算" })).toBeTruthy();
+  });
+
+  it("shows a dedicated Codex Token view for today, 7 days, 30 days, and total", async () => {
+    const user = userEvent.setup();
+    render(<App adapter={new MockDashboardAdapter("ready", 0)} />);
+    await user.click(await screen.findByRole("button", { name: "本机活动" }));
+    await user.click(screen.getByRole("button", { name: "Codex Token" }));
+    expect(screen.getByRole("group", { name: "Codex Token 时间范围" })).toBeTruthy();
+    expect(screen.getByText("Codex 模型消耗")).toBeTruthy();
+    await user.click(within(screen.getByRole("group", { name: "Codex Token 时间范围" })).getByRole("button", { name: "30 天" }));
+    expect(screen.getByText("Codex · 最近 30 天")).toBeTruthy();
+    expect(screen.getByText(/不会向 Codex 创建对话、发送消息或发起推理/)).toBeTruthy();
   });
 
   it("supports selecting multiple AI sources", async () => {

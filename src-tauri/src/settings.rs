@@ -10,6 +10,8 @@ use rfd::FileDialog;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::pricing::PricingSettings;
+
 const PLAN_RENEWAL_KEY: &str = "plan-renewal-at";
 const THEME_PREFERENCE_KEY: &str = "ui-theme-preference";
 const BACKGROUND_FILE_KEY: &str = "ui-background-file";
@@ -25,17 +27,20 @@ const QUIET_HOURS_ENABLED_KEY: &str = "quiet-hours-enabled";
 const QUIET_HOURS_START_KEY: &str = "quiet-hours-start";
 const QUIET_HOURS_END_KEY: &str = "quiet-hours-end";
 const PROJECT_MERGE_RULES_KEY: &str = "project-merge-rules-v1";
+const PRICING_SETTINGS_KEY: &str = "model-pricing-v1";
 const BACKGROUND_DIRECTORY: &str = "backgrounds";
 const MAX_BACKGROUND_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_PROJECT_MERGE_RULES: usize = 50;
 const MAX_PROJECT_MERGE_MEMBERS: usize = 100;
 const MAX_PROJECT_FIELD_LENGTH: usize = 256;
+const MAX_PRICING_MODELS: usize = 200;
 
 #[derive(Debug)]
 pub(crate) enum SettingsError {
     InvalidDate,
     InvalidPreference,
     InvalidProjectMergeRules,
+    InvalidPricingSettings,
     Storage,
     InvalidBackground(String),
 }
@@ -114,6 +119,12 @@ pub(crate) struct ProjectMergeRule {
 struct ProjectMergeRulesDocument {
     version: u8,
     rules: Vec<ProjectMergeRule>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+struct PricingSettingsDocument {
+    version: u8,
+    settings: PricingSettings,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -309,6 +320,78 @@ pub(crate) fn write_project_merge_rules(
     write_setting(&transaction, PROJECT_MERGE_RULES_KEY, &value)?;
     transaction.commit().map_err(|_| SettingsError::Storage)?;
     Ok(rules.to_vec())
+}
+
+pub(crate) fn validate_pricing_settings(settings: &PricingSettings) -> Result<(), SettingsError> {
+    if !valid_clock(&settings.peak.start_time)
+        || !valid_clock(&settings.peak.end_time)
+        || !settings.peak.multiplier.is_finite()
+        || !(1.0..=100.0).contains(&settings.peak.multiplier)
+        || settings.models.len() > MAX_PRICING_MODELS
+    {
+        return Err(SettingsError::InvalidPricingSettings);
+    }
+    let mut identities = HashSet::new();
+    for rule in &settings.models {
+        let valid_text = |value: &str| {
+            let length = value.chars().count();
+            value.trim() == value && !value.is_empty() && length <= MAX_PROJECT_FIELD_LENGTH
+        };
+        let valid_rate = |rate: Option<f64>| {
+            rate.map_or(true, |value| {
+                value.is_finite() && (0.0..=1_000_000.0).contains(&value)
+            })
+        };
+        if !valid_text(&rule.model_id)
+            || !valid_text(&rule.display_name)
+            || !matches!(rule.currency.as_str(), "USD" | "CNY")
+            || !valid_rate(rule.input_per_million)
+            || !valid_rate(rule.cached_input_per_million)
+            || !valid_rate(rule.cache_write_per_million)
+            || !valid_rate(rule.output_per_million)
+            || !identities.insert(rule.model_id.to_lowercase())
+        {
+            return Err(SettingsError::InvalidPricingSettings);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn read_pricing_settings(
+    database_path: &Path,
+) -> Result<PricingSettings, SettingsError> {
+    let connection = open(database_path)?;
+    let Some(value) = read_setting(&connection, PRICING_SETTINGS_KEY)? else {
+        return Ok(PricingSettings::default());
+    };
+    let document: PricingSettingsDocument =
+        serde_json::from_str(&value).map_err(|_| SettingsError::InvalidPricingSettings)?;
+    if document.version != 1 {
+        return Err(SettingsError::InvalidPricingSettings);
+    }
+    validate_pricing_settings(&document.settings)?;
+    Ok(document.settings)
+}
+
+pub(crate) fn write_pricing_settings(
+    database_path: &Path,
+    settings: &PricingSettings,
+) -> Result<PricingSettings, SettingsError> {
+    validate_pricing_settings(settings)?;
+    let mut saved = settings.clone();
+    saved.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+    let value = serde_json::to_string(&PricingSettingsDocument {
+        version: 1,
+        settings: saved.clone(),
+    })
+    .map_err(|_| SettingsError::InvalidPricingSettings)?;
+    let mut connection = open(database_path)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| SettingsError::Storage)?;
+    write_setting(&transaction, PRICING_SETTINGS_KEY, &value)?;
+    transaction.commit().map_err(|_| SettingsError::Storage)?;
+    Ok(saved)
 }
 
 fn parse_theme_preference(value: Option<String>) -> ThemePreference {
@@ -839,5 +922,59 @@ mod tests {
             write_app_preferences(&settings_path, temporary.path(), &invalid, false),
             Err(SettingsError::InvalidPreference)
         ));
+    }
+
+    #[test]
+    fn persists_manual_pricing_without_compiled_model_defaults() {
+        let temporary = tempfile::tempdir().expect("temp dir");
+        let path = temporary.path().join("settings.sqlite3");
+        assert!(read_pricing_settings(&path)
+            .expect("read defaults")
+            .models
+            .is_empty());
+        let settings = PricingSettings {
+            updated_at: None,
+            peak: crate::pricing::PeakPricingSchedule {
+                start_time: "18:30".to_owned(),
+                end_time: "22:15".to_owned(),
+                multiplier: 1.75,
+            },
+            models: vec![crate::pricing::ModelPricingRule {
+                model_id: "my-model".to_owned(),
+                display_name: "My Model".to_owned(),
+                currency: "USD".to_owned(),
+                input_per_million: Some(2.0),
+                cached_input_per_million: Some(0.2),
+                cache_write_per_million: None,
+                output_per_million: Some(8.0),
+                peak_enabled: true,
+            }],
+        };
+        let saved = write_pricing_settings(&path, &settings).expect("save pricing");
+        assert!(saved.updated_at.is_some());
+        assert_eq!(read_pricing_settings(&path).expect("read pricing"), saved);
+    }
+
+    #[test]
+    fn rejects_invalid_pricing_without_overwriting_last_good_value() {
+        let temporary = tempfile::tempdir().expect("temp dir");
+        let path = temporary.path().join("settings.sqlite3");
+        let good = PricingSettings::default();
+        write_pricing_settings(&path, &good).expect("save defaults");
+        let invalid = PricingSettings {
+            peak: crate::pricing::PeakPricingSchedule {
+                multiplier: 0.5,
+                ..good.peak.clone()
+            },
+            ..good.clone()
+        };
+        assert!(matches!(
+            write_pricing_settings(&path, &invalid),
+            Err(SettingsError::InvalidPricingSettings)
+        ));
+        assert_eq!(
+            read_pricing_settings(&path).expect("last good").peak,
+            good.peak
+        );
     }
 }

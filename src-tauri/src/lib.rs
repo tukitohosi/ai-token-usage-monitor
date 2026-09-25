@@ -55,6 +55,7 @@ async fn set_plan_renewal_at(
         settings::SettingsError::InvalidDate => "请输入有效的续费日期。".to_owned(),
         settings::SettingsError::InvalidPreference => "本机续费时间设置无效。".to_owned(),
         settings::SettingsError::InvalidProjectMergeRules => "项目合并规则无效。".to_owned(),
+        settings::SettingsError::InvalidPricingSettings => "模型定价设置无效。".to_owned(),
         settings::SettingsError::Storage => "无法保存本机续费时间设置。".to_owned(),
         settings::SettingsError::InvalidBackground(_) => "无法保存本机续费时间设置。".to_owned(),
     })
@@ -111,6 +112,7 @@ fn map_visual_settings_error(error: settings::SettingsError) -> String {
         settings::SettingsError::InvalidDate
         | settings::SettingsError::InvalidPreference
         | settings::SettingsError::InvalidProjectMergeRules
+        | settings::SettingsError::InvalidPricingSettings
         | settings::SettingsError::Storage => "无法保存本机视觉设置。".to_owned(),
     }
 }
@@ -196,6 +198,41 @@ async fn set_project_merge_rules(
                 "项目合并规则无效，请检查成员和显示名称。".to_owned()
             }
             _ => "无法保存本机项目合并设置。".to_owned(),
+        })
+}
+
+#[tauri::command]
+async fn read_pricing_settings(
+    runtime: tauri::State<'_, runtime::UsageRuntime>,
+) -> Result<pricing::PricingSettings, String> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.read_pricing_settings())
+        .await
+        .map_err(|_| "后台模型定价读取任务意外结束。".to_owned())?
+        .map_err(|error| match error {
+            settings::SettingsError::InvalidPricingSettings => {
+                "模型定价设置已损坏，当前不会套用任何价格。".to_owned()
+            }
+            _ => "无法读取本机模型定价设置。".to_owned(),
+        })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn set_pricing_settings(
+    runtime: tauri::State<'_, runtime::UsageRuntime>,
+    pricing_settings: pricing::PricingSettings,
+) -> Result<pricing::PricingSettings, String> {
+    settings::validate_pricing_settings(&pricing_settings)
+        .map_err(|_| "模型定价参数无效，请检查时间、倍率和单价。".to_owned())?;
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.set_pricing_settings(&pricing_settings))
+        .await
+        .map_err(|_| "后台模型定价保存任务意外结束。".to_owned())?
+        .map_err(|error| match error {
+            settings::SettingsError::InvalidPricingSettings => {
+                "模型定价参数无效，请检查时间、倍率和单价。".to_owned()
+            }
+            _ => "无法保存本机模型定价设置。".to_owned(),
         })
 }
 
@@ -340,6 +377,8 @@ pub fn run() {
             set_app_preferences,
             read_project_merge_rules,
             set_project_merge_rules,
+            read_pricing_settings,
+            set_pricing_settings,
             send_test_notification,
             read_index_maintenance_report,
             rebuild_indexes

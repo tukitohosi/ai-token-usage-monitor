@@ -11,11 +11,13 @@ import type {
   AppPreferences,
   DashboardSnapshot,
   DeviceTokenUsage,
+  DeviceUsageSummary,
   DeviceUsageRangeSummary,
   IndexMaintenanceReport,
   NormalizedQuotaWindow,
   ProjectMergeMember,
   ProjectMergeRule,
+  PricingSettings,
   RefreshProgress,
   SourceHealthSummary,
   ThemePreference,
@@ -55,7 +57,7 @@ import {
 } from "./format";
 import { selectOverviewQuotas } from "./quota-view-model";
 
-export type AppView = "overview" | "activity" | "cost" | "settings";
+export type AppView = "overview" | "activity" | "cost" | "pricing" | "settings";
 export type IconName =
   | "activity"
   | "refresh"
@@ -385,7 +387,7 @@ export function OverviewView({
           detail={
             snapshot.deviceUsage?.todayCost.unpricedTokens
               ? `${formatTokens(snapshot.deviceUsage.todayCost.unpricedTokens)} Token 尚未定价`
-              : "按离线公开价格快照估算"
+              : "按本机手动模型价格估算"
           }
           icon="wallet"
           tone="green"
@@ -768,6 +770,8 @@ export function ActivityView({
   projectMergeMessage: string | null;
   onSaveProjectMergeRules: (rules: ProjectMergeRule[]) => Promise<ProjectMergeRule[]>;
 }) {
+  const [activityMode, setActivityMode] = useState<"all" | "codex">("all");
+  const [codexRange, setCodexRange] = useState<Exclude<UsageRange, "custom">>("today");
   return (
     <section className="view-panel">
       <PageHeading
@@ -775,7 +779,13 @@ export function ActivityView({
         title="本机活动"
         description="只汇总当前电脑可读取的派生数字，不代表账号套餐额度或其他设备。"
       />
-      {usage ? (
+      <div className="activity-view-switch" role="group" aria-label="本机活动视图">
+        <button type="button" className={activityMode === "all" ? "is-active" : ""} aria-pressed={activityMode === "all"} onClick={() => setActivityMode("all")}>来源总览</button>
+        <button type="button" className={activityMode === "codex" ? "is-active" : ""} aria-pressed={activityMode === "codex"} onClick={() => setActivityMode("codex")}>Codex Token</button>
+      </div>
+      {usage && activityMode === "codex" ? (
+        <CodexTokenView usage={usage} range={codexRange} onRangeChange={setCodexRange} />
+      ) : usage ? (
         <>
           <UnifiedFilters
             usage={usage}
@@ -834,6 +844,54 @@ export function ActivityView({
         />
       )}
     </section>
+  );
+}
+
+function CodexTokenView({
+  usage,
+  range,
+  onRangeChange,
+}: {
+  usage: DeviceUsageSummary;
+  range: Exclude<UsageRange, "custom">;
+  onRangeChange: (range: Exclude<UsageRange, "custom">) => void;
+}) {
+  const codex = usage.sources.find((source) => source.id === "codex");
+  if (!codex) return <EmptyState title="尚无 Codex 本机数据" description="检测到 Codex 本机日志后，这里会显示 Token 构成。" />;
+  const summary = codex.ranges?.[range] ?? (range === "today"
+    ? { usage: codex.today, cost: codex.todayCost, byModel: codex.todayByModel, byProject: [], dailyUsage: [] }
+    : { usage: codex.total, cost: codex.cost, byModel: codex.byModel, byProject: codex.byProject, dailyUsage: [] });
+  const categories = createTokenCategories(summary.usage);
+  const cacheBasis = summary.usage.inputTokens + summary.usage.cachedInputTokens + summary.usage.cacheWriteTokens;
+  const cacheShare = cacheBasis > 0 ? summary.usage.cachedInputTokens / cacheBasis : null;
+  const rangeLabel = RANGE_ITEMS.find((item) => item.id === range)?.label ?? "所选范围";
+  return (
+    <div className="codex-token-view">
+      <div className="codex-range-control segmented-control" role="group" aria-label="Codex Token 时间范围">
+        {RANGE_ITEMS.filter((item): item is typeof RANGE_ITEMS[number] & { id: Exclude<UsageRange, "custom"> } => item.id !== "custom").map((item) => (
+          <button key={item.id} type="button" className={range === item.id ? "is-active" : ""} aria-pressed={range === item.id} onClick={() => onRangeChange(item.id)}>{item.short}</button>
+        ))}
+      </div>
+      <div className="codex-token-grid">
+        <article className="content-card token-card codex-token-card">
+          <header>
+            <div><p className="eyebrow">Codex · {rangeLabel}</p><h2>{formatTokens(summary.usage.totalTokens)} Token</h2></div>
+            <span className="soft-pill">缓存读入 {cacheShare === null ? "—" : formatPercent(cacheShare * 100)}</span>
+          </header>
+          <div className="token-body">
+            <div className="token-donut" role="img" aria-label={categories.map((item) => `${item.label}${formatExactTokens(item.value)}`).join("，")} style={{ background: createDonutGradient(categories) }}>
+              <div><strong>{cacheShare === null ? "—" : formatPercent(cacheShare * 100)}</strong><span>缓存读入占比</span></div>
+            </div>
+            <ul>{categories.map((item, index) => <li key={item.label}><span className="legend-dot" style={{ background: TOKEN_COLORS[index] }} /><span>{item.label}</span><strong>{formatTokens(item.value)}</strong></li>)}</ul>
+          </div>
+        </article>
+        <article className="content-card codex-model-card">
+          <header><div><p className="eyebrow">MODEL USAGE</p><h2>Codex 模型消耗</h2><p>按当前时间范围内的 Token 从高到低排列。</p></div></header>
+          {summary.byModel.length > 0 ? <ol>{summary.byModel.map((model) => <li key={model.key}><div><strong>{model.label}</strong><span>{formatTokens(model.usage.totalTokens)} Token</span></div><b>{formatPercent(summary.usage.totalTokens > 0 ? model.usage.totalTokens / summary.usage.totalTokens * 100 : 0)}</b></li>)}</ol> : <p className="muted-copy">该时间范围暂无模型明细。</p>}
+        </article>
+      </div>
+      <div className="privacy-callout"><Icon name="shield" /><div><strong>只读本机 Codex 用量</strong><p>此视图读取本机派生日志，不会向 Codex 创建对话、发送消息或发起推理。</p></div></div>
+    </div>
   );
 }
 
@@ -1568,6 +1626,155 @@ function SourceHealthGrid({
   );
 }
 
+function mergeUsedModels(settings: PricingSettings, usage: DeviceUsageSummary | null): PricingSettings {
+  if (!usage) return settings;
+  const totals = new Map<string, { label: string; tokens: number }>();
+  for (const source of usage.sources) {
+    for (const model of source.byModel) {
+      const identity = model.label.trim().toLowerCase();
+      if (!identity) continue;
+      const current = totals.get(identity);
+      totals.set(identity, {
+        label: current?.label ?? model.label,
+        tokens: (current?.tokens ?? 0) + model.usage.totalTokens,
+      });
+    }
+  }
+  const saved = new Map(settings.models.map((model) => [model.modelId.trim().toLowerCase(), model]));
+  const used = [...totals.entries()]
+    .sort((left, right) => right[1].tokens - left[1].tokens)
+    .map(([identity, value]) => saved.get(identity) ?? {
+      modelId: value.label,
+      displayName: value.label,
+      currency: "USD" as const,
+      inputPerMillion: null,
+      cachedInputPerMillion: null,
+      cacheWritePerMillion: null,
+      outputPerMillion: null,
+      peakEnabled: false,
+    });
+  const usedIds = new Set(used.map((model) => model.modelId.trim().toLowerCase()));
+  return { ...settings, models: [...used, ...settings.models.filter((model) => !usedIds.has(model.modelId.trim().toLowerCase()))] };
+}
+
+export function PricingView({
+  usage,
+  settings,
+  isSaving,
+  message,
+  onSave,
+}: {
+  usage: DeviceUsageSummary | null;
+  settings: PricingSettings;
+  isSaving: boolean;
+  message: string | null;
+  onSave: (settings: PricingSettings) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState(() => mergeUsedModels(settings, usage));
+  useEffect(() => setDraft(mergeUsedModels(settings, usage)), [settings, usage]);
+  const tokenTotals = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const source of usage?.sources ?? []) {
+      for (const model of source.byModel) {
+        const identity = model.label.trim().toLowerCase();
+        totals.set(identity, (totals.get(identity) ?? 0) + model.usage.totalTokens);
+      }
+    }
+    return totals;
+  }, [usage]);
+  const updateModel = (modelId: string, patch: Partial<PricingSettings["models"][number]>) => {
+    setDraft((current) => ({
+      ...current,
+      models: current.models.map((model) => model.modelId === modelId ? { ...model, ...patch } : model),
+    }));
+  };
+  const rateInput = (
+    model: PricingSettings["models"][number],
+    field: "inputPerMillion" | "cachedInputPerMillion" | "cacheWritePerMillion" | "outputPerMillion",
+    label: string,
+  ) => (
+    <label className="price-field">
+      <span>{label}</span>
+      <input
+        type="number"
+        min="0"
+        step="0.001"
+        inputMode="decimal"
+        aria-label={`${model.displayName} ${label}`}
+        placeholder="未设置"
+        value={model[field] ?? ""}
+        onChange={(event) => updateModel(model.modelId, { [field]: event.target.value === "" ? null : Number(event.target.value) })}
+      />
+    </label>
+  );
+  const usedModels = draft.models
+    .filter((model) => tokenTotals.has(model.modelId.trim().toLowerCase()))
+    .sort((left, right) => (tokenTotals.get(right.modelId.trim().toLowerCase()) ?? 0) - (tokenTotals.get(left.modelId.trim().toLowerCase()) ?? 0));
+  const peakModelCount = usedModels.filter((model) => model.peakEnabled).length;
+  return (
+    <section className="view-panel">
+      <PageHeading
+        eyebrow="MANUAL API PRICING"
+        title="模型定价"
+        description="价格完全由你在本机维护；应用不再内置或自动回退到任何模型 API 价格。"
+        actions={<button className="primary-button" type="button" disabled={isSaving || usedModels.length === 0} onClick={() => void onSave(draft)}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>}
+      />
+      <article className="content-card peak-pricing-card">
+        <header><div><p className="eyebrow">PEAK PRICING</p><h2>高峰期定价</h2><p>使用本机时间；只有加入下方白名单的模型才会乘以该倍率。</p></div><span className="soft-pill">跨午夜时段也支持</span></header>
+        <div className="peak-pricing-fields">
+          <label><span>开始时间</span><input type="time" value={draft.peak.startTime} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, startTime: event.target.value } }))} /></label>
+          <label><span>结束时间</span><input type="time" value={draft.peak.endTime} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, endTime: event.target.value } }))} /></label>
+          <label><span>收费倍率</span><div className="multiplier-input"><input type="number" min="1" max="100" step="0.1" value={draft.peak.multiplier} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, multiplier: Number(event.target.value) } }))} /><b>×</b></div></label>
+        </div>
+        <div className="peak-model-selector">
+          <div className="peak-model-selector__heading">
+            <div><strong>指定适用模型</strong><p>未选中的模型始终使用常规定价，不受高峰时段和倍率影响。</p></div>
+            <span>{peakModelCount} 个模型</span>
+          </div>
+          <div className="peak-model-options" role="group" aria-label="高峰定价适用模型">
+            {usedModels.map((model) => (
+              <label className={`peak-model-option${model.peakEnabled ? " is-selected" : ""}`} key={model.modelId}>
+                <input
+                  type="checkbox"
+                  aria-label={`${model.displayName} 高峰定价`}
+                  checked={model.peakEnabled}
+                  onChange={(event) => updateModel(model.modelId, { peakEnabled: event.target.checked })}
+                />
+                <span><strong>{model.displayName}</strong><small>{model.peakEnabled ? "应用高峰倍率" : "仅常规定价"}</small></span>
+              </label>
+            ))}
+            {usedModels.length === 0 && <span className="muted-copy">发现使用过的模型后，可在这里指定高峰定价白名单。</span>}
+          </div>
+        </div>
+      </article>
+      <div className="pricing-page-note" role="note"><Icon name="info" /><span>下列模型来自本机已索引的真实用量，并按累计 Token 从高到低排列。单价单位均为“每 100 万 Token”。留空的类别会保留为未定价，不会按 0 元处理。</span></div>
+      {message && <p className="pricing-save-message" role="status">{message}</p>}
+      <div className="model-pricing-list">
+        {usedModels.map((model, index) => {
+          const tokens = tokenTotals.get(model.modelId.trim().toLowerCase()) ?? 0;
+          const configured = [model.inputPerMillion, model.cachedInputPerMillion, model.cacheWritePerMillion, model.outputPerMillion].every((value) => value !== null);
+          return (
+            <article className="content-card model-price-card" key={model.modelId}>
+              <header>
+                <div className="model-price-rank"><span>{String(index + 1).padStart(2, "0")}</span><div><h2>{model.displayName}</h2><p>{formatTokens(tokens)} Token · 累计消耗</p></div></div>
+                <div className="model-price-status"><span className={model.peakEnabled ? "is-peak-assigned" : "is-standard-only"}>{model.peakEnabled ? "高峰白名单" : "仅常规定价"}</span><span className={configured ? "is-configured" : "is-unpriced"}>{configured ? "已完整定价" : "仍有未定价项"}</span><label><span>币种</span><select aria-label={`${model.displayName} 币种`} value={model.currency} onChange={(event) => updateModel(model.modelId, { currency: event.target.value as "USD" | "CNY" })}><option value="USD">USD $</option><option value="CNY">CNY ¥</option></select></label></div>
+              </header>
+              <div className="model-price-fields">
+                {rateInput(model, "inputPerMillion", "新输入")}
+                {rateInput(model, "cachedInputPerMillion", "缓存读入")}
+                {rateInput(model, "cacheWritePerMillion", "缓存写入")}
+                {rateInput(model, "outputPerMillion", "输出")}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+      {usedModels.length === 0 && <EmptyState title="尚未发现使用过的模型" description="完成一次本机用量扫描后，模型会自动出现在这里。" />}
+      <div className="privacy-callout"><Icon name="shield" /><div><strong>定价设置只保存在本机</strong><p>保存后会重新汇总本机派生索引；不会修改来源日志，也不会向任何模型供应商发送数据。</p></div></div>
+    </section>
+  );
+}
+
 export function CostView({
   usage,
   range,
@@ -1587,15 +1794,15 @@ export function CostView({
   isLoadingCustomRange,
   customRangeError,
   summary,
-}: FilterProps & { summary: DeviceUsageRangeSummary | null }) {
-  const [showPricingDetails, setShowPricingDetails] = useState(false);
+  onOpenPricing,
+}: FilterProps & { summary: DeviceUsageRangeSummary | null; onOpenPricing: () => void }) {
   if (!usage || !summary)
     return (
       <section className="view-panel">
         <PageHeading
           eyebrow="COST"
           title="费用"
-          description="离线价格快照与未定价覆盖情况。"
+          description="本机手动价格与未定价覆盖情况。"
         />
         <EmptyState
           title="暂无费用数据"
@@ -1617,8 +1824,8 @@ export function CostView({
       <PageHeading
         eyebrow="COST ESTIMATE"
         title="费用"
-        description="固定离线 Standard API 价格快照只用于估算，不代表订阅、Credits 或实际账单。"
-        actions={<button className="secondary-button" type="button" aria-expanded={showPricingDetails} onClick={() => setShowPricingDetails((value) => !value)}>{showPricingDetails ? "收起定价口径" : "查看定价口径"}</button>}
+        description="只按你保存的本机 API 单价估算，不代表订阅、Credits 或实际账单。"
+        actions={<button className="secondary-button" type="button" onClick={onOpenPricing}>管理模型价格</button>}
       />
       <UnifiedFilters
         usage={usage}
@@ -1643,7 +1850,7 @@ export function CostView({
         <MetricCard
           eyebrow="USD 估算"
           value={formatMoney("$", totals.usd)}
-          detail={`价格快照 ${usage.priceSnapshotDate}`}
+          detail={usage.priceSnapshotDate === "未保存" ? "尚未保存模型价格" : "按本机已保存价格重算"}
           icon="wallet"
           tone="green"
         />
@@ -1659,7 +1866,7 @@ export function CostView({
           value={formatPercent(
             totalTokens > 0 ? (pricedTokens / totalTokens) * 100 : 0,
           )}
-          detail={`${formatTokens(pricedTokens)} Token 已匹配公开价格`}
+          detail={`${formatTokens(pricedTokens)} Token 已匹配手动价格`}
           icon="check"
           tone="green"
         />
@@ -1671,61 +1878,6 @@ export function CostView({
           tone="cyan"
         />
       </div>
-      {showPricingDetails && (
-        <article className="content-card pricing-details">
-          <header>
-            <div>
-              <p className="eyebrow">OFFLINE PRICE SNAPSHOT</p>
-              <h2>定价口径</h2>
-              <p>价格快照 {usage.priceSnapshotDate}；普通输入、缓存输入、缓存写入和输出按可确认的模型规则分别估算。</p>
-            </div>
-          </header>
-          <div className="pricing-rules">
-            <p><strong>不会自动换汇：</strong>USD 与 CNY 始终分开累计。</p>
-            <p><strong>不会把缺失当免费：</strong>未知模型、缺少必要事件时间或特殊长上下文会保留为未定价。</p>
-            <p><strong>只按 Standard API：</strong>不套用订阅、Credits、Fast、Batch、Flex 或数据驻留等其他计费条件。</p>
-            <p><strong>不是实际账单：</strong>这里不代表 OAuth、代理 Credits 或工作区结算金额。</p>
-          </div>
-          <div className="pricing-catalog" aria-label="每百万 Token 价格目录">
-            {usage.priceCatalog.map((entry) => (
-              <section className="pricing-catalog__entry" key={entry.modelId}>
-                <header>
-                  <div>
-                    <h3>{entry.displayName}</h3>
-                    <code>{entry.modelId}</code>
-                  </div>
-                  <span>{entry.sourceLabel} · {entry.currency}</span>
-                </header>
-                {entry.aliases.length > 0 && <p>兼容别名：{entry.aliases.join("、")}</p>}
-                <div className="pricing-table-wrap">
-                  <table>
-                    <thead><tr><th>档位与条件</th><th>输入</th><th>缓存输入</th><th>缓存写入</th><th>输出</th></tr></thead>
-                    <tbody>
-                      {entry.tiers.map((tier) => (
-                        <tr key={`${entry.modelId}:${tier.label}`}>
-                          <td><strong>{tier.label}</strong><small>{tier.condition}</small></td>
-                          <td>{formatCatalogRate(tier.inputPerMillion, entry.currency)}</td>
-                          <td>{formatCatalogRate(tier.cachedInputPerMillion, entry.currency)}</td>
-                          <td>{formatCatalogRate(tier.cacheWritePerMillion, entry.currency)}</td>
-                          <td>{formatCatalogRate(tier.outputPerMillion, entry.currency)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-            ))}
-          </div>
-          <ol>
-            {summary.byModel.slice(0, 8).map((model) => (
-              <li key={model.key}>
-                <div><strong>{model.label}</strong><span>{formatTokens(model.usage.totalTokens)} Token</span></div>
-                <div><b>{formatCostCompact(model.cost)}</b>{model.cost.unpricedTokens > 0 && <small>未定价 {formatTokens(model.cost.unpricedTokens)}</small>}</div>
-              </li>
-            ))}
-          </ol>
-        </article>
-      )}
       <article className="content-card billing-card">
         <header>
           <div>
@@ -2684,11 +2836,6 @@ function createDonutGradient(
 }
 function formatMoney(symbol: "$" | "¥", value: number): string {
   return `${symbol}${new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(value)}`;
-}
-function formatCatalogRate(value: number | null, currency: "USD" | "CNY"): string {
-  if (value === null) return "未公布/未计价";
-  const symbol = currency === "USD" ? "$" : "¥";
-  return `${symbol}${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 4 }).format(value)}`;
 }
 function formatCostCompact(
   cost: { usd: number; cny: number; unpricedTokens: number } | null | undefined,

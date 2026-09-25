@@ -24,6 +24,8 @@ const {
   REBUILD_INDEXES_COMMAND,
   PROJECT_MERGE_RULES_COMMAND,
   SET_PROJECT_MERGE_RULES_COMMAND,
+  PRICING_SETTINGS_COMMAND,
+  SET_PRICING_SETTINGS_COMMAND,
   USAGE_DAY_DETAIL_COMMAND,
   VISUAL_PREFERENCES_COMMAND,
   SNAPSHOT_COMMAND,
@@ -205,6 +207,19 @@ describe("Tauri dashboard adapter", () => {
     await expect(adapter.setProjectMergeRules(rules)).resolves.toEqual(rules);
     expect(fixture.bridge.invoke).toHaveBeenNthCalledWith(1, PROJECT_MERGE_RULES_COMMAND);
     expect(fixture.bridge.invoke).toHaveBeenNthCalledWith(2, SET_PROJECT_MERGE_RULES_COMMAND, { rules });
+  });
+
+  it("round-trips manual pricing through dedicated local commands", async () => {
+    const snapshot = createMockDashboardSnapshot("ready");
+    const pricing = await new MockDashboardAdapter("ready", 0).readPricingSettings();
+    const fixture = bridgeFixture(snapshot);
+    fixture.bridge.invoke.mockResolvedValue(pricing);
+    const adapter = new TauriDashboardAdapter(fixture.bridge);
+
+    await expect(adapter.readPricingSettings()).resolves.toEqual(pricing);
+    await expect(adapter.setPricingSettings(pricing)).resolves.toEqual(pricing);
+    expect(fixture.bridge.invoke).toHaveBeenNthCalledWith(1, PRICING_SETTINGS_COMMAND);
+    expect(fixture.bridge.invoke).toHaveBeenNthCalledWith(2, SET_PRICING_SETTINGS_COMMAND, { pricingSettings: pricing });
   });
 
   it("uses the dedicated command for a test notification", async () => {

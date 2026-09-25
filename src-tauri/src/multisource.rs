@@ -205,6 +205,7 @@ pub(crate) struct SourceCreditBalance {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeviceUsageSummary {
     pub(crate) generated_at: String,
+    pub(crate) pricing_mode: &'static str,
     pub(crate) price_snapshot_date: String,
     pub(crate) price_catalog: Vec<pricing::PriceCatalogEntry>,
     pub(crate) total: DeviceTokenUsage,
@@ -576,18 +577,20 @@ impl MultiSourceIndex {
         Ok(Self { connection })
     }
 
-    pub(crate) fn collect(
+    pub(crate) fn collect_with_pricing(
         &mut self,
         user_home: &Path,
         codex_local: Result<(LocalUsageSummary, Vec<LocalUsageEvent>, Option<i64>), ()>,
+        pricing_settings: &pricing::PricingSettings,
     ) -> DeviceUsageSummary {
-        self.collect_with_progress(user_home, codex_local, |_| {})
+        self.collect_with_progress_and_pricing(user_home, codex_local, pricing_settings, |_| {})
     }
 
-    pub(crate) fn collect_with_progress<F>(
+    pub(crate) fn collect_with_progress_and_pricing<F>(
         &mut self,
         user_home: &Path,
         codex_local: Result<(LocalUsageSummary, Vec<LocalUsageEvent>, Option<i64>), ()>,
+        pricing_settings: &pricing::PricingSettings,
         mut on_progress: F,
     ) -> DeviceUsageSummary
     where
@@ -595,7 +598,9 @@ impl MultiSourceIndex {
     {
         let mut states = Vec::new();
         let codex = match codex_local {
-            Ok((summary, events, new_events)) => codex_summary(summary, events, new_events),
+            Ok((summary, events, new_events)) => {
+                codex_summary_with_pricing(summary, events, new_events, pricing_settings)
+            }
             Err(()) => empty_source_summary(SourceState::error(
                 SOURCE_CODEX,
                 "Codex",
@@ -674,7 +679,10 @@ impl MultiSourceIndex {
 
         let mut sources = vec![codex];
         for state in states {
-            sources.push(self.aggregate_source(self.with_persisted_last_success(state)));
+            sources.push(self.aggregate_source_with_pricing(
+                self.with_persisted_last_success(state),
+                pricing_settings,
+            ));
         }
 
         let mut ranges = RangesAccumulator::default();
@@ -685,8 +693,12 @@ impl MultiSourceIndex {
 
         DeviceUsageSummary {
             generated_at: Utc::now().to_rfc3339(),
-            price_snapshot_date: pricing::PRICE_SNAPSHOT_DATE.to_owned(),
-            price_catalog: pricing::catalog(),
+            pricing_mode: "manual",
+            price_snapshot_date: pricing_settings
+                .updated_at
+                .clone()
+                .unwrap_or_else(|| "未保存".to_owned()),
+            price_catalog: pricing::catalog(pricing_settings),
             total: ranges.total.usage,
             today: ranges.today.usage,
             cost: ranges.total.cost.clone(),
@@ -985,7 +997,16 @@ impl MultiSourceIndex {
         state
     }
 
+    #[cfg(test)]
     fn aggregate_source(&self, state: SourceState) -> UsageSourceSummary {
+        self.aggregate_source_with_pricing(state, &pricing::PricingSettings::default())
+    }
+
+    fn aggregate_source_with_pricing(
+        &self,
+        state: SourceState,
+        pricing_settings: &pricing::PricingSettings,
+    ) -> UsageSourceSummary {
         if state.status == "unavailable" {
             return empty_source_summary(state);
         }
@@ -1024,7 +1045,7 @@ impl MultiSourceIndex {
             }) {
                 for row in rows.flatten() {
                     indexed_events += 1;
-                    let event_cost = cost_for(&row.1, row.3, row.0);
+                    let event_cost = cost_for(&row.1, row.3, row.0, pricing_settings);
                     ranges.add_event(&row.1, &row.2, row.3, &event_cost, row.0, today_date);
                 }
             }
@@ -1053,6 +1074,14 @@ impl MultiSourceIndex {
     }
 
     pub(crate) fn day_tasks(&self, date: &str) -> Result<Vec<TaskUsageDetail>, ()> {
+        self.day_tasks_with_pricing(date, &pricing::PricingSettings::default())
+    }
+
+    pub(crate) fn day_tasks_with_pricing(
+        &self,
+        date: &str,
+        pricing_settings: &pricing::PricingSettings,
+    ) -> Result<Vec<TaskUsageDetail>, ()> {
         let Some((start, end)) = local_day_bounds(date) else {
             return Err(());
         };
@@ -1080,13 +1109,14 @@ impl MultiSourceIndex {
                     total_tokens: row.get(13)?,
                 };
                 let cache_metrics_available = row.get::<_, i64>(10)? != 0;
-                Ok(task_detail(
+                Ok(task_detail_with_pricing(
                     occurred_at_ms,
                     source,
                     model_label,
                     project_label,
                     usage,
                     cache_metrics_available,
+                    pricing_settings,
                 ))
             })
             .map_err(|_| ())?;
@@ -1105,6 +1135,13 @@ pub(crate) fn build_day_detail(date: String, mut tasks: Vec<TaskUsageDetail>) ->
 }
 
 pub(crate) fn codex_day_tasks(events: Vec<LocalUsageEvent>) -> Vec<TaskUsageDetail> {
+    codex_day_tasks_with_pricing(events, &pricing::PricingSettings::default())
+}
+
+pub(crate) fn codex_day_tasks_with_pricing(
+    events: Vec<LocalUsageEvent>,
+    pricing_settings: &pricing::PricingSettings,
+) -> Vec<TaskUsageDetail> {
     events
         .into_iter()
         .map(|event| {
@@ -1116,18 +1153,20 @@ pub(crate) fn codex_day_tasks(events: Vec<LocalUsageEvent>) -> Vec<TaskUsageDeta
                 event.usage.reasoning_output_tokens,
                 Some(event.usage.total_tokens),
             );
-            task_detail(
+            task_detail_with_pricing(
                 event.occurred_at_ms,
                 SOURCE_CODEX.to_owned(),
                 event.model_label,
                 event.project_label,
                 usage,
                 event.cache_metrics_available,
+                pricing_settings,
             )
         })
         .collect()
 }
 
+#[cfg(test)]
 fn task_detail(
     occurred_at_ms: Option<i64>,
     source: String,
@@ -1135,6 +1174,26 @@ fn task_detail(
     project_label: String,
     usage: DeviceTokenUsage,
     cache_metrics_available: bool,
+) -> TaskUsageDetail {
+    task_detail_with_pricing(
+        occurred_at_ms,
+        source,
+        model_label,
+        project_label,
+        usage,
+        cache_metrics_available,
+        &pricing::PricingSettings::default(),
+    )
+}
+
+fn task_detail_with_pricing(
+    occurred_at_ms: Option<i64>,
+    source: String,
+    model_label: String,
+    project_label: String,
+    usage: DeviceTokenUsage,
+    cache_metrics_available: bool,
+    pricing_settings: &pricing::PricingSettings,
 ) -> TaskUsageDetail {
     let denominator = usage.input_tokens + usage.cached_input_tokens + usage.cache_write_tokens;
     let cache_hit_rate = if cache_metrics_available && denominator > 0 {
@@ -1146,7 +1205,7 @@ fn task_detail(
         .and_then(|time| Local.timestamp_millis_opt(time).single())
         .map(|time| format!("本机任务 · {}", time.format("%H:%M")))
         .unwrap_or_else(|| "本机任务".to_owned());
-    let cost = cost_for(&model_label, usage, occurred_at_ms);
+    let cost = cost_for(&model_label, usage, occurred_at_ms, pricing_settings);
     TaskUsageDetail {
         occurred_at_ms,
         source: source_label(&source).to_owned(),
@@ -1182,10 +1241,11 @@ fn source_label(source: &str) -> &str {
     }
 }
 
-fn codex_summary(
+fn codex_summary_with_pricing(
     summary: LocalUsageSummary,
     events: Vec<LocalUsageEvent>,
     new_events: Option<i64>,
+    pricing_settings: &pricing::PricingSettings,
 ) -> UsageSourceSummary {
     let convert = |usage: crate::index::TokenUsage| {
         DeviceTokenUsage::from_parts(
@@ -1201,7 +1261,12 @@ fn codex_summary(
     let today_date = Local::now().date_naive();
     for event in events {
         let usage = convert(event.usage);
-        let cost = cost_for(&event.model_label, usage, event.occurred_at_ms);
+        let cost = cost_for(
+            &event.model_label,
+            usage,
+            event.occurred_at_ms,
+            pricing_settings,
+        );
         ranges.add_event(
             &event.model_label,
             &event.project_label,
@@ -1746,8 +1811,14 @@ fn cost_for(
     model_label: &str,
     usage: DeviceTokenUsage,
     occurred_at_ms: Option<i64>,
+    pricing_settings: &pricing::PricingSettings,
 ) -> CostSummary {
-    pricing::estimate(model_label, price_usage(usage), occurred_at_ms)
+    pricing::estimate(
+        model_label,
+        price_usage(usage),
+        occurred_at_ms,
+        pricing_settings,
+    )
 }
 
 /// Advances only the app's derived source index.  A full re-read is safer than
@@ -2350,7 +2421,28 @@ mod tests {
             transaction.commit().expect("commit");
         }
 
-        let summary = index.aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"));
+        let pricing = pricing::PricingSettings {
+            updated_at: None,
+            peak: pricing::PeakPricingSchedule {
+                start_time: "18:00".to_owned(),
+                end_time: "23:00".to_owned(),
+                multiplier: 1.5,
+            },
+            models: vec![pricing::ModelPricingRule {
+                model_id: "claude-sonnet-4-20250514".to_owned(),
+                display_name: "Claude Sonnet 4".to_owned(),
+                currency: "USD".to_owned(),
+                input_per_million: Some(3.0),
+                cached_input_per_million: Some(0.3),
+                cache_write_per_million: Some(3.75),
+                output_per_million: Some(15.0),
+                peak_enabled: false,
+            }],
+        };
+        let summary = index.aggregate_source_with_pricing(
+            SourceState::ready(SOURCE_CLAUDE, "Claude Code"),
+            &pricing,
+        );
         assert_eq!(summary.total.total_tokens, 1_500);
         assert_eq!(summary.today.total_tokens, 1_000);
         assert_eq!(summary.today_by_model.len(), 1);

@@ -457,7 +457,8 @@ function createDeviceUsage(now: number, local: LocalUsageSummary): DeviceUsageSu
 
   return {
     generatedAt: new Date(now - 18_000).toISOString(),
-    priceSnapshotDate: "2026-09-20",
+    pricingMode: "manual",
+    priceSnapshotDate: "2026-09-25T09:30:00Z",
     priceCatalog: [
       {
         displayName: "GPT-6 Astra",

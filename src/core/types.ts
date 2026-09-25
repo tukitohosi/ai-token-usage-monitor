@@ -182,6 +182,7 @@ export interface UsageSourceSummary {
 
 export interface DeviceUsageSummary {
   generatedAt: string;
+  pricingMode?: "manual";
   priceSnapshotDate: string;
   priceCatalog: PriceCatalogEntry[];
   total: DeviceTokenUsage;
@@ -199,10 +200,10 @@ export interface DeviceUsageSummary {
 export interface PriceCatalogTier {
   label: string;
   condition: string;
-  inputPerMillion: number;
+  inputPerMillion: number | null;
   cachedInputPerMillion: number | null;
   cacheWritePerMillion: number | null;
-  outputPerMillion: number;
+  outputPerMillion: number | null;
 }
 
 export interface PriceCatalogEntry {
@@ -212,6 +213,32 @@ export interface PriceCatalogEntry {
   currency: "USD" | "CNY";
   sourceLabel: string;
   tiers: PriceCatalogTier[];
+}
+
+export type PricingCurrency = "USD" | "CNY";
+
+export interface PeakPricingSchedule {
+  startTime: string;
+  endTime: string;
+  multiplier: number;
+}
+
+export interface ModelPricingRule {
+  /** Case-insensitive model label used by locally indexed events. */
+  modelId: string;
+  displayName: string;
+  currency: PricingCurrency;
+  inputPerMillion: number | null;
+  cachedInputPerMillion: number | null;
+  cacheWritePerMillion: number | null;
+  outputPerMillion: number | null;
+  peakEnabled: boolean;
+}
+
+export interface PricingSettings {
+  updatedAt: string | null;
+  peak: PeakPricingSchedule;
+  models: ModelPricingRule[];
 }
 
 export interface SourceHealthSummary {
