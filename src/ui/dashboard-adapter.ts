@@ -48,6 +48,7 @@ export interface DashboardAdapter {
   readCachedSnapshot?(): Promise<DashboardSnapshot | null>;
   /** Explicitly asks the backing data source to build a fresh snapshot. */
   refresh?(): Promise<DashboardSnapshot>;
+  refreshLocal?(): Promise<DashboardSnapshot>;
   /** Receives complete snapshots pushed by the desktop backend. */
   subscribe?(listener: DashboardSnapshotListener): Promise<UnsubscribeDashboard>;
   subscribeProgress?(listener: (progress: RefreshProgress) => void): Promise<UnsubscribeDashboard>;
@@ -206,8 +207,18 @@ export function normalizeDashboardSnapshot(value: unknown): DashboardSnapshot {
     planRenewalSource,
     refreshSchedule,
     accountDiagnostics,
+    accountSync: normalizeAccountSync(value.accountSync),
     deviceUsage,
   };
+}
+
+function normalizeAccountSync(value: unknown): DashboardSnapshot["accountSync"] {
+  if (value == null) return null;
+  if (!isRecord(value) || !["idle", "syncing", "localOnly", "ready", "partial", "offline", "error", "unauthenticated", "unsupported"].includes(String(value.status))) throw new Error("账号同步状态无效。");
+  for (const field of [value.quota, value.usage]) {
+    if (!isRecord(field) || typeof field.stale !== "boolean" || !(field.lastSuccessfulAt === null || typeof field.lastSuccessfulAt === "string")) throw new Error("账号更新时间无效。");
+  }
+  return value as unknown as DashboardSnapshot["accountSync"];
 }
 
 export function normalizeRefreshSchedule(value: unknown): RefreshSchedule | null {
@@ -272,7 +283,7 @@ function normalizeAppPreferences(value: unknown): AppPreferences {
   ) {
     throw new Error("桌面端返回了无法识别的应用设置。");
   }
-  return { ...visual, ...value } as AppPreferences;
+  return { ...visual, ...value, localOnly: value.localOnly === true } as AppPreferences;
 }
 
 function normalizeIndexMaintenanceReport(value: unknown): IndexMaintenanceReport {
@@ -407,6 +418,10 @@ export class TauriDashboardAdapter implements DashboardAdapter {
     return normalizeDashboardSnapshot(value);
   }
 
+  async refreshLocal(): Promise<DashboardSnapshot> {
+    return normalizeDashboardSnapshot(await this.bridge.invoke(SNAPSHOT_COMMAND, { localOnly: true }));
+  }
+
   async readSnapshot(): Promise<DashboardSnapshot> {
     return this.refresh();
   }
@@ -455,6 +470,7 @@ export class TauriDashboardAdapter implements DashboardAdapter {
 
   async setAppPreferences(value: AppPreferences): Promise<AppPreferences> {
     const preferences = {
+      localOnly: value.localOnly ?? false,
       refreshIntervalMinutes: value.refreshIntervalMinutes,
       closeBehavior: value.closeBehavior,
       quotaWarningPercent: value.quotaWarningPercent,
@@ -593,6 +609,7 @@ export class MockDashboardAdapter implements DashboardAdapter {
     this.visualPreferences = { themePreference, backgroundAssetPath: null };
     this.appPreferences = {
       ...this.visualPreferences,
+      localOnly: false,
       refreshIntervalMinutes: 1,
       closeBehavior: "hideToTray",
       autostartEnabled: false,
@@ -616,10 +633,13 @@ export class MockDashboardAdapter implements DashboardAdapter {
     const snapshot = createMockDashboardSnapshot(this.state);
     return {
       ...snapshot,
+      accountSync: { status: this.appPreferences.localOnly ? "localOnly" : "ready", quota: { lastSuccessfulAt: snapshot.fetchedAt, stale: !!this.appPreferences.localOnly }, usage: { lastSuccessfulAt: snapshot.fetchedAt, stale: !!this.appPreferences.localOnly } },
       planRenewalAt: this.manualPlanRenewalAt,
       planRenewalSource: this.manualPlanRenewalAt === null ? null : "manual",
     };
   }
+
+  async refreshLocal(): Promise<DashboardSnapshot> { return this.refresh(); }
 
   async readSnapshot(): Promise<DashboardSnapshot> {
     return this.refresh();

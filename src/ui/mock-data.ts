@@ -534,6 +534,7 @@ export function createMockDashboardSnapshot(state: MockDashboardState = "ready")
     fetchedAt,
     codexVersion: "0.150.0-alpha.8",
     quotaWindows,
+    accountSync: null,
     accountDiagnostics: {
       readAt: fetchedAt,
       durationMs: 91,
@@ -621,7 +622,8 @@ export function createMockDashboardSnapshot(state: MockDashboardState = "ready")
         status: "unauthenticated",
         fetchedAt: new Date(now).toISOString(),
         quotaWindows: [],
-        accountDiagnostics: null,
+        accountSync: null,
+    accountDiagnostics: null,
         resetCredits: null,
         accountUsage: null,
         message: "Codex 尚未登录。登录后可读取账号额度；本机日志统计仍可使用。",

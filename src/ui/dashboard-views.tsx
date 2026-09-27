@@ -1,3 +1,4 @@
+import type { PricingDraft } from "./pricing-editor";
 import {
   useEffect,
   useMemo,
@@ -204,6 +205,7 @@ export function StatusPopover({
           <Icon name="x" />
         </button>
       </header>
+      <SyncStatus snapshot={snapshot} />
       <dl>
         <div>
           <dt>当前状态</dt>
@@ -218,10 +220,6 @@ export function StatusPopover({
           <dd>{snapshot.accountDiagnostics?.methods.join(" · ") || "尚无记录"}</dd>
         </div>
         <div>
-          <dt>本机最近索引</dt>
-          <dd>{formatRelativeTime(snapshot.deviceUsage?.generatedAt ?? null, now)}</dd>
-        </div>
-        <div>
           <dt>刷新阶段</dt>
           <dd>{progress?.label ?? "空闲"}</dd>
         </div>
@@ -233,6 +231,17 @@ export function StatusPopover({
       {snapshot.message && <p>{snapshot.message}</p>}
     </div>
   );
+}
+
+export function SyncStatus({ snapshot }: { snapshot: DashboardSnapshot }) {
+  const sync = snapshot.accountSync;
+  const time = (value: string | null | undefined) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "暂无成功记录";
+  const labels: Record<string, string> = { idle: "等待同步", syncing: "正在后台同步", localOnly: "纯本地模式 · 已停止联网", ready: "同步成功", partial: "部分数据暂不可用", offline: "连接失败", error: "读取失败", unauthenticated: "未登录", unsupported: "接口不可用" };
+  const resource = (label: string, state: NonNullable<DashboardSnapshot["accountSync"]>["quota"]) => <div className="sync-resource"><span>{label}<b>{state.lastSuccessfulAt ? state.stale ? "历史数据（已过期）" : "已更新" : "暂不可用"}</b></span><time>{time(state.lastSuccessfulAt)}</time></div>;
+  return <section className="sync-status" aria-label="数据同步状态">
+    <div><div className="sync-status-heading"><strong>本机统计</strong><span>{snapshot.deviceUsage ? "可离线使用" : "等待本机扫描"}</span></div><time>{time(snapshot.deviceUsage?.generatedAt)}</time></div>
+    <div><div className="sync-status-heading"><strong>账号同步</strong><span>{sync ? labels[sync.status] : "状态待确认"}</span></div>{sync && <>{resource("账号额度", sync.quota)}{resource("账号每日用量", sync.usage)}</>}</div>
+  </section>;
 }
 
 export function StatusNotice({
@@ -351,7 +360,9 @@ export function OverviewView({
   onOpenActivity: () => void;
 }) {
   const localTrend = buildFifteenDaySourceTrend(snapshot.deviceUsage?.sources ?? [], now);
-  const overviewQuotas = selectOverviewQuotas(snapshot.quotaWindows);
+  const overviewQuotas = snapshot.accountSync?.status === "localOnly"
+    ? []
+    : selectOverviewQuotas(snapshot.quotaWindows);
   return (
     <section className="view-panel">
       <PageHeading
@@ -684,7 +695,7 @@ function AccountFacts({
         </div>
         <div>
           <dt>额度重置券</dt>
-          <dd>{snapshot.resetCredits?.availableCount ?? 0} 张</dd>
+          <dd>{snapshot.resetCredits ? `${snapshot.resetCredits.availableCount} 张` : "暂不可用"}</dd>
           <small>不等同于 Credits 余额</small>
         </div>
         <div>
@@ -702,7 +713,7 @@ function AccountFacts({
         </div>
         <div>
           <dt>最近更新</dt>
-          <dd>{formatRelativeTime(snapshot.fetchedAt, now)}</dd>
+          <dd>{formatRelativeTime(snapshot.accountSync ? snapshot.accountSync.quota.lastSuccessfulAt : snapshot.fetchedAt, now)}{snapshot.accountSync?.quota.stale && snapshot.accountSync.quota.lastSuccessfulAt ? "（历史数据）" : ""}</dd>
           <small>
             {snapshot.codexVersion
               ? `Codex ${snapshot.codexVersion}`
@@ -1626,52 +1637,27 @@ function SourceHealthGrid({
   );
 }
 
-function mergeUsedModels(settings: PricingSettings, usage: DeviceUsageSummary | null): PricingSettings {
-  if (!usage) return settings;
-  const totals = new Map<string, { label: string; tokens: number }>();
-  for (const source of usage.sources) {
-    for (const model of source.byModel) {
-      const identity = model.label.trim().toLowerCase();
-      if (!identity) continue;
-      const current = totals.get(identity);
-      totals.set(identity, {
-        label: current?.label ?? model.label,
-        tokens: (current?.tokens ?? 0) + model.usage.totalTokens,
-      });
-    }
-  }
-  const saved = new Map(settings.models.map((model) => [model.modelId.trim().toLowerCase(), model]));
-  const used = [...totals.entries()]
-    .sort((left, right) => right[1].tokens - left[1].tokens)
-    .map(([identity, value]) => saved.get(identity) ?? {
-      modelId: value.label,
-      displayName: value.label,
-      currency: "USD" as const,
-      inputPerMillion: null,
-      cachedInputPerMillion: null,
-      cacheWritePerMillion: null,
-      outputPerMillion: null,
-      peakEnabled: false,
-    });
-  const usedIds = new Set(used.map((model) => model.modelId.trim().toLowerCase()));
-  return { ...settings, models: [...used, ...settings.models.filter((model) => !usedIds.has(model.modelId.trim().toLowerCase()))] };
-}
-
 export function PricingView({
   usage,
-  settings,
+  draft,
+  setDraft,
+  dirty,
+  onDiscard,
+  onRecalculate,
   isSaving,
   message,
   onSave,
 }: {
   usage: DeviceUsageSummary | null;
-  settings: PricingSettings;
+  draft: PricingDraft;
+  setDraft: (action: (current: PricingDraft) => PricingDraft) => void;
+  dirty: boolean;
+  onDiscard: () => void;
+  onRecalculate: (() => void) | null;
   isSaving: boolean;
   message: string | null;
-  onSave: (settings: PricingSettings) => Promise<void>;
+  onSave: () => Promise<void>;
 }) {
-  const [draft, setDraft] = useState(() => mergeUsedModels(settings, usage));
-  useEffect(() => setDraft(mergeUsedModels(settings, usage)), [settings, usage]);
   const tokenTotals = useMemo(() => {
     const totals = new Map<string, number>();
     for (const source of usage?.sources ?? []) {
@@ -1682,34 +1668,30 @@ export function PricingView({
     }
     return totals;
   }, [usage]);
-  const updateModel = (modelId: string, patch: Partial<PricingSettings["models"][number]>) => {
+  const updateModel = (modelId: string, patch: Partial<PricingDraft["models"][number]>) => {
     setDraft((current) => ({
       ...current,
       models: current.models.map((model) => model.modelId === modelId ? { ...model, ...patch } : model),
     }));
   };
   const rateInput = (
-    model: PricingSettings["models"][number],
+    model: PricingDraft["models"][number],
     field: "inputPerMillion" | "cachedInputPerMillion" | "cacheWritePerMillion" | "outputPerMillion",
     label: string,
   ) => (
     <label className="price-field">
       <span>{label}</span>
       <input
-        type="number"
-        min="0"
-        step="0.001"
+        type="text"
         inputMode="decimal"
         aria-label={`${model.displayName} ${label}`}
         placeholder="未设置"
         value={model[field] ?? ""}
-        onChange={(event) => updateModel(model.modelId, { [field]: event.target.value === "" ? null : Number(event.target.value) })}
+        onChange={(event) => updateModel(model.modelId, { [field]: event.target.value })}
       />
     </label>
   );
-  const usedModels = draft.models
-    .filter((model) => tokenTotals.has(model.modelId.trim().toLowerCase()))
-    .sort((left, right) => (tokenTotals.get(right.modelId.trim().toLowerCase()) ?? 0) - (tokenTotals.get(left.modelId.trim().toLowerCase()) ?? 0));
+  const usedModels = draft.models;
   const peakModelCount = usedModels.filter((model) => model.peakEnabled).length;
   return (
     <section className="view-panel">
@@ -1717,14 +1699,14 @@ export function PricingView({
         eyebrow="MANUAL API PRICING"
         title="模型定价"
         description="价格完全由你在本机维护；应用不再内置或自动回退到任何模型 API 价格。"
-        actions={<button className="primary-button" type="button" disabled={isSaving || usedModels.length === 0} onClick={() => void onSave(draft)}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>}
+        actions={<div className="pricing-actions"><span role="status">{dirty ? "有未保存修改" : "价格已保存"}</span><button className="secondary-button" type="button" disabled={!dirty || isSaving} onClick={onDiscard}>放弃修改</button><button className="primary-button" type="button" disabled={isSaving || !dirty || usedModels.length === 0} onClick={() => void onSave()}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>{onRecalculate && <button className="secondary-button" type="button" disabled={isSaving} onClick={onRecalculate}>重试费用重算</button>}</div>}
       />
       <article className="content-card peak-pricing-card">
         <header><div><p className="eyebrow">PEAK PRICING</p><h2>高峰期定价</h2><p>使用本机时间；只有加入下方白名单的模型才会乘以该倍率。</p></div><span className="soft-pill">跨午夜时段也支持</span></header>
         <div className="peak-pricing-fields">
           <label><span>开始时间</span><input type="time" value={draft.peak.startTime} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, startTime: event.target.value } }))} /></label>
           <label><span>结束时间</span><input type="time" value={draft.peak.endTime} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, endTime: event.target.value } }))} /></label>
-          <label><span>收费倍率</span><div className="multiplier-input"><input type="number" min="1" max="100" step="0.1" value={draft.peak.multiplier} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, multiplier: Number(event.target.value) } }))} /><b>×</b></div></label>
+          <label><span>收费倍率</span><div className="multiplier-input"><input type="text" inputMode="decimal" aria-label="收费倍率" value={draft.peak.multiplier} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, multiplier: event.target.value } }))} /><b>×</b></div></label>
         </div>
         <div className="peak-model-selector">
           <div className="peak-model-selector__heading">
@@ -1747,12 +1729,12 @@ export function PricingView({
           </div>
         </div>
       </article>
-      <div className="pricing-page-note" role="note"><Icon name="info" /><span>下列模型来自本机已索引的真实用量，并按累计 Token 从高到低排列。单价单位均为“每 100 万 Token”。留空的类别会保留为未定价，不会按 0 元处理。</span></div>
+      <div className="pricing-page-note" role="note"><Icon name="info" /><span>下列模型来自本机已索引的真实用量，并首次按累计 Token 排列，编辑期间保持位置稳定。单价单位均为“每 100 万 Token”。留空的类别会保留为未定价，不会按 0 元处理。</span></div>
       {message && <p className="pricing-save-message" role="status">{message}</p>}
       <div className="model-pricing-list">
         {usedModels.map((model, index) => {
           const tokens = tokenTotals.get(model.modelId.trim().toLowerCase()) ?? 0;
-          const configured = [model.inputPerMillion, model.cachedInputPerMillion, model.cacheWritePerMillion, model.outputPerMillion].every((value) => value !== null);
+          const configured = [model.inputPerMillion, model.cachedInputPerMillion, model.cacheWritePerMillion, model.outputPerMillion].every((value) => value !== "");
           return (
             <article className="content-card model-price-card" key={model.modelId}>
               <header>
@@ -2115,6 +2097,9 @@ export function SettingsView({
               <option value="hideToTray">隐藏到系统托盘</option>
               <option value="exit">直接退出应用</option>
             </select>
+          </SettingRow>
+          <SettingRow label="纯本地模式">
+            <label className="local-only-setting"><input type="checkbox" aria-label="纯本地模式" checked={preferences.localOnly ?? false} onChange={event => update("localOnly", event.target.checked)} /><span>仅统计本机日志，停止账号联网同步（保存后生效）</span></label>
           </SettingRow>
           <SettingRow label="后台刷新">
             <select

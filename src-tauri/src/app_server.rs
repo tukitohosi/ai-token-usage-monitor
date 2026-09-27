@@ -8,8 +8,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_TEXT_LIMIT: usize = 256;
@@ -36,7 +40,7 @@ impl AppServerError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreditBalance {
     pub(crate) has_credits: bool,
@@ -44,7 +48,7 @@ pub(crate) struct CreditBalance {
     pub(crate) balance: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NormalizedQuotaWindow {
     pub(crate) used_percent: f64,
@@ -54,7 +58,7 @@ pub(crate) struct NormalizedQuotaWindow {
     pub(crate) limit_id: String,
     pub(crate) limit_name: Option<String>,
     pub(crate) normal_model_slug: Option<String>,
-    pub(crate) lane: &'static str,
+    pub(crate) lane: String,
     pub(crate) label: String,
     pub(crate) remaining_percent: f64,
     pub(crate) credits: Option<CreditBalance>,
@@ -62,7 +66,7 @@ pub(crate) struct NormalizedQuotaWindow {
     pub(crate) reached_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResetCredit {
     pub(crate) id: String,
@@ -74,14 +78,14 @@ pub(crate) struct ResetCredit {
     pub(crate) description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RateLimitResetCredits {
     pub(crate) available_count: u64,
     pub(crate) credits: Option<Vec<ResetCredit>>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountUsageSummary {
     pub(crate) lifetime_tokens: Option<u64>,
@@ -91,14 +95,14 @@ pub(crate) struct AccountUsageSummary {
     pub(crate) longest_streak_days: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DailyUsageBucket {
     pub(crate) start_date: String,
     pub(crate) tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountUsageReadResult {
     pub(crate) summary: Option<AccountUsageSummary>,
@@ -111,7 +115,7 @@ pub(crate) struct AccountUsageReadResult {
 #[derive(Debug)]
 pub(crate) struct AccountState {
     pub(crate) account_present: bool,
-    pub(crate) requires_openai_auth: bool,
+    pub(crate) identity: Option<String>,
 }
 
 enum ReaderMessage {
@@ -126,11 +130,15 @@ pub(crate) struct AppServerClient {
     receiver: Receiver<ReaderMessage>,
     next_request_id: u64,
     rpc_methods: Vec<String>,
+    cancelled: Arc<AtomicBool>,
     pub(crate) server_user_agent: String,
 }
 
 impl AppServerClient {
-    pub(crate) fn connect() -> Result<Self, AppServerError> {
+    pub(crate) fn connect(cancelled: Arc<AtomicBool>) -> Result<Self, AppServerError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AppServerError::Io);
+        }
         let executable = locate_codex_executable()?;
         let mut command = Command::new(executable);
         command
@@ -191,6 +199,7 @@ impl AppServerClient {
             receiver,
             next_request_id: 1,
             rpc_methods: Vec::new(),
+            cancelled,
             server_user_agent: String::new(),
         };
         let initialized = client.request(
@@ -218,7 +227,7 @@ impl AppServerClient {
 
     pub(crate) fn account_read(&mut self) -> Result<AccountState, AppServerError> {
         let value = self.request("account/read", Some(json!({ "refreshToken": false })))?;
-        let requires_openai_auth = value
+        let _requires_openai_auth = value
             .get("requiresOpenaiAuth")
             .and_then(Value::as_bool)
             .ok_or(AppServerError::Protocol)?;
@@ -226,7 +235,10 @@ impl AppServerClient {
             account_present: value
                 .get("account")
                 .is_some_and(|account| !account.is_null()),
-            requires_openai_auth,
+            identity: value
+                .get("account")
+                .filter(|v| !v.is_null())
+                .map(|v| blake3::hash(v.to_string().as_bytes()).to_hex().to_string()),
         })
     }
 
@@ -264,6 +276,9 @@ impl AppServerClient {
     }
 
     fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value, AppServerError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(AppServerError::Io);
+        }
         if !ALLOWED_REQUEST_METHODS.contains(&method) {
             return Err(AppServerError::Protocol);
         }
@@ -278,32 +293,44 @@ impl AppServerClient {
         }
         write_message(&mut self.stdin, &Value::Object(message))?;
 
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(AppServerError::Timeout);
-            }
-            match self.receiver.recv_timeout(remaining) {
-                Ok(ReaderMessage::Json(value)) => {
-                    if value.get("id").and_then(Value::as_u64) != Some(id) {
-                        // Notifications are invalidation signals only. A fresh snapshot is
-                        // already being read, so there is no raw payload to forward.
-                        continue;
-                    }
-                    if let Some(error) = value.get("error") {
-                        return Err(AppServerError::Rpc {
-                            code: error.get("code").and_then(Value::as_i64),
-                        });
-                    }
-                    return value.get("result").cloned().ok_or(AppServerError::Protocol);
+        wait_for_response(&self.receiver, id, &self.cancelled, REQUEST_TIMEOUT)
+    }
+}
+
+fn wait_for_response(
+    receiver: &Receiver<ReaderMessage>,
+    id: u64,
+    cancelled: &AtomicBool,
+    timeout: Duration,
+) -> Result<Value, AppServerError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AppServerError::Io);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AppServerError::Timeout);
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(ReaderMessage::Json(value)) => {
+                if value.get("id").and_then(Value::as_u64) != Some(id) {
+                    // Notifications are invalidation signals only. A fresh snapshot is
+                    // already being read, so there is no raw payload to forward.
+                    continue;
                 }
-                Ok(ReaderMessage::ProtocolFailure | ReaderMessage::End) => {
-                    return Err(AppServerError::Protocol)
+                if let Some(error) = value.get("error") {
+                    return Err(AppServerError::Rpc {
+                        code: error.get("code").and_then(Value::as_i64),
+                    });
                 }
-                Err(RecvTimeoutError::Timeout) => return Err(AppServerError::Timeout),
-                Err(RecvTimeoutError::Disconnected) => return Err(AppServerError::Io),
+                return value.get("result").cloned().ok_or(AppServerError::Protocol);
             }
+            Ok(ReaderMessage::ProtocolFailure | ReaderMessage::End) => {
+                return Err(AppServerError::Protocol)
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Err(AppServerError::Io),
         }
     }
 }
@@ -463,7 +490,7 @@ fn normalize_rate_limits(
                 limit_id: limit_id.clone(),
                 limit_name: limit_name.clone(),
                 normal_model_slug: normal_model_slug.clone(),
-                lane,
+                lane: lane.to_owned(),
                 label: format_window_duration(window_duration_mins),
                 remaining_percent: 100.0 - bounded_used,
                 credits: credits.clone(),
@@ -607,6 +634,37 @@ fn format_window_duration(minutes: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_reads_never_start_a_child_and_interrupt_pending_responses() {
+        let cancelled = Arc::new(AtomicBool::new(true));
+        assert!(matches!(
+            AppServerClient::connect(cancelled.clone()),
+            Err(AppServerError::Io)
+        ));
+        cancelled.store(false, Ordering::Release);
+        let (_sender, receiver) = mpsc::channel();
+        let worker_cancel = cancelled.clone();
+        let worker = thread::spawn(move || {
+            wait_for_response(&receiver, 1, &worker_cancel, Duration::from_secs(10))
+        });
+        cancelled.store(true, Ordering::Release);
+        assert!(matches!(worker.join().unwrap(), Err(AppServerError::Io)));
+    }
+
+    #[test]
+    fn silent_account_transport_has_a_bounded_timeout() {
+        let (_sender, receiver) = mpsc::channel();
+        assert!(matches!(
+            wait_for_response(
+                &receiver,
+                1,
+                &AtomicBool::new(false),
+                Duration::from_millis(10)
+            ),
+            Err(AppServerError::Timeout)
+        ));
+    }
 
     #[test]
     fn normalizes_remaining_quota_and_uses_map_key_as_identity() {

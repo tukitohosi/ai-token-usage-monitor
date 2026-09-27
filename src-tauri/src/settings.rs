@@ -70,6 +70,8 @@ pub(crate) enum CloseBehavior {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AppPreferencesInput {
+    #[serde(default)]
+    pub(crate) local_only: bool,
     pub(crate) refresh_interval_minutes: u64,
     pub(crate) close_behavior: CloseBehavior,
     pub(crate) quota_warning_percent: u8,
@@ -83,6 +85,7 @@ pub(crate) struct AppPreferencesInput {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AppPreferences {
+    pub(crate) local_only: bool,
     pub(crate) theme_preference: ThemePreference,
     pub(crate) background_asset_path: Option<String>,
     pub(crate) refresh_interval_minutes: u64,
@@ -447,6 +450,7 @@ pub(crate) fn read_app_preferences(
         .filter(|value| valid_clock(value))
         .unwrap_or_else(|| "08:00".to_owned());
     Ok(AppPreferences {
+        local_only: bool_setting(read_setting(&connection, "local-only")?),
         theme_preference: visual.theme_preference,
         background_asset_path: visual.background_asset_path,
         refresh_interval_minutes,
@@ -476,6 +480,11 @@ pub(crate) fn write_app_preferences(
     let transaction = connection
         .transaction()
         .map_err(|_| SettingsError::Storage)?;
+    write_setting(
+        &transaction,
+        "local-only",
+        if input.local_only { "true" } else { "false" },
+    )?;
     write_setting(
         &transaction,
         REFRESH_INTERVAL_KEY,
@@ -885,6 +894,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temp dir");
         let settings_path = temporary.path().join("settings.sqlite3");
         let input = AppPreferencesInput {
+            local_only: false,
             refresh_interval_minutes: 5,
             close_behavior: CloseBehavior::Exit,
             quota_warning_percent: 15,
@@ -915,6 +925,7 @@ mod tests {
         );
 
         let invalid = AppPreferencesInput {
+            local_only: false,
             refresh_interval_minutes: 2,
             ..input
         };

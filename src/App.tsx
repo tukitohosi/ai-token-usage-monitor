@@ -1,3 +1,4 @@
+import { parsePricingDraft, usePricingEditor } from "./ui/pricing-editor";
 import {
   useCallback,
   useEffect,
@@ -57,6 +58,7 @@ const INITIAL_SNAPSHOT: DashboardSnapshot = {
 const DEFAULT_PREFERENCES: AppPreferences = {
   themePreference: "system",
   backgroundAssetPath: null,
+  localOnly: false,
   refreshIntervalMinutes: 1,
   closeBehavior: "hideToTray",
   autostartEnabled: false,
@@ -76,8 +78,13 @@ const DEFAULT_PRICING_SETTINGS: PricingSettings = {
   models: [],
 };
 
+function newerSnapshot(current: DashboardSnapshot, next: DashboardSnapshot): DashboardSnapshot {
+  return (next.revision ?? 0) < (current.revision ?? 0) ? current : next;
+}
+
 function runtimePreferencesEqual(left: AppPreferences, right: AppPreferences): boolean {
-  return left.refreshIntervalMinutes === right.refreshIntervalMinutes
+  return !!left.localOnly === !!right.localOnly
+    && left.refreshIntervalMinutes === right.refreshIntervalMinutes
     && left.closeBehavior === right.closeBehavior
     && left.autostartEnabled === right.autostartEnabled
     && left.quotaWarningPercent === right.quotaWarningPercent
@@ -188,6 +195,10 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
   const [projectMergeRules, setProjectMergeRules] = useState<ProjectMergeRule[]>([]);
   const [projectMergeMessage, setProjectMergeMessage] = useState<string | null>(null);
   const [pricingSettings, setPricingSettings] = useState<PricingSettings>(DEFAULT_PRICING_SETTINGS);
+  const [pricingLoaded, setPricingLoaded] = useState(false);
+  const [pricingRecalculationFailed, setPricingRecalculationFailed] = useState(false);
+  const pricingEditor = usePricingEditor(pricingSettings, snapshot.deviceUsage, pricingLoaded);
+  const pricingSaveInFlight = useRef(false);
   const [pricingMessage, setPricingMessage] = useState<string | null>(null);
   const [isSavingPricing, setIsSavingPricing] = useState(false);
   const requestSequence = useRef(0);
@@ -201,7 +212,7 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
     try {
       const next = adapter.refresh ? await adapter.refresh() : await adapter.readSnapshot();
       if (requestSequence.current === requestId) {
-        setSnapshot(next);
+        setSnapshot(current => newerSnapshot(current, next));
         setProgress(next.refreshProgress ?? { phase: "complete", label: "刷新完成", processedSources: 6, totalSources: 6, currentSource: null, processedFiles: 0, totalFiles: 0 });
       }
     } catch {
@@ -219,10 +230,12 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
     if (adapter.subscribe) {
       void adapter.subscribe((next) => {
         if (disposed) return;
-        requestSequence.current += 1;
-        setSnapshot(next);
-        setProgress(next.refreshProgress ?? null);
-        setIsRefreshing(false);
+        setSnapshot(current => newerSnapshot(current, next));
+        // Account pushes reuse the current local result; local progress has its own channel.
+        if (!adapter.subscribeProgress) {
+          setProgress(next.refreshProgress ?? null);
+          setIsRefreshing(false);
+        }
       }).then((stop) => disposed ? stop() : stops.push(stop)).catch(() => {
         if (!disposed) setSnapshot((current) => ({ ...current, message: "后台推送通道暂不可用，可继续手动刷新。" }));
       });
@@ -249,7 +262,7 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
         try {
           const cached = await adapter.readCachedSnapshot();
           if (!disposed && cached) {
-            setSnapshot(cached);
+            setSnapshot(current => current.revision ? current : cached);
             setProgress(cached.refreshProgress ?? null);
           }
         } catch {
@@ -303,11 +316,12 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
   }, [adapter]);
 
   useEffect(() => {
-    if (!adapter.readPricingSettings) return;
+    if (!adapter.readPricingSettings) { setPricingLoaded(true); return; }
     let disposed = false;
     void adapter.readPricingSettings().then((value) => {
       if (!disposed) {
         setPricingSettings(value);
+        setPricingLoaded(true);
         setPricingMessage(null);
       }
     }).catch((error) => {
@@ -375,25 +389,41 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
     return saved;
   }, [adapter]);
 
-  const savePricingSettings = useCallback(async (value: PricingSettings) => {
-    if (!adapter.setPricingSettings) {
-      setPricingMessage("当前环境不支持保存模型定价。");
-      return;
+  const recalculatePricing = useCallback(async () => {
+    setPricingRecalculationFailed(false);
+    try {
+      if (!adapter.refreshLocal) throw new Error("当前环境不支持本机重算");
+      const next = await adapter.refreshLocal();
+      if (!next.deviceUsage || next.status === "error") throw new Error("本机汇总失败");
+      setSnapshot(current => newerSnapshot(current, next));
+      setPricingMessage("价格已保存，并已按新规则重新汇总本机费用。");
+    } catch {
+      setPricingRecalculationFailed(true);
+      setPricingMessage("价格已保存，费用重算失败。请重试费用重算。");
     }
+  }, [adapter]);
+
+  const savePricingSettings = async () => {
+    if (pricingSaveInFlight.current || !pricingEditor.draft || !adapter.setPricingSettings) return;
+    let value: PricingSettings;
+    try { value = parsePricingDraft(pricingEditor.draft); }
+    catch (error) { setPricingMessage((error as Error).message); return; }
+    const submittedRevision = pricingEditor.revision.current;
+    pricingSaveInFlight.current = true;
     setIsSavingPricing(true);
     setPricingMessage(null);
     try {
       const saved = await adapter.setPricingSettings(value);
       setPricingSettings(saved);
-      await refresh();
-      setPricingMessage("价格已保存，并已按新规则重新汇总本机费用。");
-      setSuccessToast("模型价格与高峰期规则已保存。");
+      pricingEditor.acceptSaved(saved, submittedRevision);
+      await recalculatePricing();
     } catch (error) {
-      setPricingMessage(error instanceof Error ? error.message : "无法保存模型定价。");
+      setPricingMessage(error instanceof Error ? error.message : "无法保存模型定价，草稿已保留。");
     } finally {
+      pricingSaveInFlight.current = false;
       setIsSavingPricing(false);
     }
-  }, [adapter, refresh]);
+  };
 
   const saveTheme = useCallback(async (themePreference: ThemePreference) => {
     setSettingsMessage(null);
@@ -637,7 +667,7 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
               {statusOpen && <StatusPopover snapshot={snapshot} progress={progress} now={now} onClose={() => setStatusOpen(false)} />}
             </div>
             <span className="refresh-countdown" role="status" aria-live="polite">
-              {formatRefreshCountdown(snapshot.refreshSchedule?.nextRefreshAtMs, isRefreshing, now)}
+              本机：{formatRefreshCountdown(snapshot.refreshSchedule?.nextRefreshAtMs, isRefreshing, now)}
             </span>
             <button className="refresh-button" type="button" onClick={() => void refresh()} disabled={isRefreshing} aria-label={isRefreshing ? "正在刷新数据" : "刷新数据"}><span className={isRefreshing ? "spin" : ""}><Icon name="refresh" /></span><span>{isRefreshing ? "同步中" : "刷新"}</span></button>
           </div>
@@ -648,7 +678,7 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
         {view === "overview" && <OverviewView snapshot={snapshot} now={now} onOpenDay={openDayDetail} onOpenActivity={() => requestViewChange("activity")} />}
         {view === "activity" && <ActivityView usage={effectiveDeviceUsage} sourceHealth={snapshot.sourceHealth ?? []} range={range} onRangeChange={setRange} selectedSources={activitySources} selectionMode={activitySourceMode} onSelectionModeChange={(mode) => { setActivitySourceMode(mode); if (mode === "single") setActivitySources((current) => current.slice(-1)); }} onSourcesChange={(source) => setActivitySources((current) => toggleSourceSelection(current, source, activitySourceMode))} onClearSources={() => setActivitySources([])} summary={activityRange} insightSummary={insightRange} now={now} onOpenDay={openDayDetail} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} projectMergeRules={projectMergeRules} projectMergeMessage={projectMergeMessage} onSaveProjectMergeRules={saveProjectMergeRules} />}
         {view === "cost" && <CostView usage={effectiveDeviceUsage} range={range} onRangeChange={setRange} selectedSources={costSources} selectionMode={costSourceMode} onSelectionModeChange={(mode) => { setCostSourceMode(mode); if (mode === "single") setCostSources((current) => current.slice(-1)); }} onSourcesChange={(source) => setCostSources((current) => toggleSourceSelection(current, source, costSourceMode))} onClearSources={() => setCostSources([])} summary={costRange} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} onOpenPricing={() => requestViewChange("pricing")} />}
-        {view === "pricing" && <PricingView usage={snapshot.deviceUsage ?? null} settings={pricingSettings} isSaving={isSavingPricing} message={pricingMessage} onSave={savePricingSettings} />}
+        {view === "pricing" && (pricingLoaded && pricingEditor.draft ? <PricingView usage={snapshot.deviceUsage ?? null} draft={pricingEditor.draft} setDraft={pricingEditor.update} dirty={pricingEditor.dirty} onDiscard={pricingEditor.reset} onRecalculate={pricingRecalculationFailed ? () => void recalculatePricing() : null} isSaving={isSavingPricing} message={pricingMessage} onSave={savePricingSettings} /> : <section className="content-card"><h1>模型定价</h1><p role="status">{pricingMessage ?? "正在读取已保存价格…"}</p></section>)}
         {view === "settings" && <SettingsView snapshot={snapshot} preferences={preferences} indexMaintenance={indexMaintenance} onPreferencesChange={setPreferences} onSave={() => void savePreferences()} onTestNotification={() => void sendTestNotification()} onCheckIndexes={() => void checkIndexes()} onRebuildIndexes={() => void rebuildIndexes()} onThemeChange={(value) => void saveTheme(value)} onSelectWallpaper={() => void selectWallpaper()} onClearWallpaper={() => void clearWallpaper()} onUpdateRenewal={updatePlanRenewal} isSaving={isSavingSettings} isMaintainingIndexes={isMaintainingIndexes} hasUnsavedChanges={hasUnsavedRuntimePreferences} message={settingsMessage} />}
       </main>
       {pendingView && (

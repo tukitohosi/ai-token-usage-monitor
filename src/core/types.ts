@@ -337,7 +337,15 @@ export interface AccountReadDiagnostics {
   methods: string[];
 }
 
+export interface AccountSync {
+  status: "idle" | "syncing" | "localOnly" | "ready" | "partial" | "offline" | "error" | "unauthenticated" | "unsupported";
+  quota: { lastSuccessfulAt: string | null; stale: boolean };
+  usage: { lastSuccessfulAt: string | null; stale: boolean };
+}
+
 export interface DashboardSnapshot {
+  revision?: number;
+  accountSync?: AccountSync | null;
   status: "ready" | "loading" | "offline" | "unauthenticated" | "unsupported" | "error";
   fetchedAt: string | null;
   codexVersion: string | null;
@@ -386,6 +394,7 @@ export interface VisualPreferences {
 export type CloseBehavior = "hideToTray" | "exit";
 
 export interface AppPreferences extends VisualPreferences {
+  localOnly?: boolean;
   refreshIntervalMinutes: 1 | 5 | 15;
   closeBehavior: CloseBehavior;
   autostartEnabled: boolean;

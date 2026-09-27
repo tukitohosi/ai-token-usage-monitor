@@ -1,3 +1,4 @@
+mod account_sync;
 mod app_server;
 pub mod index;
 mod multisource;
@@ -16,6 +17,7 @@ use tauri_plugin_autostart::ManagerExt;
 async fn read_dashboard_snapshot(
     app: tauri::AppHandle,
     runtime: tauri::State<'_, runtime::UsageRuntime>,
+    local_only: Option<bool>,
 ) -> Result<snapshot::DashboardSnapshot, String> {
     let runtime = runtime.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -24,6 +26,9 @@ async fn read_dashboard_snapshot(
         });
         runtime::update_tray_tooltip(&app, &snapshot);
         runtime.maybe_notify(&app, &snapshot);
+        if !local_only.unwrap_or(false) {
+            runtime.request_account_refresh(app);
+        }
         snapshot
     })
     .await
@@ -163,6 +168,10 @@ async fn set_app_preferences(
         _ => "无法保存本机应用设置。".to_owned(),
     })?;
     let _ = app.emit(runtime::REFRESH_SCHEDULE_EVENT, runtime.refresh_schedule());
+    runtime.publish_account(&app);
+    if !saved.local_only {
+        runtime.request_account_refresh(app);
+    }
     Ok(saved)
 }
 

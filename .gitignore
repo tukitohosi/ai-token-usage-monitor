@@ -10,7 +10,7 @@ coverage/
 !.env.example
 
 # Windows installers are retained as local release archives, not Git objects.
-/release/*-Setup.exe
+/release/*.exe
 
 # Local data and credentials must never enter repository history.
 *.sqlite

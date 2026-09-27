@@ -57,6 +57,13 @@ function bridgeFixture(snapshot: DashboardSnapshot) {
 }
 
 describe("Tauri dashboard adapter", () => {
+  it("explicitly requests local-only recalculation without the default account refresh", async () => {
+    const fixture = bridgeFixture(createMockDashboardSnapshot("ready"));
+    const adapter = new TauriDashboardAdapter(fixture.bridge);
+    await adapter.refreshLocal();
+    expect(fixture.bridge.invoke).toHaveBeenCalledExactlyOnceWith(SNAPSHOT_COMMAND, { localOnly: true });
+  });
+
   it("invokes the exact snapshot command and preserves an honest null renewal", async () => {
     const snapshot = createMockDashboardSnapshot("ready");
     const fixture = bridgeFixture(snapshot);

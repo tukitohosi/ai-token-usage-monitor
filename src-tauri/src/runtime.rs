@@ -73,6 +73,11 @@ pub(crate) struct UsageRuntime {
     codex_home: PathBuf,
     user_home: PathBuf,
     refresh_gate: Arc<Mutex<()>>,
+    local_generation: Arc<AtomicU64>,
+    latest_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
+    account_cache: Arc<Mutex<crate::account_sync::AccountCache>>,
+    account_task: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    local_only: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     event_refresh_in_flight: Arc<AtomicBool>,
     refresh_interval_seconds: Arc<AtomicU64>,
@@ -94,7 +99,19 @@ impl UsageRuntime {
             .as_ref()
             .map(|value| value.refresh_interval_minutes * 60)
             .unwrap_or(60);
+        let local_only = preferences.as_ref().is_some_and(|p| p.local_only);
+        let mut account_cache: crate::account_sync::AccountCache =
+            fs::read(app_data_directory.join("account-cache-v1.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        account_cache.invalidate_credentials(credential_fingerprint(&codex_home));
+        account_cache.mark_stale(if local_only { "localOnly" } else { "idle" });
         Self {
+            latest_snapshot: Arc::new(Mutex::new(None)),
+            account_cache: Arc::new(Mutex::new(account_cache)),
+            account_task: Arc::new(Mutex::new(None)),
+            local_only: Arc::new(AtomicBool::new(local_only)),
             app_data_directory: app_data_directory.clone(),
             codex_database_path: app_data_directory.join("usage-index-v1.sqlite3"),
             multi_source_database_path: app_data_directory.join("usage-index-v2.sqlite3"),
@@ -103,6 +120,7 @@ impl UsageRuntime {
             codex_home,
             user_home,
             refresh_gate: Arc::new(Mutex::new(())),
+            local_generation: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             event_refresh_in_flight: Arc::new(AtomicBool::new(false)),
             refresh_interval_seconds: Arc::new(AtomicU64::new(refresh_interval_seconds)),
@@ -130,10 +148,21 @@ impl UsageRuntime {
     where
         F: FnMut(snapshot::RefreshProgress),
     {
+        let generation = self.local_generation.load(Ordering::Acquire);
         let _refresh_guard = self
             .refresh_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generation != self.local_generation.load(Ordering::Acquire) {
+            if let Some(snapshot) = self
+                .latest_snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+            {
+                return snapshot;
+            }
+        }
         self.collect_locked(&mut on_progress)
     }
 
@@ -190,14 +219,9 @@ impl UsageRuntime {
             );
         });
         let sources_duration_ms = elapsed_milliseconds(sources_started);
-        on_progress(snapshot::RefreshProgress::new(
-            "account",
-            "正在读取账号额度",
-            6,
-        ));
-        let account_started = Instant::now();
-        let mut snapshot = snapshot::read_dashboard_snapshot();
-        let account_duration_ms = elapsed_milliseconds(account_started);
+        let account_duration_ms = 0;
+        let mut snapshot = DashboardSnapshot::empty("ready", Utc::now().to_rfc3339(), "");
+        snapshot.message = None;
 
         match settings::read_plan_renewal_at(&self.settings_path) {
             Ok(Some(value)) => {
@@ -228,7 +252,10 @@ impl UsageRuntime {
                     .collect();
                 snapshot.device_usage = Some(summary);
             }
-            Err(()) => append_message(&mut snapshot, "本机 AI 用量索引暂不可用。"),
+            Err(()) => {
+                snapshot.status = "error";
+                append_message(&mut snapshot, "本机 AI 用量索引暂不可用。");
+            }
         }
         let complete = snapshot::RefreshProgress::new("complete", "刷新完成", 6);
         snapshot.index_diagnostics = Some(snapshot::IndexDiagnostics {
@@ -250,13 +277,44 @@ impl UsageRuntime {
         snapshot.refresh_progress = Some(complete.clone());
         snapshot.refresh_schedule = Some(self.reset_refresh_schedule());
         on_progress(complete);
+        let mut latest = self
+            .latest_snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut account = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
+        account.invalidate_credentials(credential_fingerprint(&self.codex_home));
+        if self.local_only.load(Ordering::Acquire) {
+            account.mark_stale("localOnly");
+        }
+        account.apply(&mut snapshot);
+        snapshot.revision = latest.as_ref().map_or(1, |s| s.revision + 1);
         self.store_cached_snapshot(&snapshot);
+        *latest = Some(snapshot.clone());
+        self.local_generation.fetch_add(1, Ordering::Release);
         snapshot
     }
 
     pub(crate) fn read_cached_dashboard_snapshot(&self) -> Option<serde_json::Value> {
         let bytes = fs::read(&self.snapshot_cache_path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let object = value.as_object_mut()?;
+        // Legacy cache account data has no verifiable ownership/freshness.
+        let mut account = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
+        account.invalidate_credentials(credential_fingerprint(&self.codex_home));
+        let mut sanitized = DashboardSnapshot::empty("ready", Utc::now().to_rfc3339(), "");
+        account.apply(&mut sanitized);
+        let fields = serde_json::to_value(sanitized).ok()?;
+        for key in [
+            "quotaWindows",
+            "resetCredits",
+            "accountUsage",
+            "codexVersion",
+            "accountSync",
+        ] {
+            object.insert(key.to_owned(), fields[key].clone());
+        }
+        object.insert("revision".into(), 0.into());
+        Some(value)
     }
 
     fn store_cached_snapshot(&self, snapshot: &DashboardSnapshot) {
@@ -497,6 +555,20 @@ impl UsageRuntime {
             input,
             autostart_enabled,
         )?;
+        let previous = self
+            .local_only
+            .swap(preferences.local_only, Ordering::AcqRel);
+        if previous != preferences.local_only {
+            self.cancel_account_task();
+            self.account_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mark_stale(if preferences.local_only {
+                    "localOnly"
+                } else {
+                    "idle"
+                });
+        }
         self.refresh_interval_seconds
             .store(preferences.refresh_interval_minutes * 60, Ordering::Release);
         self.reset_refresh_schedule();
@@ -590,7 +662,12 @@ impl UsageRuntime {
 
         let mut current = BTreeSet::new();
         let mut messages = Vec::new();
-        for quota in &snapshot.quota_windows {
+        for quota in snapshot.quota_windows.iter().filter(|_| {
+            snapshot
+                .account_sync
+                .as_ref()
+                .is_some_and(|s| !s.quota.stale)
+        }) {
             if quota.remaining_percent < f64::from(preferences.quota_warning_percent) {
                 let key = format!("quota:{}:{}", quota.key, preferences.quota_warning_percent);
                 current.insert(key.clone());
@@ -623,6 +700,18 @@ impl UsageRuntime {
             .active_notification_keys
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if snapshot
+            .account_sync
+            .as_ref()
+            .map_or(true, |s| s.quota.stale)
+        {
+            current.extend(
+                previous
+                    .iter()
+                    .filter(|key| key.starts_with("quota:"))
+                    .cloned(),
+            );
+        }
         let body = new_notification_body(&previous, &messages);
         *previous = current;
         drop(previous);
@@ -666,10 +755,100 @@ impl UsageRuntime {
                 update_tray_tooltip(&app, &snapshot);
                 runtime.maybe_notify(&app, &snapshot);
                 let _ = app.emit(SNAPSHOT_EVENT, snapshot);
+                runtime.request_account_refresh(app.clone());
             }
             runtime
                 .event_refresh_in_flight
                 .store(false, Ordering::Release);
+        });
+    }
+
+    fn cancel_account_task(&self) {
+        if let Some(cancelled) = self
+            .account_task
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn publish_account<R: Runtime>(&self, app: &AppHandle<R>) {
+        let mut latest = self
+            .latest_snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let account = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(snapshot) = latest.as_mut() {
+            account.apply(snapshot);
+            snapshot.revision += 1;
+            self.store_cached_snapshot(snapshot);
+            let _ = app.emit(SNAPSHOT_EVENT, snapshot.clone());
+            update_tray_tooltip(app, snapshot);
+        }
+        if let Ok(bytes) = serde_json::to_vec(&*account) {
+            let _ = fs::create_dir_all(&self.app_data_directory);
+            let _ = fs::write(self.app_data_directory.join("account-cache-v1.json"), bytes);
+        }
+    }
+
+    pub(crate) fn request_account_refresh<R: Runtime>(&self, app: AppHandle<R>) {
+        if self.local_only.load(Ordering::Acquire) || self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let mut task = self.account_task.lock().unwrap_or_else(|p| p.into_inner());
+        if task.is_some() {
+            return;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *task = Some(cancelled.clone());
+        let fingerprint = credential_fingerprint(&self.codex_home);
+        {
+            let mut cache = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.invalidate_credentials(fingerprint.clone());
+            cache.mark_stale("syncing");
+        }
+        self.publish_account(&app);
+        let runtime = self.clone();
+        thread::spawn(move || {
+            let result = snapshot::read_dashboard_snapshot(cancelled.clone());
+            let mut task = runtime
+                .account_task
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !task
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &cancelled))
+            {
+                return;
+            }
+            if !cancelled.load(Ordering::Acquire)
+                && !runtime.local_only.load(Ordering::Acquire)
+                && !runtime.shutdown.load(Ordering::Acquire)
+            {
+                {
+                    let mut cache = runtime
+                        .account_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if credential_fingerprint(&runtime.codex_home) == fingerprint {
+                        cache.merge(&result);
+                    } else {
+                        cache.invalidate_credentials(credential_fingerprint(&runtime.codex_home));
+                    }
+                }
+                runtime.publish_account(&app);
+                let latest = runtime
+                    .latest_snapshot
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(snapshot) = latest {
+                    runtime.maybe_notify(&app, &snapshot);
+                }
+            }
+            *task = None;
         });
     }
 
@@ -688,6 +867,7 @@ impl UsageRuntime {
 
     pub(crate) fn stop(&self) {
         self.shutdown.store(true, Ordering::Release);
+        self.cancel_account_task();
     }
 
     fn read_codex_local_usage<F>(
@@ -749,6 +929,12 @@ impl UsageRuntime {
         }
         self.shutdown.load(Ordering::Acquire)
     }
+}
+
+fn credential_fingerprint(codex_home: &Path) -> Option<String> {
+    fs::read(codex_home.join("auth.json"))
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn elapsed_milliseconds(started: Instant) -> u64 {
@@ -1003,6 +1189,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_scan_and_pricing_save_do_not_wait_for_account_task() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        let pending = Arc::new(AtomicBool::new(false));
+        *runtime.account_task.lock().unwrap() = Some(pending.clone());
+        let snapshot = runtime.collect();
+        assert!(snapshot.device_usage.is_some());
+        assert_eq!(snapshot.status, "ready");
+        assert!(!pending.load(Ordering::Acquire));
+        let mut prices = PricingSettings::default();
+        prices.peak.multiplier = 2.0;
+        let saved = runtime.set_pricing_settings(&prices).unwrap();
+        assert_eq!(saved.peak.multiplier, 2.0);
+        assert_eq!(
+            runtime.read_pricing_settings().unwrap().peak.multiplier,
+            2.0
+        );
+        assert_eq!(runtime.collect().revision, snapshot.revision + 1);
+    }
+
+    #[test]
+    fn local_only_persists_and_cancels_in_flight_account_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let data = temporary.path().join("data");
+        let runtime = UsageRuntime::new(
+            data.clone(),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *runtime.account_task.lock().unwrap() = Some(cancelled.clone());
+        let input: settings::AppPreferencesInput = serde_json::from_value(serde_json::json!({
+            "localOnly": true, "refreshIntervalMinutes": 1, "closeBehavior": "hideToTray", "quotaWarningPercent": 20,
+            "cacheWarningPercent": 90, "notificationsEnabled": false, "quietHoursEnabled": false, "quietHoursStart": "22:00", "quietHoursEnd": "08:00"
+        })).unwrap();
+        runtime.set_app_preferences(&input, false).unwrap();
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(runtime.account_task.lock().unwrap().is_none());
+        let restarted = UsageRuntime::new(
+            data,
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        assert!(restarted.local_only.load(Ordering::Acquire));
+        let snapshot = restarted.collect();
+        assert_eq!(snapshot.account_sync.unwrap().status, "localOnly");
+        assert!(restarted.account_task.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_dashboard_cache_does_not_revive_unverified_account_data() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        fs::write(&runtime.snapshot_cache_path, br#"{"revision":123,"quotaWindows":[{"private":"old"}],"accountUsage":{"old":true},"deviceUsage":{"sentinel":42}}"#).unwrap();
+        let cache = runtime.read_cached_dashboard_snapshot().unwrap();
+        assert_eq!(cache["revision"], 0);
+        assert_eq!(cache["quotaWindows"], serde_json::json!([]));
+        assert!(cache["accountUsage"].is_null());
+        assert_eq!(cache["deviceUsage"]["sentinel"], 42);
+        assert_eq!(cache["accountSync"]["quota"]["stale"], true);
+    }
+
+    #[test]
     fn stop_interrupts_the_scheduler_wait() {
         let temporary = tempfile::tempdir().expect("temp dir");
         let runtime = UsageRuntime::new(
@@ -1029,6 +1286,7 @@ mod tests {
             .next_refresh_at_ms
             .is_some_and(|value| value >= before + 59_000));
         let preferences = settings::AppPreferencesInput {
+            local_only: false,
             refresh_interval_minutes: 5,
             close_behavior: settings::CloseBehavior::HideToTray,
             quota_warning_percent: 20,

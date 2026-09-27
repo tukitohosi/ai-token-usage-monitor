@@ -88,7 +88,7 @@ pub(crate) struct RefreshSchedule {
     pub(crate) interval_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountReadDiagnostics {
     pub(crate) read_at: String,
@@ -99,7 +99,15 @@ pub(crate) struct AccountReadDiagnostics {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DashboardSnapshot {
+    pub(crate) revision: u64,
     pub(crate) status: &'static str,
+    pub(crate) account_sync: Option<crate::account_sync::AccountSync>,
+    #[serde(skip)]
+    pub(crate) account_identity: Option<String>,
+    #[serde(skip)]
+    pub(crate) quota_read_ok: bool,
+    #[serde(skip)]
+    pub(crate) usage_read_ok: bool,
     pub(crate) fetched_at: Option<String>,
     pub(crate) codex_version: Option<String>,
     pub(crate) quota_windows: Vec<NormalizedQuotaWindow>,
@@ -120,9 +128,14 @@ pub(crate) struct DashboardSnapshot {
 }
 
 impl DashboardSnapshot {
-    fn empty(status: &'static str, fetched_at: String, message: &str) -> Self {
+    pub(crate) fn empty(status: &'static str, fetched_at: String, message: &str) -> Self {
         Self {
+            revision: 0,
             status,
+            account_sync: None,
+            account_identity: None,
+            quota_read_ok: false,
+            usage_read_ok: false,
             fetched_at: Some(fetched_at),
             codex_version: None,
             quota_windows: Vec::new(),
@@ -142,10 +155,12 @@ impl DashboardSnapshot {
     }
 }
 
-pub(crate) fn read_dashboard_snapshot() -> DashboardSnapshot {
+pub(crate) fn read_dashboard_snapshot(
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> DashboardSnapshot {
     let read_started = Instant::now();
     let fetched_at = Utc::now().to_rfc3339();
-    let mut client = match AppServerClient::connect() {
+    let mut client = match AppServerClient::connect(cancelled) {
         Ok(client) => client,
         Err(error) => {
             return with_account_diagnostics(
@@ -171,7 +186,7 @@ pub(crate) fn read_dashboard_snapshot() -> DashboardSnapshot {
             );
         }
     };
-    if account.requires_openai_auth && !account.account_present {
+    if !account.account_present {
         let mut snapshot = DashboardSnapshot::empty(
             "unauthenticated",
             fetched_at.clone(),
@@ -205,6 +220,7 @@ pub(crate) fn read_dashboard_snapshot() -> DashboardSnapshot {
             },
         );
         snapshot.codex_version = codex_version;
+        snapshot.account_identity = account.identity;
         return with_account_diagnostics(
             snapshot,
             fetched_at,
@@ -214,10 +230,17 @@ pub(crate) fn read_dashboard_snapshot() -> DashboardSnapshot {
     }
 
     let partial = rate_limits.is_err() || account_usage.is_err();
+    let quota_read_ok = rate_limits.is_ok();
+    let usage_read_ok = account_usage.is_ok();
     let (quota_windows, reset_credits) = rate_limits.unwrap_or_default();
     with_account_diagnostics(
         DashboardSnapshot {
+            revision: 0,
             status: "ready",
+            account_sync: None,
+            account_identity: account.identity,
+            quota_read_ok,
+            usage_read_ok,
             fetched_at: Some(fetched_at.clone()),
             codex_version,
             quota_windows,
@@ -289,7 +312,7 @@ mod tests {
     #[test]
     #[ignore = "requires the locally installed and authenticated Codex app"]
     fn live_snapshot_uses_only_the_sanitized_dashboard_contract() {
-        let snapshot = read_dashboard_snapshot();
+        let snapshot = read_dashboard_snapshot(Default::default());
         assert_eq!(snapshot.status, "ready");
         assert!(snapshot.fetched_at.is_some());
         assert!(snapshot.codex_version.is_some());
