@@ -2423,11 +2423,7 @@ mod tests {
 
         let pricing = pricing::PricingSettings {
             updated_at: None,
-            peak: pricing::PeakPricingSchedule {
-                start_time: "18:00".to_owned(),
-                end_time: "23:00".to_owned(),
-                multiplier: 1.5,
-            },
+            peak: pricing::PeakPricingSchedule::default(),
             models: vec![pricing::ModelPricingRule {
                 model_id: "claude-sonnet-4-20250514".to_owned(),
                 display_name: "Claude Sonnet 4".to_owned(),

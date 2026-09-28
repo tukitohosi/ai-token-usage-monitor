@@ -74,7 +74,7 @@ const DEFAULT_PREFERENCES: AppPreferences = {
 
 const DEFAULT_PRICING_SETTINGS: PricingSettings = {
   updatedAt: null,
-  peak: { startTime: "18:00", endTime: "23:00", multiplier: 1.5 },
+  peak: { windows: [{ weekdayStart: 1, weekdayEnd: 7, startTime: "18:00", endTime: "23:00" }], multiplier: 1.5, timeZone: "local", excludeChinaHolidays: false, specialDates: [] },
   models: [],
 };
 

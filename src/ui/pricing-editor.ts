@@ -4,12 +4,13 @@ import type { DeviceUsageSummary, ModelPricingRule, PricingSettings } from "../c
 const rateFields = ["inputPerMillion", "cachedInputPerMillion", "cacheWritePerMillion", "outputPerMillion"] as const;
 type RateField = typeof rateFields[number];
 export type PricingDraft = Omit<PricingSettings, "models" | "peak"> & {
+  pendingSpecialDate: string;
   models: Array<Omit<ModelPricingRule, RateField> & Record<RateField, string>>;
   peak: Omit<PricingSettings["peak"], "multiplier"> & { multiplier: string };
 };
 
 export function createPricingDraft(settings: PricingSettings): PricingDraft {
-  return { ...settings, peak: { ...settings.peak, multiplier: String(settings.peak.multiplier) }, models: settings.models.map(model => ({
+  return { ...settings, pendingSpecialDate: "", peak: { ...settings.peak, multiplier: String(settings.peak.multiplier) }, models: settings.models.map(model => ({
     ...model, inputPerMillion: model.inputPerMillion === null ? "" : String(model.inputPerMillion), cachedInputPerMillion: model.cachedInputPerMillion === null ? "" : String(model.cachedInputPerMillion), cacheWritePerMillion: model.cacheWritePerMillion === null ? "" : String(model.cacheWritePerMillion), outputPerMillion: model.outputPerMillion === null ? "" : String(model.outputPerMillion),
   })) };
 }
@@ -22,10 +23,31 @@ function decimal(value: string, optional: boolean): number | null {
 }
 
 export function parsePricingDraft(draft: PricingDraft): PricingSettings {
+  if (draft.pendingSpecialDate) throw new Error("请先将选择的日期加入特殊日期列表。");
   const multiplier = decimal(draft.peak.multiplier, false)!;
   if (multiplier < 1 || multiplier > 100) throw new Error("高峰倍率必须在 1 到 100 之间。");
-  if (![draft.peak.startTime, draft.peak.endTime].every(time => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))) throw new Error("请输入完整的高峰开始和结束时间。");
-  return { ...draft, peak: { ...draft.peak, multiplier }, models: draft.models.map(model => ({
+  if (draft.peak.windows.length > 32) throw new Error("高峰时段最多可设置 32 个。");
+  for (const window of draft.peak.windows) {
+    if (![window.weekdayStart, window.weekdayEnd].every(day => Number.isInteger(day) && day >= 1 && day <= 7)
+      || ![window.startTime, window.endTime].every(time => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))) {
+      throw new Error("请检查高峰时段的星期和开始、结束时间。");
+    }
+  }
+  if (draft.peak.timeZone !== "local") {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: draft.peak.timeZone }).format(0);
+    } catch {
+      throw new Error("请输入有效的城市时区，例如 America/Los_Angeles、Europe/London 或 Asia/Tokyo。");
+    }
+  }
+  if (draft.peak.specialDates.length > 2000 || new Set(draft.peak.specialDates).size !== draft.peak.specialDates.length
+    || draft.peak.specialDates.some(date => !/^[1-9]\d{3}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/.test(date)
+      || Number.isNaN(Date.parse(`${date}T00:00:00Z`))
+      || new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date)) {
+    throw new Error("特殊日期必须是不重复的有效日期。");
+  }
+  const { pendingSpecialDate: _, ...settings } = draft;
+  return { ...settings, peak: { ...draft.peak, multiplier }, models: draft.models.map(model => ({
     ...model, inputPerMillion: decimal(model.inputPerMillion, true), cachedInputPerMillion: decimal(model.cachedInputPerMillion, true), cacheWritePerMillion: decimal(model.cacheWritePerMillion, true), outputPerMillion: decimal(model.outputPerMillion, true),
   })) };
 }

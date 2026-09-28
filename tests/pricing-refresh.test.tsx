@@ -34,6 +34,51 @@ async function openPricing(adapter = new PushAdapter()) {
 }
 
 describe("pricing draft lifetime and local save", () => {
+  it("saves weekday windows, holiday exclusion and special dates across navigation", async () => {
+    const adapter = await openPricing();
+    const save = vi.spyOn(adapter, "setPricingSettings");
+    fireEvent.change(screen.getByLabelText("时段 1 结束星期"), { target: { value: "5" } });
+    fireEvent.change(screen.getByLabelText("开始时间"), { target: { value: "09:00" } });
+    fireEvent.change(screen.getByLabelText("结束时间"), { target: { value: "12:00" } });
+    fireEvent.change(screen.getByLabelText("高峰规则时区"), { target: { value: "America/Los_Angeles" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加时段" }));
+    fireEvent.click(screen.getByLabelText("自动排除中国大陆节假日"));
+    fireEvent.change(screen.getByLabelText("特殊日期"), { target: { value: "2026-09-28" } });
+    fireEvent.click(screen.getByRole("button", { name: "费用" }));
+    fireEvent.click(screen.getByRole("button", { name: "模型定价" }));
+    expect((screen.getByLabelText("特殊日期") as HTMLInputElement).value).toBe("2026-09-28");
+    fireEvent.click(screen.getByRole("button", { name: "加入特殊日期" }));
+    expect((screen.getByLabelText("时段 2 开始时间") as HTMLInputElement).value).toBe("14:00");
+    expect(screen.getByText("2026-09-28")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "保存价格并重算" }));
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(save.mock.calls[0]![0].peak).toMatchObject({
+      timeZone: "America/Los_Angeles",
+      excludeChinaHolidays: true,
+      specialDates: ["2026-09-28"],
+      windows: [
+        { weekdayStart: 1, weekdayEnd: 5, startTime: "09:00", endTime: "12:00" },
+        { weekdayStart: 1, weekdayEnd: 5, startTime: "14:00", endTime: "18:00" },
+      ],
+    });
+  });
+
+  it("offers London and Tokyo and rejects an invalid time zone before saving", async () => {
+    const adapter = await openPricing();
+    const save = vi.spyOn(adapter, "setPricingSettings");
+    expect(document.querySelector('option[value="Europe/London"]')).toBeTruthy();
+    expect(document.querySelector('option[value="Asia/Tokyo"]')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("高峰规则时区"), { target: { value: "custom" } });
+    fireEvent.change(screen.getByLabelText("自定义城市时区"), { target: { value: "unknown/city" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存价格并重算" }));
+    expect(await screen.findByText(/请输入有效的城市时区/)).toBeTruthy();
+    expect(save).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("自定义城市时区"), { target: { value: "America/New_York" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存价格并重算" }));
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(save.mock.calls[0]![0].peak.timeZone).toBe("America/New_York");
+  });
+
   it("ignores an older snapshot after a newer account or local push", async () => {
     const adapter = await openPricing();
     const latest = { ...createMockDashboardSnapshot("ready"), revision: 20, message: "最新本机结果" };

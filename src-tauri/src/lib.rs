@@ -232,14 +232,14 @@ async fn set_pricing_settings(
     pricing_settings: pricing::PricingSettings,
 ) -> Result<pricing::PricingSettings, String> {
     settings::validate_pricing_settings(&pricing_settings)
-        .map_err(|_| "模型定价参数无效，请检查时间、倍率和单价。".to_owned())?;
+        .map_err(|_| "模型定价参数无效，请检查星期、时段、特殊日期、倍率和单价。".to_owned())?;
     let runtime = runtime.inner().clone();
     tauri::async_runtime::spawn_blocking(move || runtime.set_pricing_settings(&pricing_settings))
         .await
         .map_err(|_| "后台模型定价保存任务意外结束。".to_owned())?
         .map_err(|error| match error {
             settings::SettingsError::InvalidPricingSettings => {
-                "模型定价参数无效，请检查时间、倍率和单价。".to_owned()
+                "模型定价参数无效，请检查星期、时段、特殊日期、倍率和单价。".to_owned()
             }
             _ => "无法保存本机模型定价设置。".to_owned(),
         })

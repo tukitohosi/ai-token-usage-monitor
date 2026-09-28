@@ -348,13 +348,21 @@ export function normalizePricingSettings(value: unknown): PricingSettings {
     throw new Error("桌面端返回了无法识别的模型定价设置。");
   }
   const peak = value.peak;
+  const weekday = (day: unknown): day is number => typeof day === "number" && Number.isInteger(day) && day >= 1 && day <= 7;
   if (
     !(value.updatedAt === null || typeof value.updatedAt === "string")
-    || typeof peak.startTime !== "string"
-    || typeof peak.endTime !== "string"
+    || !Array.isArray(peak.windows)
+    || peak.windows.some((window) => !isRecord(window)
+      || !weekday(window.weekdayStart) || !weekday(window.weekdayEnd)
+      || typeof window.startTime !== "string" || typeof window.endTime !== "string")
     || typeof peak.multiplier !== "number"
     || !Number.isFinite(peak.multiplier)
     || peak.multiplier < 1
+    || typeof peak.timeZone !== "string"
+    || !peak.timeZone
+    || typeof peak.excludeChinaHolidays !== "boolean"
+    || !Array.isArray(peak.specialDates)
+    || peak.specialDates.some((date) => typeof date !== "string")
   ) throw new Error("桌面端返回了无法识别的高峰期设置。");
   const optionalRate = (rate: unknown): rate is number | null => rate === null
     || (typeof rate === "number" && Number.isFinite(rate) && rate >= 0);
@@ -375,9 +383,11 @@ export function normalizePricingSettings(value: unknown): PricingSettings {
   return {
     updatedAt: value.updatedAt,
     peak: {
-      startTime: peak.startTime,
-      endTime: peak.endTime,
+      windows: peak.windows as PricingSettings["peak"]["windows"],
       multiplier: peak.multiplier,
+      timeZone: peak.timeZone,
+      excludeChinaHolidays: peak.excludeChinaHolidays,
+      specialDates: peak.specialDates as string[],
     },
     models,
   };
@@ -594,7 +604,7 @@ export class MockDashboardAdapter implements DashboardAdapter {
   private projectMergeRules: ProjectMergeRule[] = [];
   private pricingSettings: PricingSettings = {
     updatedAt: "2026-09-25T09:30:00Z",
-    peak: { startTime: "18:00", endTime: "23:00", multiplier: 1.5 },
+    peak: { windows: [{ weekdayStart: 1, weekdayEnd: 7, startTime: "18:00", endTime: "23:00" }], multiplier: 1.5, timeZone: "local", excludeChinaHolidays: false, specialDates: [] },
     models: [
       { modelId: "GPT-5.6 Sol", displayName: "GPT-5.6 Sol", currency: "USD", inputPerMillion: 4, cachedInputPerMillion: 0.4, cacheWritePerMillion: 5, outputPerMillion: 20, peakEnabled: true },
       { modelId: "默认模型", displayName: "默认模型", currency: "USD", inputPerMillion: null, cachedInputPerMillion: null, cacheWritePerMillion: null, outputPerMillion: null, peakEnabled: false },

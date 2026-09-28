@@ -89,6 +89,21 @@ function formatRangeLabel(range: UsageRange, customStartDate: string, customEndD
     : RANGE_ITEMS.find((item) => item.id === range)?.label ?? "所选范围";
 }
 const TOKEN_COLORS = ["#7c6cff", "#3abfe9", "#35c994", "#f2a851", "#dd6ea8"];
+const COMMON_PEAK_TIME_ZONES = [
+  { value: "local", label: "本机时间" },
+  { value: "Asia/Shanghai", label: "北京时间" },
+  { value: "America/Los_Angeles", label: "太平洋时间（洛杉矶）" },
+  { value: "Europe/London", label: "伦敦时间" },
+  { value: "Asia/Tokyo", label: "东京时间" },
+];
+const OTHER_PEAK_TIME_ZONES = (() => {
+  try {
+    const common = new Set(COMMON_PEAK_TIME_ZONES.map((zone) => zone.value));
+    return Intl.supportedValuesOf("timeZone").filter((zone) => !common.has(zone));
+  } catch {
+    return [];
+  }
+})();
 
 export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const common = {
@@ -1674,6 +1689,13 @@ export function PricingView({
       models: current.models.map((model) => model.modelId === modelId ? { ...model, ...patch } : model),
     }));
   };
+  const updateWindow = (index: number, patch: Partial<PricingDraft["peak"]["windows"][number]>) => {
+    setDraft((current) => ({
+      ...current,
+      peak: { ...current.peak, windows: current.peak.windows.map((window, position) => position === index ? { ...window, ...patch } : window) },
+    }));
+  };
+  const weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
   const rateInput = (
     model: PricingDraft["models"][number],
     field: "inputPerMillion" | "cachedInputPerMillion" | "cacheWritePerMillion" | "outputPerMillion",
@@ -1693,20 +1715,49 @@ export function PricingView({
   );
   const usedModels = draft.models;
   const peakModelCount = usedModels.filter((model) => model.peakEnabled).length;
+  const commonPeakTimeZone = COMMON_PEAK_TIME_ZONES.some((zone) => zone.value === draft.peak.timeZone) ? draft.peak.timeZone : "custom";
   return (
     <section className="view-panel">
       <PageHeading
         eyebrow="MANUAL API PRICING"
         title="模型定价"
         description="价格完全由你在本机维护；应用不再内置或自动回退到任何模型 API 价格。"
-        actions={<div className="pricing-actions"><span role="status">{dirty ? "有未保存修改" : "价格已保存"}</span><button className="secondary-button" type="button" disabled={!dirty || isSaving} onClick={onDiscard}>放弃修改</button><button className="primary-button" type="button" disabled={isSaving || !dirty || usedModels.length === 0} onClick={() => void onSave()}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>{onRecalculate && <button className="secondary-button" type="button" disabled={isSaving} onClick={onRecalculate}>重试费用重算</button>}</div>}
+        actions={<div className="pricing-actions"><span role="status">{dirty ? "有未保存修改" : "价格已保存"}</span><button className="secondary-button" type="button" disabled={!dirty || isSaving} onClick={onDiscard}>放弃修改</button><button className="primary-button" type="button" disabled={isSaving || !dirty} onClick={() => void onSave()}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>{onRecalculate && <button className="secondary-button" type="button" disabled={isSaving} onClick={onRecalculate}>重试费用重算</button>}</div>}
       />
       <article className="content-card peak-pricing-card">
-        <header><div><p className="eyebrow">PEAK PRICING</p><h2>高峰期定价</h2><p>使用本机时间；只有加入下方白名单的模型才会乘以该倍率。</p></div><span className="soft-pill">跨午夜时段也支持</span></header>
+        <header><div><p className="eyebrow">PEAK PRICING</p><h2>高峰期定价</h2><p>按指定时区、星期和时段计算；只有加入下方白名单的模型才会使用高峰倍率。</p></div><span className="soft-pill">跨午夜时段也支持</span></header>
         <div className="peak-pricing-fields">
-          <label><span>开始时间</span><input type="time" value={draft.peak.startTime} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, startTime: event.target.value } }))} /></label>
-          <label><span>结束时间</span><input type="time" value={draft.peak.endTime} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, endTime: event.target.value } }))} /></label>
           <label><span>收费倍率</span><div className="multiplier-input"><input type="text" inputMode="decimal" aria-label="收费倍率" value={draft.peak.multiplier} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, multiplier: event.target.value } }))} /><b>×</b></div></label>
+          <label><span>规则时区</span><select aria-label="高峰规则时区" value={commonPeakTimeZone} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, timeZone: event.target.value === "custom" ? "" : event.target.value } }))}>{COMMON_PEAK_TIME_ZONES.map((zone) => <option key={zone.value} value={zone.value}>{zone.label}</option>)}<option value="custom">其他城市时区…</option></select></label>
+          {commonPeakTimeZone === "custom" && <label className="peak-custom-time-zone"><span>城市时区</span><input type="text" list="peak-time-zone-options" aria-label="自定义城市时区" placeholder="如 America/New_York" value={draft.peak.timeZone} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, timeZone: event.target.value } }))} /><datalist id="peak-time-zone-options">{OTHER_PEAK_TIME_ZONES.map((zone) => <option key={zone} value={zone} />)}</datalist></label>}
+          <p className="peak-schedule-hint peak-time-zone-hint">可选择常用时区，或输入其他城市时区；太平洋、伦敦等地区会自动处理夏令时。星期及特殊日期均按所选时区判断。</p>
+        </div>
+        <div className="peak-schedule-section">
+          <div className="peak-schedule-heading"><div><strong>每周高峰时段</strong><p>同一星期范围可添加多个时段；开始时间计入高峰，结束时间不计入。</p></div><button className="secondary-button" type="button" disabled={draft.peak.windows.length >= 32} onClick={() => setDraft((current) => ({ ...current, peak: { ...current.peak, windows: [...current.peak.windows, { weekdayStart: 1, weekdayEnd: 5, startTime: "14:00", endTime: "18:00" }] } }))}>添加时段</button></div>
+          <div className="peak-window-list">
+            {draft.peak.windows.map((window, index) => (
+              <div className="peak-window" key={index}>
+                <div className="peak-window-heading"><strong>时段 {index + 1}</strong><button type="button" className="peak-remove-button" aria-label={`删除时段 ${index + 1}`} onClick={() => setDraft((current) => ({ ...current, peak: { ...current.peak, windows: current.peak.windows.filter((_, position) => position !== index) } }))}>删除</button></div>
+                <div className="peak-window-fields">
+                  <label><span>从星期</span><select aria-label={`时段 ${index + 1} 起始星期`} value={window.weekdayStart} onChange={(event) => updateWindow(index, { weekdayStart: Number(event.target.value) })}>{weekdays.map((day, position) => <option value={position + 1} key={day}>{day}</option>)}</select></label>
+                  <label><span>到星期</span><select aria-label={`时段 ${index + 1} 结束星期`} value={window.weekdayEnd} onChange={(event) => updateWindow(index, { weekdayEnd: Number(event.target.value) })}>{weekdays.map((day, position) => <option value={position + 1} key={day}>{day}</option>)}</select></label>
+                  <label><span>开始时间</span><input type="time" aria-label={index === 0 ? "开始时间" : `时段 ${index + 1} 开始时间`} value={window.startTime} onChange={(event) => updateWindow(index, { startTime: event.target.value })} /></label>
+                  <label><span>结束时间</span><input type="time" aria-label={index === 0 ? "结束时间" : `时段 ${index + 1} 结束时间`} value={window.endTime} onChange={(event) => updateWindow(index, { endTime: event.target.value })} /></label>
+                </div>
+              </div>
+            ))}
+            {draft.peak.windows.length === 0 && <p className="muted-copy">当前没有高峰时段，所有日期均按常规定价。</p>}
+          </div>
+          <p className="peak-schedule-hint">跨午夜时段按用量发生当天的星期判断；例如选周一至周五时，周六凌晨不会进入高峰。</p>
+        </div>
+        <div className="peak-schedule-section">
+          <label className="peak-holiday-toggle"><input type="checkbox" checked={draft.peak.excludeChinaHolidays} onChange={(event) => setDraft((current) => ({ ...current, peak: { ...current.peak, excludeChinaHolidays: event.target.checked } }))} /><span>自动排除中国大陆节假日</span></label>
+          <p className="peak-schedule-hint">依据国务院公布的放假调休区间，按规则时区的日历日判断，离线覆盖 2024—2026 年。其他年份仍按每周时段判断，请用特殊日期补充；周末调休上班不会自动视为工作日。</p>
+        </div>
+        <div className="peak-schedule-section">
+          <div className="peak-schedule-heading"><div><strong>特殊日期</strong><p>这些日期全天不启用高峰计费，优先于每周时段。</p></div></div>
+          <div className="peak-special-add"><label><span>选择日期</span><input type="date" aria-label="特殊日期" value={draft.pendingSpecialDate} onChange={(event) => setDraft((current) => ({ ...current, pendingSpecialDate: event.target.value }))} /></label><button className="secondary-button" type="button" disabled={!draft.pendingSpecialDate || draft.peak.specialDates.includes(draft.pendingSpecialDate)} onClick={() => setDraft((current) => ({ ...current, pendingSpecialDate: "", peak: { ...current.peak, specialDates: [...current.peak.specialDates, current.pendingSpecialDate].sort() } }))}>加入特殊日期</button></div>
+          <div className="peak-special-dates">{draft.peak.specialDates.map((date) => <span className="peak-special-date" key={date}>{date}<button type="button" aria-label={`移除特殊日期 ${date}`} onClick={() => setDraft((current) => ({ ...current, peak: { ...current.peak, specialDates: current.peak.specialDates.filter((value) => value !== date) } }))}>×</button></span>)}{draft.peak.specialDates.length === 0 && <span className="muted-copy">尚未添加特殊日期。</span>}</div>
         </div>
         <div className="peak-model-selector">
           <div className="peak-model-selector__heading">

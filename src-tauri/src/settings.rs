@@ -28,12 +28,15 @@ const QUIET_HOURS_START_KEY: &str = "quiet-hours-start";
 const QUIET_HOURS_END_KEY: &str = "quiet-hours-end";
 const PROJECT_MERGE_RULES_KEY: &str = "project-merge-rules-v1";
 const PRICING_SETTINGS_KEY: &str = "model-pricing-v1";
+const PRICING_SETTINGS_BACKUP_KEY: &str = "model-pricing-v1-pre-schedule-backup";
 const BACKGROUND_DIRECTORY: &str = "backgrounds";
 const MAX_BACKGROUND_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_PROJECT_MERGE_RULES: usize = 50;
 const MAX_PROJECT_MERGE_MEMBERS: usize = 100;
 const MAX_PROJECT_FIELD_LENGTH: usize = 256;
 const MAX_PRICING_MODELS: usize = 200;
+const MAX_PRICING_WINDOWS: usize = 32;
+const MAX_SPECIAL_DATES: usize = 2_000;
 
 #[derive(Debug)]
 pub(crate) enum SettingsError {
@@ -128,6 +131,33 @@ struct ProjectMergeRulesDocument {
 struct PricingSettingsDocument {
     version: u8,
     settings: PricingSettings,
+}
+
+#[derive(Debug, Deserialize)]
+struct PricingSettingsVersion {
+    version: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPeakPricingSchedule {
+    start_time: String,
+    end_time: String,
+    multiplier: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPricingSettings {
+    updated_at: Option<String>,
+    peak: LegacyPeakPricingSchedule,
+    models: Vec<crate::pricing::ModelPricingRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyPricingSettingsDocument {
+    version: u8,
+    settings: LegacyPricingSettings,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -326,13 +356,32 @@ pub(crate) fn write_project_merge_rules(
 }
 
 pub(crate) fn validate_pricing_settings(settings: &PricingSettings) -> Result<(), SettingsError> {
-    if !valid_clock(&settings.peak.start_time)
-        || !valid_clock(&settings.peak.end_time)
-        || !settings.peak.multiplier.is_finite()
+    if !settings.peak.multiplier.is_finite()
         || !(1.0..=100.0).contains(&settings.peak.multiplier)
         || settings.models.len() > MAX_PRICING_MODELS
+        || settings.peak.windows.len() > MAX_PRICING_WINDOWS
+        || settings.peak.special_dates.len() > MAX_SPECIAL_DATES
+        || (settings.peak.time_zone != "local"
+            && settings.peak.time_zone.parse::<chrono_tz::Tz>().is_err())
     {
         return Err(SettingsError::InvalidPricingSettings);
+    }
+    for window in &settings.peak.windows {
+        if !(1..=7).contains(&window.weekday_start)
+            || !(1..=7).contains(&window.weekday_end)
+            || !valid_clock(&window.start_time)
+            || !valid_clock(&window.end_time)
+        {
+            return Err(SettingsError::InvalidPricingSettings);
+        }
+    }
+    let mut dates = HashSet::new();
+    for date in &settings.peak.special_dates {
+        let valid = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .is_ok_and(|parsed| parsed.format("%Y-%m-%d").to_string() == *date);
+        if !valid || !dates.insert(date) {
+            return Err(SettingsError::InvalidPricingSettings);
+        }
     }
     let mut identities = HashSet::new();
     for rule in &settings.models {
@@ -367,13 +416,44 @@ pub(crate) fn read_pricing_settings(
     let Some(value) = read_setting(&connection, PRICING_SETTINGS_KEY)? else {
         return Ok(PricingSettings::default());
     };
-    let document: PricingSettingsDocument =
+    let header: PricingSettingsVersion =
         serde_json::from_str(&value).map_err(|_| SettingsError::InvalidPricingSettings)?;
-    if document.version != 1 {
-        return Err(SettingsError::InvalidPricingSettings);
-    }
-    validate_pricing_settings(&document.settings)?;
-    Ok(document.settings)
+    let settings = match header.version {
+        1 => {
+            let document: LegacyPricingSettingsDocument =
+                serde_json::from_str(&value).map_err(|_| SettingsError::InvalidPricingSettings)?;
+            if document.version != 1
+                || !valid_clock(&document.settings.peak.start_time)
+                || !valid_clock(&document.settings.peak.end_time)
+            {
+                return Err(SettingsError::InvalidPricingSettings);
+            }
+            PricingSettings {
+                updated_at: document.settings.updated_at,
+                peak: crate::pricing::PeakPricingSchedule {
+                    windows: vec![crate::pricing::PeakPricingWindow {
+                        weekday_start: 1,
+                        weekday_end: 7,
+                        start_time: document.settings.peak.start_time,
+                        end_time: document.settings.peak.end_time,
+                    }],
+                    multiplier: document.settings.peak.multiplier,
+                    time_zone: "local".to_owned(),
+                    exclude_china_holidays: false,
+                    special_dates: Vec::new(),
+                },
+                models: document.settings.models,
+            }
+        }
+        2 => {
+            let document: PricingSettingsDocument =
+                serde_json::from_str(&value).map_err(|_| SettingsError::InvalidPricingSettings)?;
+            document.settings
+        }
+        _ => return Err(SettingsError::InvalidPricingSettings),
+    };
+    validate_pricing_settings(&settings)?;
+    Ok(settings)
 }
 
 pub(crate) fn write_pricing_settings(
@@ -384,7 +464,7 @@ pub(crate) fn write_pricing_settings(
     let mut saved = settings.clone();
     saved.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
     let value = serde_json::to_string(&PricingSettingsDocument {
-        version: 1,
+        version: 2,
         settings: saved.clone(),
     })
     .map_err(|_| SettingsError::InvalidPricingSettings)?;
@@ -392,6 +472,14 @@ pub(crate) fn write_pricing_settings(
     let transaction = connection
         .transaction()
         .map_err(|_| SettingsError::Storage)?;
+    if let Some(previous) = read_setting(&transaction, PRICING_SETTINGS_KEY)? {
+        let header: PricingSettingsVersion =
+            serde_json::from_str(&previous).map_err(|_| SettingsError::InvalidPricingSettings)?;
+        if header.version == 1 && read_setting(&transaction, PRICING_SETTINGS_BACKUP_KEY)?.is_none()
+        {
+            write_setting(&transaction, PRICING_SETTINGS_BACKUP_KEY, &previous)?;
+        }
+    }
     write_setting(&transaction, PRICING_SETTINGS_KEY, &value)?;
     transaction.commit().map_err(|_| SettingsError::Storage)?;
     Ok(saved)
@@ -946,9 +1034,14 @@ mod tests {
         let settings = PricingSettings {
             updated_at: None,
             peak: crate::pricing::PeakPricingSchedule {
-                start_time: "18:30".to_owned(),
-                end_time: "22:15".to_owned(),
+                windows: vec![crate::pricing::PeakPricingWindow {
+                    weekday_start: 1,
+                    weekday_end: 7,
+                    start_time: "18:30".to_owned(),
+                    end_time: "22:15".to_owned(),
+                }],
                 multiplier: 1.75,
+                ..crate::pricing::PeakPricingSchedule::default()
             },
             models: vec![crate::pricing::ModelPricingRule {
                 model_id: "my-model".to_owned(),
@@ -964,6 +1057,88 @@ mod tests {
         let saved = write_pricing_settings(&path, &settings).expect("save pricing");
         assert!(saved.updated_at.is_some());
         assert_eq!(read_pricing_settings(&path).expect("read pricing"), saved);
+    }
+
+    #[test]
+    fn reads_old_pricing_without_changing_it_and_backs_it_up_on_first_save() {
+        let temporary = tempfile::tempdir().expect("temp dir");
+        let path = temporary.path().join("settings.sqlite3");
+        let legacy = serde_json::json!({
+            "version": 1,
+            "settings": {
+                "updatedAt": null,
+                "peak": { "startTime": "20:00", "endTime": "03:00", "multiplier": 2.0 },
+                "models": [{
+                    "modelId": "deepseek-flash", "displayName": "DeepSeek Flash", "currency": "CNY",
+                    "inputPerMillion": 1.0, "cachedInputPerMillion": null,
+                    "cacheWritePerMillion": null, "outputPerMillion": 4.0, "peakEnabled": true
+                }]
+            }
+        })
+        .to_string();
+        write_setting(&open(&path).expect("open"), PRICING_SETTINGS_KEY, &legacy).expect("seed v1");
+        let migrated = read_pricing_settings(&path).expect("read v1");
+        assert_eq!(migrated.peak.windows.len(), 1);
+        assert_eq!(migrated.peak.windows[0].weekday_start, 1);
+        assert_eq!(migrated.peak.windows[0].weekday_end, 7);
+        assert_eq!(migrated.peak.windows[0].start_time, "20:00");
+        assert!(!migrated.peak.exclude_china_holidays);
+        assert_eq!(migrated.models[0].model_id, "deepseek-flash");
+        let connection = open(&path).expect("reopen");
+        assert_eq!(
+            read_setting(&connection, PRICING_SETTINGS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(legacy.as_str())
+        );
+        drop(connection);
+        write_pricing_settings(&path, &migrated).expect("save v2");
+        let connection = open(&path).expect("reopen v2");
+        assert_eq!(
+            read_setting(&connection, PRICING_SETTINGS_BACKUP_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(legacy.as_str())
+        );
+        let current = read_setting(&connection, PRICING_SETTINGS_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<PricingSettingsVersion>(&current)
+                .unwrap()
+                .version,
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_weekdays_and_special_dates() {
+        let mut settings = PricingSettings::default();
+        settings.peak.windows[0].weekday_start = 0;
+        assert!(matches!(
+            validate_pricing_settings(&settings),
+            Err(SettingsError::InvalidPricingSettings)
+        ));
+        settings.peak.windows[0].weekday_start = 1;
+        settings.peak.special_dates.push("2026-02-30".to_owned());
+        assert!(matches!(
+            validate_pricing_settings(&settings),
+            Err(SettingsError::InvalidPricingSettings)
+        ));
+    }
+
+    #[test]
+    fn accepts_city_time_zones_and_rejects_unknown_zones() {
+        let mut settings = PricingSettings::default();
+        for zone in ["America/Los_Angeles", "Europe/London", "Asia/Tokyo", "UTC"] {
+            settings.peak.time_zone = zone.to_owned();
+            assert!(validate_pricing_settings(&settings).is_ok(), "{zone}");
+        }
+        settings.peak.time_zone = "unknown/city".to_owned();
+        assert!(matches!(
+            validate_pricing_settings(&settings),
+            Err(SettingsError::InvalidPricingSettings)
+        ));
     }
 
     #[test]

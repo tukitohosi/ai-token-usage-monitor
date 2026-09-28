@@ -218,9 +218,19 @@ export interface PriceCatalogEntry {
 export type PricingCurrency = "USD" | "CNY";
 
 export interface PeakPricingSchedule {
+  windows: PeakPricingWindow[];
+  multiplier: number;
+  /** "local" or an IANA city time zone such as America/Los_Angeles. */
+  timeZone: string;
+  excludeChinaHolidays: boolean;
+  specialDates: string[];
+}
+
+export interface PeakPricingWindow {
+  weekdayStart: number;
+  weekdayEnd: number;
   startTime: string;
   endTime: string;
-  multiplier: number;
 }
 
 export interface ModelPricingRule {
