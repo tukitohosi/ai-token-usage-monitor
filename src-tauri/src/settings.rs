@@ -324,7 +324,13 @@ pub(crate) fn read_project_merge_rules(
     database_path: &Path,
 ) -> Result<Vec<ProjectMergeRule>, SettingsError> {
     let connection = open(database_path)?;
-    let Some(value) = read_setting(&connection, PROJECT_MERGE_RULES_KEY)? else {
+    read_project_merge_rules_from_connection(&connection)
+}
+
+fn read_project_merge_rules_from_connection(
+    connection: &Connection,
+) -> Result<Vec<ProjectMergeRule>, SettingsError> {
+    let Some(value) = read_setting(connection, PROJECT_MERGE_RULES_KEY)? else {
         return Ok(Vec::new());
     };
     let document: ProjectMergeRulesDocument =
@@ -413,7 +419,13 @@ pub(crate) fn read_pricing_settings(
     database_path: &Path,
 ) -> Result<PricingSettings, SettingsError> {
     let connection = open(database_path)?;
-    let Some(value) = read_setting(&connection, PRICING_SETTINGS_KEY)? else {
+    read_pricing_settings_from_connection(&connection)
+}
+
+fn read_pricing_settings_from_connection(
+    connection: &Connection,
+) -> Result<PricingSettings, SettingsError> {
+    let Some(value) = read_setting(connection, PRICING_SETTINGS_KEY)? else {
         return Ok(PricingSettings::default());
     };
     let header: PricingSettingsVersion =
@@ -454,6 +466,28 @@ pub(crate) fn read_pricing_settings(
     };
     validate_pricing_settings(&settings)?;
     Ok(settings)
+}
+
+/// Export reads saved settings only; a missing settings database means defaults.
+pub(crate) fn read_export_settings(
+    database_path: &Path,
+) -> Result<(PricingSettings, Vec<ProjectMergeRule>), SettingsError> {
+    if !database_path.exists() {
+        return Ok((PricingSettings::default(), Vec::new()));
+    }
+    let connection =
+        Connection::open_with_flags(database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| SettingsError::Storage)?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| SettingsError::Storage)?;
+    connection
+        .execute_batch("BEGIN")
+        .map_err(|_| SettingsError::Storage)?;
+    Ok((
+        read_pricing_settings_from_connection(&connection)?,
+        read_project_merge_rules_from_connection(&connection)?,
+    ))
 }
 
 pub(crate) fn write_pricing_settings(
@@ -1109,6 +1143,44 @@ mod tests {
                 .version,
             2
         );
+    }
+
+    #[test]
+    fn export_settings_decode_legacy_prices_without_writes_or_migrations() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.sqlite3");
+        let legacy = serde_json::json!({ "version":1, "settings": { "updatedAt":"2026-01-01T00:00:00Z", "peak":{"startTime":"18:00","endTime":"23:00","multiplier":2.0}, "models":[] } }).to_string();
+        {
+            let connection = open(&path).unwrap();
+            write_setting(&connection, PRICING_SETTINGS_KEY, &legacy).unwrap();
+            let rules = serde_json::json!({"version":1,"rules":[{"id":"group","displayName":"项目组","members":[{"sourceId":"codex","sourceLabel":"Codex","projectKey":"a","projectLabel":"a"},{"sourceId":"opencode","sourceLabel":"OpenCode","projectKey":"b","projectLabel":"b"}]}]}).to_string();
+            write_setting(&connection, PROJECT_MERGE_RULES_KEY, &rules).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        let (pricing, rules) = read_export_settings(&path).unwrap();
+        assert_eq!(pricing.peak.windows[0].start_time, "18:00");
+        assert_eq!(pricing.updated_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(rules[0].display_name, "项目组");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            assert!(read_setting(&connection, PRICING_SETTINGS_BACKUP_KEY)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                read_setting(&connection, PRICING_SETTINGS_KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some(legacy.as_str())
+            );
+            write_setting(&connection, PRICING_SETTINGS_KEY, "malformed JSON").unwrap();
+        }
+        let malformed = fs::read(&path).unwrap();
+        assert!(read_export_settings(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), malformed);
+        let absent = temp.path().join("missing.sqlite3");
+        assert!(read_export_settings(&absent).is_ok());
+        assert!(!absent.exists());
     }
 
     #[test]

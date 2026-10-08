@@ -161,6 +161,55 @@ fn deduplicates_copied_rollout_files_by_uuid_and_ordinal() {
 }
 
 #[test]
+fn readonly_export_preserves_canonical_deduplication_and_never_migrates() {
+    let temp = tempdir().unwrap();
+    let database = temp.path().join("usage.sqlite3");
+    let first = temp
+        .path()
+        .join("rollout-first-00000000-0000-0000-0000-000000000999.jsonl");
+    let copied = temp
+        .path()
+        .join("rollout-copy-00000000-0000-0000-0000-000000000999.jsonl");
+    let lines = [record("session_meta", json!({})), token(8)];
+    write_lines(&first, &lines, true);
+    write_lines(&copied, &lines, true);
+    {
+        let mut index = IncrementalIndex::open(&database).unwrap();
+        index.scan_file(&first).unwrap();
+        index.scan_file(&copied).unwrap();
+    }
+    let before = fs::read(&database).unwrap();
+    let events = IncrementalIndex::read_existing_events(&database, None).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].usage.total_tokens, 8);
+    let timestamp = events[0].occurred_at_ms.unwrap();
+    assert_eq!(
+        IncrementalIndex::read_existing_events(&database, Some((timestamp, timestamp + 1)))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(IncrementalIndex::read_existing_events(
+        &database,
+        Some((timestamp + 1, timestamp + 2))
+    )
+    .unwrap()
+    .is_empty());
+    assert_eq!(fs::read(&database).unwrap(), before);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .pragma_update(None, "user_version", 1_i64)
+        .unwrap();
+    drop(connection);
+    let outdated = fs::read(&database).unwrap();
+    assert!(IncrementalIndex::read_existing_events(&database, None).is_err());
+    assert_eq!(fs::read(&database).unwrap(), outdated);
+    let absent = temp.path().join("does-not-exist.sqlite3");
+    assert!(IncrementalIndex::read_existing_events(&absent, None).is_err());
+    assert!(!absent.exists());
+}
+
+#[test]
 fn local_events_expose_an_opaque_task_key_without_raw_rollout_identity() {
     let temp = tempdir().expect("temp dir");
     let rollout = temp

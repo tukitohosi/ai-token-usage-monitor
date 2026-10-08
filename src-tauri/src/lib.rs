@@ -7,11 +7,33 @@ mod runtime;
 mod settings;
 mod snapshot;
 mod tray;
+mod usage_export;
 
 use std::path::PathBuf;
 
 use tauri::{Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
+
+#[tauri::command]
+async fn read_usage_export(
+    runtime: tauri::State<'_, runtime::UsageRuntime>,
+    query: usage_export::UsageExportQuery,
+) -> Result<usage_export::UsageExportReport, String> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.read_usage_export(query))
+        .await
+        .map_err(|_| "后台报告生成任务意外结束。".to_owned())?
+}
+
+#[tauri::command]
+async fn save_usage_export(
+    window: tauri::Window,
+    request: usage_export::SaveExportRequest,
+) -> Result<usage_export::SaveExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || usage_export::save_report(request, window))
+        .await
+        .map_err(|_| "后台报告保存任务意外结束。".to_owned())?
+}
 
 #[tauri::command]
 async fn read_dashboard_snapshot(
@@ -376,6 +398,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_dashboard_snapshot,
             read_cached_dashboard_snapshot,
+            read_usage_export,
+            save_usage_export,
             set_plan_renewal_at,
             read_usage_day_detail,
             read_visual_preferences,

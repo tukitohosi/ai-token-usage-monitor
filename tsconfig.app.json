@@ -22,6 +22,7 @@
     "src/**/*.tsx",
     "src/ui/**/*.ts",
     "src/core/types.ts",
+    "src/core/usage-export.ts",
     "src/vite-env.d.ts",
     "tests/**/*.test.tsx"
   ]

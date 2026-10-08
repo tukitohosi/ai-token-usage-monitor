@@ -1,0 +1,68 @@
+.usage-export-backdrop { position: fixed; z-index: 200; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(3, 4, 7, .66); backdrop-filter: blur(8px); }
+.usage-export-dialog { width: min(760px, 100%); max-height: calc(100dvh - 48px); overflow: auto; overscroll-behavior: contain; padding: 26px; border: 1px solid var(--border-strong); border-radius: 20px; background: var(--surface-strong); color: var(--text); box-shadow: 0 28px 100px rgba(0, 0, 0, .45); }
+.usage-export-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
+.usage-export-header .eyebrow { margin: 0 0 8px; color: var(--purple-bright); font-size: 11px; letter-spacing: .08em; }
+.usage-export-header h2 { margin: 0 0 9px; font-size: 25px; letter-spacing: -.025em; }
+.usage-export-header #usage-export-description { margin: 0; color: var(--text-soft); font-size: 13px; line-height: 1.6; }
+.usage-export-demo { display: inline-block; margin-top: 11px; padding: 5px 8px; border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent); border-radius: 6px; color: var(--amber); background: color-mix(in srgb, var(--amber) 7%, transparent); font-size: 11px; font-weight: 600; }
+.usage-export-close { flex: 0 0 auto; width: 36px; height: 36px; padding: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); font-size: 24px; line-height: 1; cursor: pointer; }
+.usage-export-filters { margin: 0; padding: 0; border: 0; min-width: 0; }
+.usage-export-filter-row, .usage-export-source-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; font-size: 13px; }
+.usage-export-filter-row > label, .usage-export-source-heading > span { color: var(--text-soft); font-weight: 600; }
+.usage-export-filter-row select, .usage-export-dates input { min-height: 38px; padding: 7px 11px; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--surface-soft); color: var(--text); }
+.usage-export-filter-row select { min-width: 170px; }
+.usage-export-filter-row option { background: var(--surface-strong); }
+.usage-export-source-heading { margin: 18px 0 10px; }
+.usage-export-source-heading button { padding: 2px 0; border: 0; background: transparent; color: var(--purple-bright); cursor: pointer; font-size: 12px; }
+.usage-export-sources { display: flex; flex-wrap: wrap; gap: 8px; }
+.usage-export-sources label { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; color: var(--text-soft); background: var(--surface-soft); cursor: pointer; }
+.usage-export-sources label.is-selected { border-color: color-mix(in srgb, var(--purple) 38%, transparent); background: color-mix(in srgb, var(--purple) 9%, transparent); color: var(--text); }
+.usage-export-sources input { margin: 0; accent-color: var(--purple); }
+.usage-export-dates { display: flex; align-items: end; gap: 12px; margin-top: 14px; }
+.usage-export-dates label { display: grid; flex: 1; gap: 7px; min-width: 0; font-size: 12px; color: var(--text-soft); }
+.usage-export-dates input { width: 100%; }
+.usage-export-dates > span { padding-bottom: 10px; color: var(--muted); }
+.usage-export-generate { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 0; margin-bottom: 4px; }
+.usage-export-generate > p { max-width: 440px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.usage-export-generate > button { flex-shrink: 0; white-space: nowrap; }
+.usage-export-summary { padding: 16px 18px; border: 1px solid color-mix(in srgb, var(--purple) 24%, transparent); border-radius: 13px; background: color-mix(in srgb, var(--purple) 5%, transparent); }
+.usage-export-summary-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
+.usage-export-summary-heading > span { color: var(--text-soft); font-size: 11px; white-space: nowrap; }
+.usage-export-stats { display: grid; grid-template-columns: 1.5fr 1fr 1fr; gap: 16px; margin: 18px 0 13px; }
+.usage-export-stats > div { display: grid; gap: 6px; min-width: 0; }
+.usage-export-stats span { color: var(--text-soft); font-size: 11px; }
+.usage-export-stats strong { font-size: 21px; letter-spacing: -.035em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.usage-export-stats small { font-size: 11px; font-weight: 400; letter-spacing: 0; color: var(--muted); }
+.usage-export-summary > p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.usage-export-notice { margin: 12px 0; color: var(--text-soft); font-size: 12px; line-height: 1.65; }
+.usage-export-datasets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+.usage-export-card { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+.usage-export-card--full { border-color: color-mix(in srgb, var(--purple) 30%, transparent); }
+.usage-export-card-heading { display: flex; align-items: center; gap: 8px; }
+.usage-export-card-heading > span { color: var(--muted); font-size: 10px; letter-spacing: .05em; }
+.usage-export-card-heading h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.usage-export-card-heading > small { margin-left: auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.usage-export-card > p { min-height: 38px; margin: 9px 0 15px; color: var(--text-soft); font-size: 12px; line-height: 1.65; }
+.usage-export-buttons { display: flex; gap: 8px; }
+.usage-export-buttons button { min-height: 32px; padding: 0 12px; font-size: 11px; }
+.usage-export-footnote { margin-top: 18px; color: var(--muted); font-size: 11px; line-height: 1.8; }
+.usage-export-error, .usage-export-message { margin: 0 0 14px; padding: 11px 13px; border: 1px solid var(--border); border-radius: 9px; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.usage-export-error { color: var(--red); background: color-mix(in srgb, var(--red) 5%, transparent); }
+.usage-export-message { color: var(--green); background: color-mix(in srgb, var(--green) 5%, transparent); }
+.usage-export-empty { display: grid; justify-items: center; padding: 36px 20px 26px; border-top: 1px solid var(--border); text-align: center; }
+.usage-export-empty > span { display: grid; place-items: center; width: 42px; height: 42px; margin-bottom: 14px; border: 1px solid var(--border-strong); border-radius: 13px; color: var(--purple-bright); font-size: 24px; background: var(--surface-soft); }
+.usage-export-empty strong { font-size: 14px; font-weight: 600; }
+.usage-export-empty p { max-width: 370px; color: var(--muted); font-size: 12px; line-height: 1.75; }
+.usage-export-dialog button:disabled, .usage-export-filters:disabled { opacity: .5; cursor: default; }
+.usage-export-dialog :focus-visible { outline: 2px solid var(--purple-bright); outline-offset: 3px; }
+.usage-export-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.app-shell[data-theme="light"] .usage-export-dialog { background: #fbfbfd; }
+@media (max-width: 600px) {
+  .usage-export-backdrop { padding: 10px; }
+  .usage-export-dialog { max-height: calc(100dvh - 20px); padding: 20px 16px; border-radius: 16px; }
+  .usage-export-generate { align-items: stretch; flex-direction: column; gap: 12px; }
+  .usage-export-datasets { grid-template-columns: 1fr; }
+  .usage-export-card > p { min-height: 0; }
+  .usage-export-stats { gap: 10px; }
+  .usage-export-stats strong { font-size: 18px; }
+}

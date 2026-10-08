@@ -1,4 +1,5 @@
 import type { PricingDraft } from "./pricing-editor";
+import { usePricingOrder } from "./pricing-order";
 import {
   useEffect,
   useMemo,
@@ -786,6 +787,7 @@ export function ActivityView({
   projectMergeRules,
   projectMergeMessage,
   onSaveProjectMergeRules,
+  onOpenExport,
 }: FilterProps & {
   sourceHealth: SourceHealthSummary[];
   summary: DeviceUsageRangeSummary | null;
@@ -795,6 +797,7 @@ export function ActivityView({
   projectMergeRules: ProjectMergeRule[];
   projectMergeMessage: string | null;
   onSaveProjectMergeRules: (rules: ProjectMergeRule[]) => Promise<ProjectMergeRule[]>;
+  onOpenExport: () => void;
 }) {
   const [activityMode, setActivityMode] = useState<"all" | "codex">("all");
   const [codexRange, setCodexRange] = useState<Exclude<UsageRange, "custom">>("today");
@@ -804,6 +807,7 @@ export function ActivityView({
         eyebrow="LOCAL ACTIVITY"
         title="本机活动"
         description="只汇总当前电脑可读取的派生数字，不代表账号套餐额度或其他设备。"
+        actions={<button className="secondary-button" type="button" onClick={onOpenExport}><Icon name="download" />导出数据</button>}
       />
       <div className="activity-view-switch" role="group" aria-label="本机活动视图">
         <button type="button" className={activityMode === "all" ? "is-active" : ""} aria-pressed={activityMode === "all"} onClick={() => setActivityMode("all")}>来源总览</button>
@@ -1673,16 +1677,7 @@ export function PricingView({
   message: string | null;
   onSave: () => Promise<void>;
 }) {
-  const tokenTotals = useMemo(() => {
-    const totals = new Map<string, number>();
-    for (const source of usage?.sources ?? []) {
-      for (const model of source.byModel) {
-        const identity = model.label.trim().toLowerCase();
-        totals.set(identity, (totals.get(identity) ?? 0) + model.usage.totalTokens);
-      }
-    }
-    return totals;
-  }, [usage]);
+  const { models: usedModels, tokenTotals, onFocusCapture, onBlurCapture } = usePricingOrder(draft.models, usage);
   const updateModel = (modelId: string, patch: Partial<PricingDraft["models"][number]>) => {
     setDraft((current) => ({
       ...current,
@@ -1713,11 +1708,10 @@ export function PricingView({
       />
     </label>
   );
-  const usedModels = draft.models;
   const peakModelCount = usedModels.filter((model) => model.peakEnabled).length;
   const commonPeakTimeZone = COMMON_PEAK_TIME_ZONES.some((zone) => zone.value === draft.peak.timeZone) ? draft.peak.timeZone : "custom";
   return (
-    <section className="view-panel">
+    <section className="view-panel" onFocusCapture={onFocusCapture} onBlurCapture={onBlurCapture}>
       <PageHeading
         eyebrow="MANUAL API PRICING"
         title="模型定价"
@@ -1780,7 +1774,7 @@ export function PricingView({
           </div>
         </div>
       </article>
-      <div className="pricing-page-note" role="note"><Icon name="info" /><span>下列模型来自本机已索引的真实用量，并首次按累计 Token 排列，编辑期间保持位置稳定。单价单位均为“每 100 万 Token”。留空的类别会保留为未定价，不会按 0 元处理。</span></div>
+      <div className="pricing-page-note" role="note"><Icon name="info" /><span>按本机已索引的累计 Token 消耗量自动排序，数据刷新后更新；正在输入时，离开输入框后再调整顺序。单价单位均为“每 100 万 Token”。留空表示未定价。</span></div>
       {message && <p className="pricing-save-message" role="status">{message}</p>}
       <div className="model-pricing-list">
         {usedModels.map((model, index) => {
@@ -1828,7 +1822,8 @@ export function CostView({
   customRangeError,
   summary,
   onOpenPricing,
-}: FilterProps & { summary: DeviceUsageRangeSummary | null; onOpenPricing: () => void }) {
+  onOpenExport,
+}: FilterProps & { summary: DeviceUsageRangeSummary | null; onOpenPricing: () => void; onOpenExport: () => void }) {
   if (!usage || !summary)
     return (
       <section className="view-panel">
@@ -1836,6 +1831,7 @@ export function CostView({
           eyebrow="COST"
           title="费用"
           description="本机手动价格与未定价覆盖情况。"
+          actions={<button className="secondary-button" type="button" onClick={onOpenExport}><Icon name="download" />导出数据</button>}
         />
         <EmptyState
           title="暂无费用数据"
@@ -1858,7 +1854,7 @@ export function CostView({
         eyebrow="COST ESTIMATE"
         title="费用"
         description="只按你保存的本机 API 单价估算，不代表订阅、Credits 或实际账单。"
-        actions={<button className="secondary-button" type="button" onClick={onOpenPricing}>管理模型价格</button>}
+        actions={<div className="inline-actions"><button className="secondary-button" type="button" onClick={onOpenPricing}>管理模型价格</button><button className="secondary-button" type="button" onClick={onOpenExport}><Icon name="download" />导出数据</button></div>}
       />
       <UnifiedFilters
         usage={usage}
@@ -1917,7 +1913,6 @@ export function CostView({
             <p className="eyebrow">逐来源明细</p>
             <h2>{formatRangeLabel(range, appliedCustomStartDate, appliedCustomEndDate)}费用</h2>
           </div>
-          <ExportButtons range={range} rangeLabel={formatRangeLabel(range, appliedCustomStartDate, appliedCustomEndDate)} rows={rows} />
         </header>
         <ol>
           {rows.map((row) => (
@@ -1953,70 +1948,11 @@ export function CostView({
         <div>
           <strong>费用仍然保持本地优先</strong>
           <p>
-            导出只包含来源标签、Token 汇总和估算费用，不包含对话、路径、会话 ID
-            或凭据。
+            可导出模型、日期、来源和项目的用量与估算费用，不包含对话、完整路径、会话标识或凭据。
           </p>
         </div>
       </div>
     </section>
-  );
-}
-
-function ExportButtons({
-  range,
-  rangeLabel,
-  rows,
-}: {
-  range: UsageRange;
-  rangeLabel: string;
-  rows: ReturnType<typeof costDetailRows>;
-}) {
-  const exportData = (format: "csv" | "json") => {
-    const safe = rows.map((row) => ({
-      source: row.source.label,
-      tokens: row.usage.totalTokens,
-      usd: row.cost.usd,
-      cny: row.cost.cny,
-      unpricedTokens: row.cost.unpricedTokens,
-    }));
-    const text =
-      format === "json"
-        ? JSON.stringify(
-            { range, rangeLabel, exportedAt: new Date().toISOString(), sources: safe },
-            null,
-            2,
-          )
-        : [
-            `range,"${rangeLabel.replaceAll('"', '""')}"`,
-            "source,tokens,usd,cny,unpricedTokens",
-            ...safe.map((row) =>
-              [row.source, row.tokens, row.usd, row.cny, row.unpricedTokens]
-                .map((value) => `"${String(value).replaceAll('"', '""')}"`)
-                .join(","),
-            ),
-          ].join("\r\n");
-    const url = URL.createObjectURL(
-      new Blob([text], {
-        type: format === "json" ? "application/json" : "text/csv;charset=utf-8",
-      }),
-    );
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `ai-token-usage-${range}-${localDateKey(new Date())}.${format}`;
-    link.click();
-    URL.revokeObjectURL(url);
-  };
-  return (
-    <div className="export-actions">
-      <button type="button" onClick={() => exportData("csv")}>
-        <Icon name="download" />
-        CSV
-      </button>
-      <button type="button" onClick={() => exportData("json")}>
-        <Icon name="download" />
-        JSON
-      </button>
-    </div>
   );
 }
 

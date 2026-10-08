@@ -3,6 +3,7 @@ dist/
 coverage/
 .vite/
 .tools/
+/review/
 *.log
 *.tsbuildinfo
 .env

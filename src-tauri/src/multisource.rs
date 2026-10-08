@@ -23,6 +23,67 @@ use crate::{
 
 pub(crate) const MULTI_SOURCE_SCHEMA_VERSION: i64 = 3;
 
+/// An internal numeric row, never sent directly to the webview or export file.
+pub(crate) struct IndexedExportEvent {
+    pub(crate) source_id: String,
+    pub(crate) occurred_at_ms: Option<i64>,
+    pub(crate) model_label: String,
+    pub(crate) project_label: String,
+    pub(crate) usage: DeviceTokenUsage,
+}
+
+pub(crate) fn read_existing_export_events(
+    path: &Path,
+    source_ids: &[String],
+    range: Option<(i64, i64)>,
+) -> rusqlite::Result<Vec<IndexedExportEvent>> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let version: String = connection.query_row(
+        "SELECT value FROM source_index_meta WHERE key = 'schema-version'",
+        [],
+        |row| row.get(0),
+    )?;
+    if version.parse::<i64>().ok() != Some(MULTI_SOURCE_SCHEMA_VERSION) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let placeholders = (0..source_ids.len())
+        .map(|index| format!("?{}", index + 3))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT source, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens FROM source_events WHERE (?1 IS NULL OR (occurred_at_ms >= ?1 AND occurred_at_ms < ?2)) AND source IN ({placeholders})");
+    let mut parameters = vec![
+        range
+            .map(|value| rusqlite::types::Value::Integer(value.0))
+            .unwrap_or(rusqlite::types::Value::Null),
+        range
+            .map(|value| rusqlite::types::Value::Integer(value.1))
+            .unwrap_or(rusqlite::types::Value::Null),
+    ];
+    parameters.extend(source_ids.iter().cloned().map(rusqlite::types::Value::Text));
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+        Ok(IndexedExportEvent {
+            source_id: row.get(0)?,
+            occurred_at_ms: row.get(1)?,
+            model_label: row.get(2)?,
+            project_label: row.get(3)?,
+            usage: DeviceTokenUsage {
+                input_tokens: row.get(4)?,
+                cached_input_tokens: row.get(5)?,
+                cache_write_tokens: row.get(6)?,
+                cache_write_5m_tokens: row.get(7)?,
+                cache_write_1h_tokens: row.get(8)?,
+                cache_write_unknown_tokens: row.get(9)?,
+                output_tokens: row.get(10)?,
+                reasoning_output_tokens: row.get(11)?,
+                total_tokens: row.get(12)?,
+            },
+        })
+    })?;
+    rows.collect()
+}
+
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_CLAUDE: &str = "claude-code";
 const SOURCE_OPENCODE: &str = "opencode";
@@ -63,7 +124,7 @@ impl CacheWrites {
 }
 
 impl DeviceTokenUsage {
-    fn add_assign(&mut self, other: Self) {
+    pub(crate) fn add_assign(&mut self, other: Self) {
         self.input_tokens += other.input_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
@@ -75,7 +136,7 @@ impl DeviceTokenUsage {
         self.total_tokens += other.total_tokens;
     }
 
-    fn from_parts(
+    pub(crate) fn from_parts(
         input: i64,
         cache_read: i64,
         cache_write: i64,
@@ -1807,7 +1868,7 @@ fn price_usage(usage: DeviceTokenUsage) -> PriceUsage {
     }
 }
 
-fn cost_for(
+pub(crate) fn cost_for(
     model_label: &str,
     usage: DeviceTokenUsage,
     occurred_at_ms: Option<i64>,
@@ -2015,6 +2076,48 @@ fn project_label(value: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn readonly_export_filters_sources_dates_and_retains_undated_only_for_all() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("export.sqlite3");
+        {
+            let index = MultiSourceIndex::open(&path).unwrap();
+            for (key, source, timestamp) in [
+                (1_i64, "claude-code", Some(100_i64)),
+                (2, "claude-code", None),
+                (3, "opencode", Some(100)),
+            ] {
+                index.connection.execute("INSERT INTO source_events(event_key,source,source_file_key,occurred_at_ms,model_label,project_label,input_tokens,cached_input_tokens,cache_write_tokens,output_tokens,reasoning_output_tokens,total_tokens) VALUES (?1,?2,?3,?4,'provider/model','project',10,0,0,2,1,12)", params![vec![key as u8;32],source,vec![9_u8;32],timestamp]).unwrap();
+            }
+        }
+        let before = fs::read(&path).unwrap();
+        let selected = vec!["claude-code".to_owned()];
+        let all = read_existing_export_events(&path, &selected, None).unwrap();
+        assert_eq!(all.len(), 2);
+        let dated = read_existing_export_events(&path, &selected, Some((100, 101))).unwrap();
+        assert_eq!(dated.len(), 1);
+        assert_eq!(dated[0].model_label, "provider/model");
+        assert_eq!(dated[0].usage.total_tokens, 12);
+        assert_eq!(dated[0].usage.reasoning_output_tokens, 1);
+        assert!(
+            read_existing_export_events(&path, &selected, Some((101, 102)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE source_index_meta SET value='1' WHERE key='schema-version'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let old_schema = fs::read(&path).unwrap();
+        assert!(read_existing_export_events(&path, &selected, None).is_err());
+        assert_eq!(fs::read(&path).unwrap(), old_schema);
+    }
 
     fn claude_line(session: &str, message: &str, extra: &str) -> String {
         format!(

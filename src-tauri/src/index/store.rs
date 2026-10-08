@@ -45,6 +45,27 @@ struct ReadResult {
 }
 
 impl IncrementalIndex {
+    /// Reads an existing index without creating, configuring or migrating it.
+    pub(crate) fn read_existing_events(
+        database_path: &Path,
+        range: Option<(i64, i64)>,
+    ) -> IndexResult<Vec<LocalUsageEvent>> {
+        let connection =
+            Connection::open_with_flags(database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let application_id: i64 =
+            connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+        if application_id != super::schema::APPLICATION_ID {
+            return Err(IndexError::ForeignDatabase(application_id));
+        }
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != super::schema::SCHEMA_VERSION {
+            return Err(IndexError::UnsupportedSchema(version));
+        }
+        super::schema::verify_parser_version(&connection)?;
+        query_local_events(&connection, range)
+    }
+
     pub fn open(database_path: impl AsRef<Path>) -> IndexResult<Self> {
         if let Some(parent) = database_path.as_ref().parent() {
             fs::create_dir_all(parent)?;

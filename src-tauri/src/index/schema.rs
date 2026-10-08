@@ -80,7 +80,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> IndexResult<()> {
     verify_parser_version(connection)
 }
 
-fn verify_parser_version(connection: &Connection) -> IndexResult<()> {
+pub(crate) fn verify_parser_version(connection: &Connection) -> IndexResult<()> {
     let persisted: Option<String> = connection
         .query_row(
             "SELECT value FROM app_meta WHERE key = 'parser_semantics_version'",

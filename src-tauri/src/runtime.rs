@@ -631,6 +631,36 @@ impl UsageRuntime {
         Ok(build_day_detail(date.to_owned(), tasks))
     }
 
+    pub(crate) fn read_usage_export(
+        &self,
+        query: crate::usage_export::UsageExportQuery,
+    ) -> Result<crate::usage_export::UsageExportReport, String> {
+        let _refresh_guard = self
+            .refresh_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Health is explicitly last-known; day-detail reads can update indexes
+        // independently of the last dashboard snapshot. Never imply a revision match.
+        let snapshot = self
+            .latest_snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+            .or_else(|| {
+                fs::read(&self.snapshot_cache_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            });
+        crate::usage_export::read_report(
+            query,
+            &self.codex_database_path,
+            &self.multi_source_database_path,
+            &self.settings_path,
+            snapshot.as_ref(),
+        )
+    }
+
     pub(crate) fn maybe_notify<R: Runtime>(
         &self,
         app: &AppHandle<R>,

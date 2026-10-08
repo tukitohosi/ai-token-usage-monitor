@@ -1,5 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { normalizeUsageExportReport, type UsageExportQuery, type UsageExportReport, type SaveUsageExportRequest, type SaveUsageExportResult } from "../core/usage-export";
+import { createMockUsageExportReport } from "./mock-usage-export";
 
 import type {
   AppPreferences,
@@ -37,6 +39,8 @@ export const SET_PRICING_SETTINGS_COMMAND = "set_pricing_settings";
 export const TEST_NOTIFICATION_COMMAND = "send_test_notification";
 export const INDEX_MAINTENANCE_COMMAND = "read_index_maintenance_report";
 export const REBUILD_INDEXES_COMMAND = "rebuild_indexes";
+export const USAGE_EXPORT_COMMAND = "read_usage_export";
+export const SAVE_USAGE_EXPORT_COMMAND = "save_usage_export";
 
 export type DashboardSnapshotListener = (snapshot: DashboardSnapshot) => void;
 export type UnsubscribeDashboard = () => void;
@@ -74,6 +78,9 @@ export interface DashboardAdapter {
   sendTestNotification?(): Promise<AppPreferences>;
   readIndexMaintenanceReport?(): Promise<IndexMaintenanceReport>;
   rebuildIndexes?(): Promise<IndexRebuildResult>;
+  /** Captures a report from existing local indexes without scanning source files. */
+  readUsageExport?(query: UsageExportQuery): Promise<UsageExportReport>;
+  saveUsageExport?(request: SaveUsageExportRequest): Promise<SaveUsageExportResult>;
 }
 
 interface TauriSnapshotEvent {
@@ -423,6 +430,18 @@ function normalizeProgress(value: unknown): RefreshProgress {
 export class TauriDashboardAdapter implements DashboardAdapter {
   constructor(private readonly bridge: TauriDashboardBridge = DEFAULT_TAURI_BRIDGE) {}
 
+  async readUsageExport(query: UsageExportQuery): Promise<UsageExportReport> {
+    return normalizeUsageExportReport(await this.bridge.invoke(USAGE_EXPORT_COMMAND, { query }));
+  }
+
+  async saveUsageExport(request: SaveUsageExportRequest): Promise<SaveUsageExportResult> {
+    const result = await this.bridge.invoke(SAVE_USAGE_EXPORT_COMMAND, { request });
+    if (!isRecord(result) || (result.status !== "saved" && result.status !== "cancelled") || !(result.path === null || typeof result.path === "string")) {
+      throw new Error("无法确认导出文件是否已保存，请检查目标文件夹。");
+    }
+    return { status: result.status, path: result.path };
+  }
+
   async refresh(): Promise<DashboardSnapshot> {
     const value = await this.bridge.invoke(SNAPSHOT_COMMAND);
     return normalizeDashboardSnapshot(value);
@@ -610,6 +629,23 @@ export class MockDashboardAdapter implements DashboardAdapter {
       { modelId: "默认模型", displayName: "默认模型", currency: "USD", inputPerMillion: null, cachedInputPerMillion: null, cacheWritePerMillion: null, outputPerMillion: null, peakEnabled: false },
     ],
   };
+
+  async readUsageExport(query: UsageExportQuery): Promise<UsageExportReport> {
+    return createMockUsageExportReport(query);
+  }
+
+  async saveUsageExport(request: SaveUsageExportRequest): Promise<SaveUsageExportResult> {
+    const blob = new Blob([request.content], { type: request.format === "csv" ? "text/csv;charset=utf-8" : "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = request.suggestedFileName;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return { status: "saved", path: null };
+  }
 
   constructor(
     private readonly state: MockDashboardState = "ready",
