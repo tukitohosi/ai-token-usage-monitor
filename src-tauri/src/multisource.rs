@@ -21,7 +21,7 @@ use crate::{
     pricing::{self, CostSummary, PriceUsage},
 };
 
-pub(crate) const MULTI_SOURCE_SCHEMA_VERSION: i64 = 3;
+pub(crate) const MULTI_SOURCE_SCHEMA_VERSION: i64 = 4;
 
 /// An internal numeric row, never sent directly to the webview or export file.
 pub(crate) struct IndexedExportEvent {
@@ -285,6 +285,7 @@ pub(crate) struct DeviceUsageSummary {
 struct UsageEvent {
     identity: String,
     occurred_at_ms: Option<i64>,
+    snapshot_ordinal: i64,
     model_label: String,
     project_label: String,
     usage: DeviceTokenUsage,
@@ -585,6 +586,7 @@ impl MultiSourceIndex {
     pub(crate) fn open(path: &Path) -> rusqlite::Result<Self> {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        backup_before_source_migration(&connection, path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(
             "
@@ -636,6 +638,16 @@ impl MultiSourceIndex {
         ensure_source_event_columns(&connection)?;
         migrate_derived_source_index(&mut connection)?;
         Ok(Self { connection })
+    }
+
+    /// Re-read available sources without throwing away history whose original
+    /// source has been archived, moved, removed, or is temporarily unreadable.
+    pub(crate) fn invalidate_scan_state_for_rebuild(&mut self) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE source_files SET size_bytes = -1, modified_at_ms = NULL",
+            [],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn collect_with_pricing(
@@ -751,6 +763,20 @@ impl MultiSourceIndex {
             ranges.add_source(source);
         }
         let ranges = ranges.finish();
+        let mut warnings: Vec<String> = sources
+            .iter()
+            .filter_map(|source| {
+                self.history_retention_message(&source.id)
+                    .map(|message| format!("{}：{message}", source.label))
+            })
+            .collect();
+        if let Some(message) = sources
+            .iter()
+            .find(|source| source.id == SOURCE_CODEX)
+            .and_then(|source| source.message.as_deref())
+        {
+            warnings.push(format!("Codex：{message}"));
+        }
 
         DeviceUsageSummary {
             generated_at: Utc::now().to_rfc3339(),
@@ -768,7 +794,7 @@ impl MultiSourceIndex {
             today_by_model: ranges.today.by_model.clone(),
             by_project: ranges.total.by_project.clone(),
             sources,
-            warnings: Vec::new(),
+            warnings,
             ranges,
         }
     }
@@ -783,6 +809,7 @@ impl MultiSourceIndex {
     {
         let project_root = claude_home.join("projects");
         if !project_root.is_dir() {
+            self.mark_source_absent(SOURCE_CLAUDE);
             on_progress(0, 0);
             return SourceState::not_detected(
                 SOURCE_CLAUDE,
@@ -813,6 +840,7 @@ impl MultiSourceIndex {
     {
         let trace_root = root.join("traces");
         if !trace_root.is_dir() {
+            self.mark_source_absent(id);
             on_progress(0, 0);
             return SourceState::not_detected(id, label, "未检测到本机 trace 用量目录。");
         }
@@ -841,6 +869,7 @@ impl MultiSourceIndex {
         F: FnMut(i64, i64),
     {
         if !database_path.is_file() {
+            self.mark_source_absent(SOURCE_OPENCODE);
             on_progress(0, 0);
             return SourceState::not_detected(
                 SOURCE_OPENCODE,
@@ -875,15 +904,17 @@ impl MultiSourceIndex {
                     )
                 }
             };
-            if transaction
-                .execute(
-                    "DELETE FROM source_event_files WHERE source = ?1 AND source_file_key = ?2",
-                    params![SOURCE_OPENCODE, file_key.as_slice()],
-                )
-                .is_err()
+            if parsed.complete
+                && transaction
+                    .execute(
+                        "DELETE FROM source_event_files WHERE source = ?1 AND source_file_key = ?2",
+                        params![SOURCE_OPENCODE, file_key.as_slice()],
+                    )
+                    .is_err()
             {
                 return SourceState::error(SOURCE_OPENCODE, "OpenCode", "本机用量索引暂不可写入。");
             }
+            let complete = parsed.complete;
             scan.skipped_records += parsed.skipped_records;
             for event in parsed.events {
                 match insert_event(&transaction, SOURCE_OPENCODE, &file_key, event) {
@@ -902,11 +933,11 @@ impl MultiSourceIndex {
                 &transaction,
                 SOURCE_OPENCODE,
                 &file_key,
-                size_bytes,
+                if complete { size_bytes } else { -1 },
                 modified_at_ms,
             )
             .is_err()
-                || prune_orphan_events(&transaction, SOURCE_OPENCODE).is_err()
+                || (complete && prune_orphan_events(&transaction, SOURCE_OPENCODE).is_err())
             {
                 return SourceState::error(SOURCE_OPENCODE, "OpenCode", "本机用量索引暂不可写入。");
             }
@@ -965,6 +996,7 @@ impl MultiSourceIndex {
             .map_err(|_| ())?;
         for (index, path) in files.iter().enumerate() {
             let file_key = hash_bytes(path.to_string_lossy().as_bytes());
+            let before_stamp = file_stamp(path);
             let contents = match fs::read_to_string(path) {
                 Ok(contents) => contents,
                 Err(_) => {
@@ -978,45 +1010,89 @@ impl MultiSourceIndex {
                 }
             };
             let (size_bytes, modified_at_ms) = file_stamp(path);
-            let changed = self.file_changed(source, &file_key, size_bytes, modified_at_ms);
+            let changed = before_stamp != (size_bytes, modified_at_ms)
+                || self.file_changed(source, &file_key, size_bytes, modified_at_ms);
+            let parsed = changed.then(|| {
+                let mut parsed = parser(path, &contents);
+                parsed.complete &= before_stamp == (size_bytes, modified_at_ms);
+                parsed
+            });
             let transaction = match self.connection.transaction() {
                 Ok(transaction) => transaction,
                 Err(_) => return Err(()),
             };
-            if changed {
-                transaction
-                    .execute(
-                        "DELETE FROM source_event_files WHERE source = ?1 AND source_file_key = ?2",
-                        params![source, file_key.as_slice()],
-                    )
-                    .map_err(|_| ())?;
-                let parsed = parser(path, &contents);
+            let mut complete = true;
+            if let Some(parsed) = parsed {
+                complete = parsed.complete;
+                if complete {
+                    transaction
+                        .execute(
+                            "DELETE FROM source_event_files WHERE source = ?1 AND source_file_key = ?2",
+                            params![source, file_key.as_slice()],
+                        )
+                        .map_err(|_| ())?;
+                }
                 scan.skipped_records += parsed.skipped_records;
                 for event in parsed.events {
                     if insert_event(&transaction, source, &file_key, event).map_err(|_| ())? {
                         scan.new_events += 1;
                     }
                 }
+                // A recognized reply replaces every old UUID snapshot, even
+                // when an old copied source is no longer available to reread.
+                for legacy_key in parsed.legacy_event_keys {
+                    retire_legacy_event(&transaction, source, &legacy_key).map_err(|_| ())?;
+                }
+                if complete {
+                    prune_orphan_events(&transaction, source).map_err(|_| ())?;
+                }
             }
-            upsert_source_file(&transaction, source, &file_key, size_bytes, modified_at_ms)
-                .map_err(|_| ())?;
+            upsert_source_file(
+                &transaction,
+                source,
+                &file_key,
+                if complete { size_bytes } else { -1 },
+                modified_at_ms,
+            )
+            .map_err(|_| ())?;
             transaction.commit().map_err(|_| ())?;
             on_progress(i64::try_from(index + 1).unwrap_or(i64::MAX), total_files);
         }
-        self.connection.execute(
-            "DELETE FROM source_event_files WHERE source = ?1 AND source_file_key IN (SELECT file_key FROM source_files WHERE source = ?1 AND present = 0)",
-            [source],
-        ).map_err(|_| ())?;
-        self.connection
-            .execute(
-                "DELETE FROM source_files WHERE source = ?1 AND present = 0",
-                [source],
-            )
-            .map_err(|_| ())?;
-        let transaction = self.connection.transaction().map_err(|_| ())?;
-        prune_orphan_events(&transaction, source).map_err(|_| ())?;
-        transaction.commit().map_err(|_| ())?;
+        // Missing sources are provenance, not a request to erase their usage.
         Ok(scan)
+    }
+
+    fn mark_source_absent(&self, source: &str) {
+        let _ = self.connection.execute(
+            "UPDATE source_files SET present = 0 WHERE source = ?1",
+            [source],
+        );
+    }
+
+    fn history_retention_message(&self, source: &str) -> Option<String> {
+        let missing: i64 = self.connection.query_row(
+            "SELECT count(*) FROM source_files f WHERE f.source = ?1 AND f.present = 0
+             AND EXISTS (SELECT 1 FROM source_event_files m WHERE m.source = f.source AND m.source_file_key = f.file_key)",
+            [source], |row| row.get(0),
+        ).unwrap_or(0);
+        let legacy: i64 = self
+            .connection
+            .query_row(
+                "SELECT count(*) FROM source_events WHERE source = ?1 AND legacy_pending = 1",
+                [source],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let mut messages = Vec::new();
+        if missing > 0 {
+            messages.push(format!("已保留 {missing} 个当前不可见来源的历史用量。"));
+        }
+        if legacy > 0 {
+            messages.push(format!(
+                "{legacy} 条旧版历史用量尚未由原始来源重新核对，可能包含流式回复的重复快照。"
+            ));
+        }
+        (!messages.is_empty()).then(|| messages.join(" "))
     }
 
     fn file_changed(
@@ -1065,11 +1141,17 @@ impl MultiSourceIndex {
 
     fn aggregate_source_with_pricing(
         &self,
-        state: SourceState,
+        mut state: SourceState,
         pricing_settings: &pricing::PricingSettings,
     ) -> UsageSourceSummary {
         if state.status == "unavailable" {
             return empty_source_summary(state);
+        }
+        if let Some(message) = self.history_retention_message(state.id) {
+            state.message = Some(match state.message {
+                Some(existing) => format!("{existing} {message}"),
+                None => message,
+            });
         }
         let source_files = self
             .connection
@@ -1338,16 +1420,24 @@ fn codex_summary_with_pricing(
         );
     }
     let ranges = ranges.finish();
+    let refresh_succeeded = new_events.is_some();
+    let mut messages = summary.warnings;
+    if !refresh_succeeded {
+        messages.insert(
+            0,
+            "本轮 Codex 来源读取失败，仍显示此前已保存的历史用量。".to_owned(),
+        );
+    }
     UsageSourceSummary {
         id: SOURCE_CODEX.to_owned(),
         label: "Codex".to_owned(),
-        status: "ready".to_owned(),
-        message: None,
+        status: if refresh_succeeded { "ready" } else { "error" }.to_owned(),
+        message: (!messages.is_empty()).then(|| messages.join(" ")),
         source_files: summary.source_files,
         indexed_events: summary.indexed_events,
         new_events,
         skipped_records: Some(summary.skipped_events),
-        last_indexed_at: Some(Utc::now().to_rfc3339()),
+        last_indexed_at: refresh_succeeded.then(|| Utc::now().to_rfc3339()),
         total: ranges.total.usage,
         today: ranges.today.usage,
         cost: ranges.total.cost.clone(),
@@ -1384,10 +1474,23 @@ fn empty_source_summary(state: SourceState) -> UsageSourceSummary {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ParsedUsageEvents {
     events: Vec<UsageEvent>,
     skipped_records: i64,
+    complete: bool,
+    legacy_event_keys: Vec<[u8; 32]>,
+}
+
+impl Default for ParsedUsageEvents {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            skipped_records: 0,
+            complete: true,
+            legacy_event_keys: Vec::new(),
+        }
+    }
 }
 
 impl std::ops::Deref for ParsedUsageEvents {
@@ -1398,13 +1501,15 @@ impl std::ops::Deref for ParsedUsageEvents {
     }
 }
 
-fn parse_claude_file(_path: &Path, contents: &str) -> ParsedUsageEvents {
+fn parse_claude_file(path: &Path, contents: &str) -> ParsedUsageEvents {
     let complete = contents.ends_with('\n');
     let lines: Vec<_> = contents.lines().collect();
     let line_count = lines.len();
     let mut parsed = ParsedUsageEvents::default();
+    let mut replies: HashMap<String, usize> = HashMap::new();
     for (index, line) in lines.into_iter().enumerate() {
         if !complete && index + 1 == line_count {
+            parsed.complete = false;
             continue;
         }
         let value: Value = match serde_json::from_str(line) {
@@ -1412,6 +1517,7 @@ fn parse_claude_file(_path: &Path, contents: &str) -> ParsedUsageEvents {
             Err(_) => {
                 if !line.trim().is_empty() {
                     parsed.skipped_records += 1;
+                    parsed.complete = false;
                 }
                 continue;
             }
@@ -1430,6 +1536,7 @@ fn parse_claude_file(_path: &Path, contents: &str) -> ParsedUsageEvents {
             number(usage.get("output_tokens")),
         ) else {
             parsed.skipped_records += 1;
+            parsed.complete = false;
             continue;
         };
         let cache_read = number(usage.get("cache_read_input_tokens")).unwrap_or(0);
@@ -1444,15 +1551,29 @@ fn parse_claude_file(_path: &Path, contents: &str) -> ParsedUsageEvents {
             || usage.get("cache_creation_input_tokens").is_some()
             || cache_write_5m.is_some()
             || cache_write_1h.is_some();
-        let session = text(value.get("sessionId"))
-            .or_else(|| text(value.get("session_id")))
-            .unwrap_or("unknown");
-        let message_id = text(value.get("uuid"))
-            .or_else(|| text(message.get("id")))
-            .unwrap_or("unknown");
-        parsed.events.push(UsageEvent {
-            identity: format!("{session}:{message_id}"),
+        let session = text(value.get("sessionId")).or_else(|| text(value.get("session_id")));
+        let reply_id = text(message.get("id"));
+        let uuid = text(value.get("uuid"));
+        // UUID identifies a log update; message.id identifies the reply whose
+        // usage is repeatedly snapshotted during streaming.
+        let session_key = session
+            .map(|value| format!("session:{}:{value}", value.len()))
+            .unwrap_or_else(|| format!("file:{:?}", hash_bytes(path.to_string_lossy().as_bytes())));
+        let reply_key = reply_id
+            .map(|id| format!("message:{id}"))
+            .or_else(|| uuid.map(|id| format!("uuid:{id}")))
+            .unwrap_or_else(|| format!("line:{index}"));
+        let identity = format!("claude-reply-v2\0{session_key}\0{reply_key}");
+        if let (Some(session), Some(old_id)) = (session, uuid.or(reply_id)) {
+            parsed.legacy_event_keys.push(source_event_key(
+                SOURCE_CLAUDE,
+                &format!("{session}:{old_id}"),
+            ));
+        }
+        let event = UsageEvent {
+            identity: identity.clone(),
             occurred_at_ms: timestamp(value.get("timestamp")),
+            snapshot_ordinal: i64::try_from(index).unwrap_or(i64::MAX),
             model_label: text(message.get("model")).unwrap_or("未知模型").to_owned(),
             project_label: project_label(text(value.get("cwd")).unwrap_or("")),
             usage: DeviceTokenUsage::from_cache_parts(
@@ -1468,7 +1589,18 @@ fn parse_claude_file(_path: &Path, contents: &str) -> ParsedUsageEvents {
                 None,
             ),
             cache_metrics_available,
-        });
+        };
+        if let Some(&position) = replies.get(&identity) {
+            let previous = &parsed.events[position];
+            if (event.occurred_at_ms, event.snapshot_ordinal)
+                >= (previous.occurred_at_ms, previous.snapshot_ordinal)
+            {
+                parsed.events[position] = event;
+            }
+        } else {
+            replies.insert(identity, parsed.events.len());
+            parsed.events.push(event);
+        }
     }
     parsed
 }
@@ -1484,6 +1616,8 @@ fn parse_workbuddy_trace(
             return ParsedUsageEvents {
                 events: Vec::new(),
                 skipped_records: 1,
+                complete: false,
+                ..ParsedUsageEvents::default()
             }
         }
     };
@@ -1519,6 +1653,7 @@ fn parse_workbuddy_trace(
             occurred_at_ms: trace
                 .and_then(|trace| timestamp(trace.get("startedAt")))
                 .or_else(|| timestamp(value.get("timestamp"))),
+            snapshot_ordinal: 0,
             model_label: model.to_owned(),
             project_label: session_labels
                 .get(session)
@@ -1533,6 +1668,7 @@ fn parse_workbuddy_trace(
             ),
         }],
         skipped_records: 0,
+        ..ParsedUsageEvents::default()
     }
 }
 
@@ -1682,6 +1818,7 @@ fn read_opencode_events(path: &Path) -> Result<ParsedUsageEvents, ()> {
         parsed.events.push(UsageEvent {
             identity: row.0,
             occurred_at_ms: Some(row.1),
+            snapshot_ordinal: 0,
             model_label: opencode_model_label(row.4.as_deref()),
             project_label: project_label(row.3.as_deref().unwrap_or("")),
             usage: DeviceTokenUsage::from_parts(
@@ -1695,6 +1832,7 @@ fn read_opencode_events(path: &Path) -> Result<ParsedUsageEvents, ()> {
             cache_metrics_available: tokens.get("cache").is_some(),
         });
     }
+    parsed.complete = parsed.skipped_records == 0;
     Ok(parsed)
 }
 
@@ -1793,22 +1931,61 @@ fn insert_event(
     file_key: &[u8; 32],
     event: UsageEvent,
 ) -> rusqlite::Result<bool> {
-    let event_key = hash_bytes(format!("{source}\0{}", event.identity).as_bytes());
+    let event_key = source_event_key(source, &event.identity);
     let existed = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM source_events WHERE source = ?1 AND event_key = ?2)",
         params![source, event_key.as_slice()],
         |row| row.get::<_, bool>(0),
     )?;
     transaction.execute(
-        "INSERT OR REPLACE INTO source_events(event_key, source, source_file_key, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, cache_metrics_available, output_tokens, reasoning_output_tokens, total_tokens)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        params![event_key.as_slice(), source, file_key.as_slice(), event.occurred_at_ms, event.model_label, event.project_label, event.usage.input_tokens, event.usage.cached_input_tokens, event.usage.cache_write_tokens, event.usage.cache_write_5m_tokens, event.usage.cache_write_1h_tokens, event.usage.cache_write_unknown_tokens, i64::from(event.cache_metrics_available), event.usage.output_tokens, event.usage.reasoning_output_tokens, event.usage.total_tokens],
+        "INSERT INTO source_events(event_key, source, source_file_key, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, cache_metrics_available, output_tokens, reasoning_output_tokens, total_tokens, snapshot_ordinal, legacy_pending)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0)
+         ON CONFLICT(event_key) DO UPDATE SET
+           source_file_key = excluded.source_file_key,
+           occurred_at_ms = excluded.occurred_at_ms,
+           model_label = excluded.model_label, project_label = excluded.project_label,
+           input_tokens = excluded.input_tokens, cached_input_tokens = excluded.cached_input_tokens,
+           cache_write_tokens = excluded.cache_write_tokens,
+           cache_write_5m_tokens = excluded.cache_write_5m_tokens,
+           cache_write_1h_tokens = excluded.cache_write_1h_tokens,
+           cache_write_unknown_tokens = excluded.cache_write_unknown_tokens,
+           cache_metrics_available = excluded.cache_metrics_available,
+           output_tokens = excluded.output_tokens, reasoning_output_tokens = excluded.reasoning_output_tokens,
+           total_tokens = excluded.total_tokens, snapshot_ordinal = excluded.snapshot_ordinal, legacy_pending = 0
+         WHERE source_events.legacy_pending = 1
+            OR coalesce(excluded.occurred_at_ms, -9223372036854775808) > coalesce(source_events.occurred_at_ms, -9223372036854775808)
+            OR (excluded.occurred_at_ms IS source_events.occurred_at_ms
+                AND (excluded.snapshot_ordinal > source_events.snapshot_ordinal
+                     OR (excluded.snapshot_ordinal = source_events.snapshot_ordinal
+                         AND excluded.source_file_key >= source_events.source_file_key)))",
+        params![event_key.as_slice(), source, file_key.as_slice(), event.occurred_at_ms, event.model_label, event.project_label, event.usage.input_tokens, event.usage.cached_input_tokens, event.usage.cache_write_tokens, event.usage.cache_write_5m_tokens, event.usage.cache_write_1h_tokens, event.usage.cache_write_unknown_tokens, i64::from(event.cache_metrics_available), event.usage.output_tokens, event.usage.reasoning_output_tokens, event.usage.total_tokens, event.snapshot_ordinal],
     )?;
     transaction.execute(
         "INSERT OR IGNORE INTO source_event_files(source, source_file_key, event_key) VALUES(?1, ?2, ?3)",
         params![source, file_key.as_slice(), event_key.as_slice()],
     )?;
     Ok(!existed)
+}
+
+fn source_event_key(source: &str, identity: &str) -> [u8; 32] {
+    hash_bytes(format!("{source}\0{identity}").as_bytes())
+}
+
+fn retire_legacy_event(
+    transaction: &rusqlite::Transaction<'_>,
+    source: &str,
+    event_key: &[u8; 32],
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "DELETE FROM source_event_files WHERE source = ?1 AND event_key = ?2
+         AND EXISTS (SELECT 1 FROM source_events e WHERE e.source = ?1 AND e.event_key = ?2 AND e.legacy_pending = 1)",
+        params![source, event_key.as_slice()],
+    )?;
+    transaction.execute(
+        "DELETE FROM source_events WHERE source = ?1 AND event_key = ?2 AND legacy_pending = 1",
+        params![source, event_key.as_slice()],
+    )?;
+    Ok(())
 }
 
 fn prune_orphan_events(
@@ -1882,8 +2059,47 @@ pub(crate) fn cost_for(
     )
 }
 
-/// Advances only the app's derived source index.  A full re-read is safer than
-/// trying to reinterpret old generic cache-write counters as 5m/1h values.
+fn backup_before_source_migration(connection: &Connection, path: &Path) -> rusqlite::Result<()> {
+    let has_events: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_events')",
+        [], |row| row.get(0),
+    )?;
+    if !has_events {
+        return Ok(());
+    }
+    let current = connection
+        .query_row(
+            "SELECT value FROM source_index_meta WHERE key = 'schema-version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<i64>().ok());
+    if current.is_some_and(|version| version > MULTI_SOURCE_SCHEMA_VERSION) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    if current == Some(MULTI_SOURCE_SCHEMA_VERSION) {
+        return Ok(());
+    }
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?
+        .as_nanos();
+    let name = path
+        .file_name()
+        .ok_or(rusqlite::Error::InvalidQuery)?
+        .to_string_lossy();
+    let backup = path.with_file_name(format!("{name}.before-v4-{suffix}.sqlite3"));
+    if backup.exists() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    connection.backup(rusqlite::DatabaseName::Main, &backup, None)
+}
+
+/// Additive migration: old counters stay available until a successful source
+/// reread can replace them. Unavailable sources keep their original history.
 fn migrate_derived_source_index(connection: &mut Connection) -> rusqlite::Result<()> {
     let current: Option<String> = connection
         .query_row(
@@ -1892,17 +2108,39 @@ fn migrate_derived_source_index(connection: &mut Connection) -> rusqlite::Result
             |row| row.get(0),
         )
         .optional()?;
-    if current
+    let current = current
         .as_deref()
-        .and_then(|value| value.parse::<i64>().ok())
-        == Some(MULTI_SOURCE_SCHEMA_VERSION)
-    {
+        .and_then(|value| value.parse::<i64>().ok());
+    if current == Some(MULTI_SOURCE_SCHEMA_VERSION) {
         return Ok(());
     }
+    if current.is_some_and(|version| version > MULTI_SOURCE_SCHEMA_VERSION) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     let transaction = connection.transaction()?;
-    transaction.execute("DELETE FROM source_event_files", [])?;
-    transaction.execute("DELETE FROM source_events", [])?;
-    transaction.execute("DELETE FROM source_files", [])?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO source_event_files(source, source_file_key, event_key)
+         SELECT source, source_file_key, event_key FROM source_events",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO source_files(source, file_key, size_bytes, modified_at_ms, present)
+         SELECT source, source_file_key, -1, NULL, 0 FROM source_events",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE source_events SET legacy_pending = 1 WHERE source = ?1",
+        [SOURCE_CLAUDE],
+    )?;
+    if current.unwrap_or(0) < 3 {
+        transaction.execute(
+            "UPDATE source_events SET cache_write_unknown_tokens = max(cache_write_unknown_tokens, cache_write_tokens - cache_write_5m_tokens - cache_write_1h_tokens)", [],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE source_files SET size_bytes = -1, modified_at_ms = NULL",
+        [],
+    )?;
     transaction.execute(
         "INSERT INTO source_index_meta(key, value) VALUES('schema-version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1932,6 +2170,14 @@ fn ensure_source_event_columns(connection: &Connection) -> rusqlite::Result<()> 
         (
             "cache_metrics_available",
             "INTEGER NOT NULL DEFAULT 0 CHECK(cache_metrics_available IN (0, 1))",
+        ),
+        (
+            "snapshot_ordinal",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(snapshot_ordinal >= 0)",
+        ),
+        (
+            "legacy_pending",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(legacy_pending IN (0, 1))",
         ),
     ] {
         if !columns.iter().any(|column| column == name) {
@@ -2175,6 +2421,254 @@ mod tests {
         assert!(events[0].cache_metrics_available);
     }
 
+    fn claude_snapshot(
+        reply: &str,
+        uuid: &str,
+        second: i64,
+        input: i64,
+        cache: i64,
+        output: i64,
+    ) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "fixture-session", "uuid": uuid,
+            "timestamp": 1_792_112_400_000_i64 + second * 1_000,
+            "message": { "id": reply, "model": "deepseek-flash", "usage": {
+                "input_tokens": input, "cache_read_input_tokens": cache, "output_tokens": output
+            }}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    #[test]
+    fn claude_43_stream_updates_are_ten_reply_snapshots() {
+        let mut lines = String::new();
+        for update in 0..33 {
+            lines.push_str(&claude_snapshot(
+                &format!("reply-{}", update % 10),
+                &format!("update-{update}"),
+                update,
+                2_153 + i64::from(update < 9),
+                10_670 + i64::from(update < 18),
+                11 + i64::from(update < 12),
+            ));
+        }
+        for reply in 0..10 {
+            lines.push_str(&claude_snapshot(
+                &format!("reply-{reply}"),
+                &format!("final-{reply}"),
+                33 + reply,
+                1_810 + i64::from(reply < 3),
+                13_132 + i64::from(reply < 8),
+                946 + i64::from(reply < 2),
+            ));
+        }
+        let raw_total: i64 = lines
+            .lines()
+            .map(|line| {
+                let row: Value = serde_json::from_str(line).unwrap();
+                let usage = &row["message"]["usage"];
+                usage["input_tokens"].as_i64().unwrap()
+                    + usage["cache_read_input_tokens"].as_i64().unwrap()
+                    + usage["output_tokens"].as_i64().unwrap()
+            })
+            .sum();
+        assert_eq!(lines.lines().count(), 43);
+        assert_eq!(raw_total, 582_454);
+        let parsed = parse_claude_file(Path::new("fixture.jsonl"), &lines);
+        assert!(parsed.complete);
+        assert_eq!(parsed.len(), 10);
+        let mut usage = DeviceTokenUsage::default();
+        for event in parsed.events {
+            usage.add_assign(event.usage);
+        }
+        assert_eq!(usage.input_tokens, 18_103);
+        assert_eq!(usage.cached_input_tokens, 131_328);
+        assert_eq!(usage.output_tokens, 9_462);
+        assert_eq!(usage.total_tokens, 158_893);
+    }
+
+    #[test]
+    fn claude_stream_growth_keeps_last_valid_complete_snapshot() {
+        let mut lines = claude_snapshot("reply", "first", 1, 10, 20, 1);
+        lines.push_str(&claude_snapshot("reply", "second", 2, 10, 20, 9));
+        lines.push_str("{\"type\":\"assistant\",\"sessionId\":\"fixture-session\",\"message\":{\"id\":\"reply\",\"usage\":{\"input_tokens\":999}}}\n");
+        lines.push_str(claude_snapshot("reply", "unfinished", 3, 999, 999, 999).trim_end());
+        let parsed = parse_claude_file(Path::new("fixture.jsonl"), &lines);
+        assert!(!parsed.complete);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].usage.total_tokens, 39);
+        assert_eq!(parsed[0].usage.output_tokens, 9);
+    }
+
+    #[test]
+    fn claude_snapshot_selection_is_independent_of_copy_scan_order() {
+        let temporary = tempdir().unwrap();
+        let old = temporary.path().join("old.jsonl");
+        let new = temporary.path().join("new.jsonl");
+        fs::write(&old, claude_snapshot("reply", "old-update", 1, 10, 20, 1)).unwrap();
+        fs::write(&new, claude_snapshot("reply", "new-update", 2, 10, 20, 9)).unwrap();
+        let mut index = MultiSourceIndex::open(&temporary.path().join("index.sqlite3")).unwrap();
+        for files in [
+            vec![new.clone(), old.clone()],
+            vec![old.clone(), new.clone()],
+        ] {
+            index.invalidate_scan_state_for_rebuild().unwrap();
+            index
+                .scan_files(SOURCE_CLAUDE, &files, parse_claude_file, |_, _| {})
+                .unwrap();
+            let summary = index.aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"));
+            assert_eq!(summary.indexed_events, 1);
+            assert_eq!(summary.total.total_tokens, 39);
+        }
+    }
+
+    #[test]
+    fn claude_missing_reply_ids_fall_back_without_unknown_collisions() {
+        let lines = "{\"type\":\"assistant\",\"sessionId\":\"s\",\"uuid\":\"a\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n{\"type\":\"assistant\",\"sessionId\":\"s\",\"uuid\":\"b\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n";
+        let parsed = parse_claude_file(Path::new("one.jsonl"), lines);
+        assert_eq!(parsed.len(), 2);
+        assert_ne!(parsed[0].identity, parsed[1].identity);
+        let anonymous = "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n";
+        let one = parse_claude_file(Path::new("one.jsonl"), &anonymous.repeat(2));
+        let two = parse_claude_file(Path::new("two.jsonl"), anonymous);
+        assert_eq!(one.len(), 2);
+        assert_ne!(one[0].identity, one[1].identity);
+        assert_ne!(one[0].identity, two[0].identity);
+    }
+
+    #[test]
+    fn source_v3_migration_preserves_missing_history_and_retires_uuid_updates() {
+        let temporary = tempdir().unwrap();
+        let projects = temporary.path().join(".claude").join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        let file = projects.join("current.jsonl");
+        let file_key = hash_bytes(file.to_string_lossy().as_bytes());
+        let missing_key = hash_bytes(b"missing-copy");
+        let database = temporary.path().join("index.sqlite3");
+        let mut index = MultiSourceIndex::open(&database).unwrap();
+        {
+            let transaction = index.connection.transaction().unwrap();
+            for (uuid, output) in [("first", 1), ("second", 9), ("unavailable", 100)] {
+                let mut event =
+                    parse_claude_file(&file, &claude_snapshot("reply", uuid, 1, 10, 20, output))
+                        .events
+                        .remove(0);
+                event.identity = format!("fixture-session:{uuid}");
+                insert_event(&transaction, SOURCE_CLAUDE, &missing_key, event.clone()).unwrap();
+                if uuid != "unavailable" {
+                    insert_event(&transaction, SOURCE_CLAUDE, &file_key, event).unwrap();
+                }
+            }
+            upsert_source_file(&transaction, SOURCE_CLAUDE, &file_key, 0, None).unwrap();
+            upsert_source_file(&transaction, SOURCE_CLAUDE, &missing_key, 0, None).unwrap();
+            transaction
+                .execute(
+                    "UPDATE source_index_meta SET value = '3' WHERE key = 'schema-version'",
+                    [],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        drop(index);
+        let mut index = MultiSourceIndex::open(&database).unwrap();
+        let before = index.aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"));
+        assert_eq!(before.indexed_events, 3);
+        assert!(before.message.unwrap().contains("尚未由原始来源重新核对"));
+        let backup = fs::read_dir(temporary.path())
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().contains(".before-v4-"))
+            .unwrap();
+        let backup_connection =
+            Connection::open_with_flags(backup.path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            backup_connection
+                .query_row("SELECT count(*) FROM source_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+
+        // An unreadable parse must not discard UUID history during migration.
+        fs::write(&file, "{damaged json}\n").unwrap();
+        index.scan_claude(&temporary.path().join(".claude"));
+        assert_eq!(
+            index
+                .aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"))
+                .indexed_events,
+            3
+        );
+        fs::write(
+            &file,
+            format!(
+                "{}{}",
+                claude_snapshot("reply", "first", 1, 10, 20, 1),
+                claude_snapshot("reply", "second", 2, 10, 20, 9)
+            ),
+        )
+        .unwrap();
+        index.scan_claude(&temporary.path().join(".claude"));
+        let after = index.aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"));
+        assert_eq!(
+            after.indexed_events, 2,
+            "one reply plus unavailable legacy history"
+        );
+        assert_eq!(after.total.total_tokens, 39 + 130);
+        let pending: i64 = index
+            .connection
+            .query_row(
+                "SELECT count(*) FROM source_events WHERE legacy_pending = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn successful_reread_corrects_obsolete_events_but_bad_files_keep_history() {
+        let temporary = tempdir().unwrap();
+        let file = temporary.path().join("fixture.jsonl");
+        fs::write(
+            &file,
+            format!(
+                "{}{}",
+                claude_snapshot("one", "one", 1, 1, 0, 1),
+                claude_snapshot("two", "two", 2, 1, 0, 2)
+            ),
+        )
+        .unwrap();
+        let mut index = MultiSourceIndex::open(&temporary.path().join("index.sqlite3")).unwrap();
+        let scan = |index: &mut MultiSourceIndex| {
+            index
+                .scan_files(
+                    SOURCE_CLAUDE,
+                    std::slice::from_ref(&file),
+                    parse_claude_file,
+                    |_, _| {},
+                )
+                .unwrap()
+        };
+        scan(&mut index);
+        fs::write(&file, "{bad}\n").unwrap();
+        scan(&mut index);
+        assert_eq!(
+            index
+                .aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"))
+                .indexed_events,
+            2
+        );
+        fs::write(&file, claude_snapshot("one", "one", 1, 1, 0, 1)).unwrap();
+        scan(&mut index);
+        assert_eq!(
+            index
+                .aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"))
+                .indexed_events,
+            1
+        );
+    }
+
     #[test]
     fn task_alert_requires_complete_cache_metrics_and_strictly_below_ninety_percent() {
         let low = task_detail(
@@ -2298,9 +2792,14 @@ mod tests {
             index
                 .aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"))
                 .indexed_events,
-            0,
-            "file deletion removes orphaned events"
+            1,
+            "removing the last source preserves its recorded history"
         );
+        assert!(index
+            .aggregate_source(SourceState::ready(SOURCE_CLAUDE, "Claude Code"))
+            .message
+            .unwrap()
+            .contains("已保留"));
     }
 
     #[test]
@@ -2419,6 +2918,78 @@ mod tests {
     }
 
     #[test]
+    fn workbuddy_and_opencode_keep_history_when_sources_disappear() {
+        let temporary = tempdir().unwrap();
+        let workbuddy = temporary.path().join(".workbuddy");
+        let traces = workbuddy.join("traces");
+        fs::create_dir_all(&traces).unwrap();
+        let trace = traces.join("trace_0123456789abcdef0123456789abcdef.json");
+        fs::write(&trace, workbuddy_trace(130)).unwrap();
+        let database = temporary.path().join("opencode.db");
+        let writer = create_opencode_database(&database);
+        let mut index = MultiSourceIndex::open(&temporary.path().join("index.sqlite3")).unwrap();
+        index.scan_workbuddy(SOURCE_WORKBUDDY, "WorkBuddy", &workbuddy);
+        index.scan_opencode(&database);
+        let previous = index
+            .aggregate_source(SourceState::ready(SOURCE_OPENCODE, "OpenCode"))
+            .total;
+        drop(writer);
+        fs::remove_file(&database).unwrap();
+        fs::remove_file(&trace).unwrap();
+        index.scan_workbuddy(SOURCE_WORKBUDDY, "WorkBuddy", &workbuddy);
+        index.scan_opencode(&database);
+        let workbuddy = index.aggregate_source(SourceState::ready(SOURCE_WORKBUDDY, "WorkBuddy"));
+        let opencode = index.aggregate_source(SourceState::ready(SOURCE_OPENCODE, "OpenCode"));
+        assert_eq!(workbuddy.total.total_tokens, 130);
+        assert_eq!(opencode.total, previous);
+        assert!(workbuddy.message.unwrap().contains("已保留"));
+        assert!(opencode.message.unwrap().contains("已保留"));
+    }
+
+    #[test]
+    fn rebuild_invalidation_preserves_events_and_mappings() {
+        let temporary = tempdir().unwrap();
+        let trace = temporary
+            .path()
+            .join("trace_0123456789abcdef0123456789abcdef.json");
+        fs::write(&trace, workbuddy_trace(130)).unwrap();
+        let mut index = MultiSourceIndex::open(&temporary.path().join("index.sqlite3")).unwrap();
+        index
+            .scan_files(
+                SOURCE_WORKBUDDY,
+                &[trace],
+                |path, contents| parse_workbuddy_trace(path, contents, &HashMap::new()),
+                |_, _| {},
+            )
+            .unwrap();
+        index.invalidate_scan_state_for_rebuild().unwrap();
+        assert_eq!(
+            index
+                .connection
+                .query_row("SELECT count(*) FROM source_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            index
+                .connection
+                .query_row("SELECT count(*) FROM source_event_files", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            index
+                .connection
+                .query_row("SELECT size_bytes FROM source_files", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            -1
+        );
+    }
+
+    #[test]
     fn v2_index_and_serialized_summary_do_not_retain_private_source_data() {
         let temporary = tempdir().expect("temp dir");
         let projects = temporary.path().join(".claude").join("projects");
@@ -2500,6 +3071,7 @@ mod tests {
                 UsageEvent {
                     identity: "dated".to_owned(),
                     occurred_at_ms: Some(Local::now().timestamp_millis()),
+                    snapshot_ordinal: 0,
                     model_label: "claude-sonnet-4-20250514".to_owned(),
                     project_label: "fixture".to_owned(),
                     usage: current_usage,
@@ -2514,6 +3086,7 @@ mod tests {
                 UsageEvent {
                     identity: "undated".to_owned(),
                     occurred_at_ms: None,
+                    snapshot_ordinal: 0,
                     model_label: "unknown-model".to_owned(),
                     project_label: "fixture".to_owned(),
                     usage: unpriced_usage,

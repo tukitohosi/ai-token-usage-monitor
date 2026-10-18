@@ -1,6 +1,6 @@
 [package]
 name = "codex-usage-monitor"
-version = "0.9.7"
+version = "0.9.8"
 description = "Local-first AI token activity monitor for Windows."
 authors = ["L.Q"]
 license = ""
@@ -28,7 +28,8 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2.3.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10.4"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+zstd = "0.13"
 blake3 = "1.5"
 rfd = "0.15"
 

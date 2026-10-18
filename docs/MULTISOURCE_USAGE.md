@@ -10,8 +10,8 @@
 
 | 来源 | 只读数据 | 稳定去重键 | 说明 |
 | --- | --- | --- | --- |
-| Codex | `CODEX_HOME/sessions` | v1 rollout 与子代理边界 | v1 索引仍是唯一事实来源 |
-| Claude Code | `~/.claude/projects/**/*.jsonl` | 会话 + assistant 消息 UUID 的不可逆哈希 | 仅读取带 `message.usage` 的 assistant 记录 |
+| Codex | `CODEX_HOME/sessions` 与 `archived_sessions` 的 `.jsonl`、`.jsonl.zst` | 会话 UUID、事件序号与子代理边界 | 普通、压缩和归档副本只统计一次 |
+| Claude Code | `~/.claude/projects/**/*.jsonl` | 会话 + `message.id` 的不可逆哈希，缺失时回退日志 UUID | 同一回复的多次流式快照仅保留最后一份有效用量 |
 | OpenCode 桌面版 | `~/.local/share/opencode/opencode.db` 与 WAL | `part.id` 的不可逆哈希 | 仅 `step-finish` Token 行 |
 | WorkBuddy | `~/.workbuddy/traces` | trace 稳定键的不可逆哈希 | 仅标准 trace 文件 |
 | WorkBuddy AI | `~/.workbuddy-ai/traces` | trace 稳定键的不可逆哈希 | 不扫描 `C:\Users\<你的用户名>\WorkBuddy AI` 工作区 |
@@ -21,7 +21,9 @@
 
 `usage-index-v2.sqlite3` 仅保存来源、不可逆键、时间、模型、脱敏项目标签和 Token 派生数字（新输入、缓存读取、缓存写入、输出、推理输出、总 Token）。它不保存对话文字、标题、完整路径、原始 JSON、会话 ID、账号或凭据。
 
-源文件变化会重建该文件的映射；删除文件会删除已失去所有映射的事件。相同事件出现在多个 Claude JSONL 副本中时只统计一次，直到最后一个副本消失。
+源文件完整成功重读后可纠正对应记录；源文件删除、移动或暂时无法读取时，已记录历史继续保留并显示提示。相同回复出现在多个 Claude JSONL 副本中时只统计一次，旧副本不能覆盖更新的快照。升级前备份原数据库并保留历史；无法核实的新旧去重关系会明确提示，不擅自抹去旧记录。
+
+重建索引会先创建 SQLite 一致性备份，再重新读取可用源，不清空历史。费用继续根据当前保存的价格设置重算，是本机估算值。
 
 ## 状态和失败隔离
 

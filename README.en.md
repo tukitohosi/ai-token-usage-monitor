@@ -4,11 +4,13 @@
 
 A Windows app for viewing AI token usage, model activity and estimated costs alongside Codex account limits. It reads local records from Codex, Claude Code, OpenCode, WorkBuddy and WorkBuddy AI.
 
-The current release is **v0.9.7**. [Download](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.7)
+The current release is **v0.9.8**. [Download](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.8)
 
 ## Features
 
 - Explore usage by date, AI source, model and project, with daily details.
+- Read plain, Zstandard-compressed and archived Codex logs. Keep recorded history when source files move or disappear.
+- Merge Claude Code streaming usage snapshots by reply, including other models used through Claude Code, so each reply is counted once.
 - See daily trends and the past 24 hours of activity.
 - View Codex account limits and account daily activity separately from local records.
 - Enter input, cache-read, cache-write and output prices for each model. Missing prices remain unpriced.
@@ -20,7 +22,7 @@ The current release is **v0.9.7**. [Download](https://github.com/tukitohosi/ai-t
 
 ## Install and use
 
-1. Download AI-Token-Usage-Monitor-0.9.7-Setup.exe from the [v0.9.7 release](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.7).
+1. Download AI-Token-Usage-Monitor-0.9.8-Setup.exe from the [v0.9.8 release](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.8).
 2. Start the app and wait for the first local scan. A large history may take tens of seconds.
 3. Open Local Activity for usage, Model Pricing for rates and Cost for estimates.
 4. Enable local-only mode in Settings if you do not need account synchronization.
@@ -28,18 +30,18 @@ The current release is **v0.9.7**. [Download](https://github.com/tukitohosi/ai-t
 
 ## Data and limitations
 
-- Local statistics cover readable records on this computer, not the complete history of other devices or cloud tasks.
+- Local statistics include previously recorded history and readable records on this computer, not the complete history of other devices or cloud tasks.
 - Codex account limits require a network connection. Limit percentages cannot be converted into a fixed token balance.
 - Costs use your own prices and are estimates, not provider bills. USD and CNY totals stay separate.
 - Cursor does not yet have a connected usage source.
 - Built-in mainland China holiday dates cover 2024–2026; use special dates for other years.
-- The app does not read Codex auth.json or store access tokens, prompts, responses or tool output. Exports contain summaries rather than conversations, full paths or session identifiers.
+- The statistics database does not store access tokens, prompts, responses or tool output. Exports contain summaries rather than credentials, conversations, full paths or session identifiers.
 
-Settings and derived indexes stay in the current Windows user's application-data directory. Index maintenance backs up its own index and does not rewrite source records.
+Settings and derived indexes stay in the current Windows user's application-data directory. Index upgrades and maintenance back up their own indexes. Rebuilding preserves recorded history and does not rewrite source records.
 
 ## Run from source
 
-Requires Node.js 22 or newer, Rust and a Windows build environment.
+Requires Node.js 22.15 or newer, Rust and a Windows build environment.
 
 ~~~powershell
 npm install

@@ -1,4 +1,8 @@
 import { createReadStream } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { createZstdDecompress } from "node:zlib";
+import { readZstdFrameChunks } from "./zstd-frame.js";
 
 export interface CompleteLine {
   line: number;
@@ -71,6 +75,17 @@ export async function readCompleteFileLines(
   onLine: (line: CompleteLine) => void | Promise<void>,
   maxLineCharacters?: number,
 ): Promise<CompleteLineReadResult> {
-  const stream = createReadStream(filePath);
-  return readCompleteLines(stream, onLine, maxLineCharacters);
+  if (!filePath.endsWith(".jsonl.zst")) {
+    return readCompleteLines(createReadStream(filePath), onLine, maxLineCharacters);
+  }
+  const decompressed = createZstdDecompress();
+  const reading = readCompleteLines(decompressed, onLine, maxLineCharacters);
+  // Node can ignore later frames that arrive in the same write. Keep frame
+  // boundaries in separate writes and discard skippable metadata frames.
+  // The framing reader also rejects truncated input before success is returned.
+  const [, result] = await Promise.all([
+    pipeline(Readable.from(readZstdFrameChunks(filePath)), decompressed),
+    reading,
+  ]);
+  return result;
 }

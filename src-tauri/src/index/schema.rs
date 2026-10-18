@@ -4,7 +4,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::error::{IndexError, IndexResult};
 
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 pub(crate) const PARSER_SEMANTICS_VERSION: i64 = 2;
 // ASCII "CUXI" (Codex Usage indeX Index).
 pub(crate) const APPLICATION_ID: i64 = 0x4355_5849;
@@ -52,27 +52,38 @@ pub(crate) fn migrate(connection: &mut Connection) -> IndexResult<()> {
         transaction.pragma_update(None, "user_version", 1_i64)?;
     }
     if current_version <= 1 {
-        // v2 adds cache-data availability. Rebuild only this app's derived
-        // index because old rows cannot tell a zero cache counter from a
-        // missing one. Original rollout JSONL files are read-only.
+        // A missing original log must never erase historical usage. Old rows
+        // keep their token values; cache availability remains unknown until a
+        // successful reread can enrich them.
         transaction.execute_batch(
             "ALTER TABLE usage_events ADD COLUMN cache_metrics_available INTEGER NOT NULL DEFAULT 0 CHECK(cache_metrics_available IN (0, 1));
-             DELETE FROM usage_events;
-             DELETE FROM file_warning_counts;
-             DELETE FROM rollout_parser_state;
-             DELETE FROM rollout_files;
-             DELETE FROM models;
-             DELETE FROM projects;",
+             UPDATE rollout_files SET parser_version = 0;",
         )?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at_ms)
-             VALUES (2, 'cache availability and safe derived rebuild', 'v2', unixepoch('subsec') * 1000)",
+             VALUES (2, 'cache availability without historical data loss', 'v2-preserving', unixepoch('subsec') * 1000)",
             [],
         )?;
         transaction.execute(
             "INSERT INTO app_meta(key, value) VALUES ('parser_semantics_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [PARSER_SEMANTICS_VERSION.to_string()],
+        )?;
+    }
+    if current_version <= 2 {
+        transaction.execute_batch(
+            "ALTER TABLE rollout_files ADD COLUMN source_stamp TEXT;
+             CREATE TABLE session_snapshots (
+               rollout_key_hash BLOB PRIMARY KEY CHECK(length(rollout_key_hash) = 32),
+               file_id INTEGER UNIQUE REFERENCES rollout_files(id)
+             ) WITHOUT ROWID;
+             INSERT INTO session_snapshots(rollout_key_hash, file_id)
+             SELECT DISTINCT rollout_key_hash, NULL FROM rollout_files;",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, checksum, applied_at_ms)
+             VALUES (3, 'permanent session history and compressed sources', 'v3', unixepoch('subsec') * 1000)",
+            [],
         )?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }

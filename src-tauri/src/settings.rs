@@ -1153,7 +1153,7 @@ mod tests {
         {
             let connection = open(&path).unwrap();
             write_setting(&connection, PRICING_SETTINGS_KEY, &legacy).unwrap();
-            let rules = serde_json::json!({"version":1,"rules":[{"id":"group","displayName":"项目组","members":[{"sourceId":"codex","sourceLabel":"Codex","projectKey":"a","projectLabel":"a"},{"sourceId":"opencode","sourceLabel":"OpenCode","projectKey":"b","projectLabel":"b"}]}]}).to_string();
+            let rules = serde_json::json!({"version":1,"rules":[{"id":"group","displayName":"项目组","members":[{"sourceId":"codex","sourceLabel":"Codex","projectKey":"a","projectLabel":"项目组"},{"sourceId":"opencode","sourceLabel":"OpenCode","projectKey":"b","projectLabel":"b"}]}]}).to_string();
             write_setting(&connection, PROJECT_MERGE_RULES_KEY, &rules).unwrap();
         }
         let before = fs::read(&path).unwrap();

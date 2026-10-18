@@ -344,10 +344,18 @@ impl UsageRuntime {
             .refresh_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let backup_created_at = self.backup_and_remove_index_databases()?;
+        let backup_created_at = self.backup_index_databases()?;
+        // Only invalidate scan stamps. Historical events remain available even
+        // when their source was archived, moved, or is temporarily unreadable.
+        IncrementalIndex::open(&self.codex_database_path)
+            .and_then(|mut index| index.invalidate_scan_state_for_rebuild())
+            .map_err(|_| ())?;
+        MultiSourceIndex::open(&self.multi_source_database_path)
+            .and_then(|mut index| index.invalidate_scan_state_for_rebuild())
+            .map_err(|_| ())?;
         on_progress(snapshot::RefreshProgress::new(
             "codex",
-            "备份完成，正在重建派生索引",
+            "一致性备份完成，正在保留历史并重新扫描来源",
             0,
         ));
         let snapshot = self.collect_locked(&mut on_progress);
@@ -375,7 +383,7 @@ impl UsageRuntime {
         let (overall_status, message) = if error_count > 0 {
             (
                 "error",
-                "检测到索引损坏或版本不匹配；可备份后重建派生索引。",
+                "检测到索引损坏或版本不匹配；请保留历史备份后修复，重建不会清空历史。",
             )
         } else if warning_count > 0 {
             ("warning", "部分索引尚未建立；完成一次刷新后会自动创建。")
@@ -392,7 +400,7 @@ impl UsageRuntime {
         }
     }
 
-    fn backup_and_remove_index_databases(&self) -> Result<Option<String>, ()> {
+    fn backup_index_databases(&self) -> Result<Option<String>, ()> {
         let database_paths = [&self.codex_database_path, &self.multi_source_database_path];
         if !database_paths
             .iter()
@@ -402,29 +410,25 @@ impl UsageRuntime {
         }
         let now = Utc::now();
         let created_at = now.to_rfc3339_opts(SecondsFormat::Secs, true);
-        let backup_directory = self.app_data_directory.join("index-backups").join(format!(
-            "{}-{:03}",
-            now.format("%Y%m%dT%H%M%SZ"),
-            now.timestamp_subsec_millis()
-        ));
-        fs::create_dir_all(&backup_directory).map_err(|_| ())?;
+        let backup_root = self.app_data_directory.join("index-backups");
+        fs::create_dir_all(&backup_root).map_err(|_| ())?;
+        let backup_directory = backup_root.join(now.format("%Y%m%dT%H%M%S%.9fZ").to_string());
+        fs::create_dir(&backup_directory).map_err(|_| ())?;
         for path in database_paths {
-            copy_database_family(path, &backup_directory)?;
+            backup_database_snapshot(path, &backup_directory)?;
         }
         let manifest = serde_json::json!({
             "createdAt": created_at,
-            "format": 1,
+            "format": 2,
+            "backupMethod": "sqlite-online-backup",
             "files": ["usage-index-v1.sqlite3", "usage-index-v2.sqlite3"],
-            "privacy": "Derived indexes only; no source logs are included."
+            "privacy": "Usage history indexes only; no source logs are included."
         });
         fs::write(
             backup_directory.join("manifest.json"),
             serde_json::to_vec_pretty(&manifest).map_err(|_| ())?,
         )
         .map_err(|_| ())?;
-        for path in database_paths {
-            remove_database_family(path)?;
-        }
         let _ = settings::record_index_backup(&self.settings_path, &created_at);
         Ok(Some(created_at))
     }
@@ -908,12 +912,19 @@ impl UsageRuntime {
         F: FnMut(usize, usize),
     {
         let mut index = IncrementalIndex::open(&self.codex_database_path).map_err(|_| ())?;
-        let scan = index
-            .scan_codex_home_with_progress(&self.codex_home, on_progress)
-            .map_err(|_| ())?;
-        let summary = index.aggregate().map_err(|_| ())?;
+        let scan = index.scan_codex_home_with_progress(&self.codex_home, on_progress);
+        let mut summary = index.aggregate().map_err(|_| ())?;
+        let new_events = match scan {
+            Ok(scan) => Some(scan.indexed_events_added),
+            Err(_) => {
+                summary.warnings.push(
+                    "本轮部分 Codex 日志未能完整读取，当前展示已成功记录的历史用量；稍后刷新将重试。".to_owned(),
+                );
+                None
+            }
+        };
         let events = index.local_events().map_err(|_| ())?;
-        Ok((summary, events, Some(scan.indexed_events_added)))
+        Ok((summary, events, new_events))
     }
 
     fn read_device_usage<F>(
@@ -1121,26 +1132,24 @@ fn database_family_exists(path: &Path) -> bool {
         .any(|suffix| family_member(path, suffix).exists())
 }
 
-fn copy_database_family(path: &Path, backup_directory: &Path) -> Result<(), ()> {
-    let file_name = path.file_name().ok_or(())?;
-    for suffix in ["", "-wal", "-shm"] {
-        let source = family_member(path, suffix);
-        if !source.exists() {
-            continue;
-        }
-        let mut target_name = file_name.to_os_string();
-        target_name.push(suffix);
-        fs::copy(&source, backup_directory.join(target_name)).map_err(|_| ())?;
+fn backup_database_snapshot(path: &Path, backup_directory: &Path) -> Result<(), ()> {
+    if !path.exists() {
+        // An orphaned WAL must not be silently treated as an empty database.
+        return if database_family_exists(path) {
+            Err(())
+        } else {
+            Ok(())
+        };
     }
-    Ok(())
-}
-
-fn remove_database_family(path: &Path) -> Result<(), ()> {
-    for suffix in ["", "-wal", "-shm"] {
-        let member = family_member(path, suffix);
-        if member.exists() {
-            fs::remove_file(member).map_err(|_| ())?;
-        }
+    let file_name = path.file_name().ok_or(())?;
+    let target = backup_directory.join(file_name);
+    let source = open_read_only(path).map_err(|_| ())?;
+    source
+        .backup(rusqlite::DatabaseName::Main, &target, None)
+        .map_err(|_| ())?;
+    let backup = open_read_only(&target).map_err(|_| ())?;
+    if !quick_check_ok(&backup) {
+        return Err(());
     }
     Ok(())
 }
@@ -1392,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_backup_contains_only_derived_indexes_before_removal() {
+    fn maintenance_backup_contains_history_indexes_without_removing_originals() {
         let temporary = tempfile::tempdir().expect("temp dir");
         let codex_home = temporary.path().join("codex");
         let source_log = codex_home.join("sessions").join("source.jsonl");
@@ -1409,11 +1418,11 @@ mod tests {
             .expect("create multi-source index");
 
         let created_at = runtime
-            .backup_and_remove_index_databases()
+            .backup_index_databases()
             .expect("backup succeeds")
             .expect("backup timestamp");
-        assert!(!runtime.codex_database_path.exists());
-        assert!(!runtime.multi_source_database_path.exists());
+        assert!(runtime.codex_database_path.exists());
+        assert!(runtime.multi_source_database_path.exists());
         assert_eq!(
             fs::read(&source_log).expect("source remains readable"),
             b"source-history-stays-read-only"
@@ -1433,6 +1442,247 @@ mod tests {
                 .expect("read backup timestamp")
                 .as_deref(),
             Some(created_at.as_str())
+        );
+    }
+
+    #[test]
+    fn maintenance_backup_includes_committed_wal_pages() {
+        let temporary = tempfile::tempdir().expect("temp dir");
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        fs::create_dir_all(&runtime.app_data_directory).unwrap();
+        let writer = Connection::open(&runtime.codex_database_path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE latest_history(tokens INTEGER NOT NULL);
+                 INSERT INTO latest_history VALUES(12345);",
+            )
+            .unwrap();
+        assert!(
+            family_member(&runtime.codex_database_path, "-wal")
+                .metadata()
+                .unwrap()
+                .len()
+                > 0
+        );
+        runtime.backup_index_databases().expect("consistent backup");
+        let backup = fs::read_dir(runtime.app_data_directory.join("index-backups"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("usage-index-v1.sqlite3");
+        let restored = open_read_only(&backup).unwrap();
+        let tokens: i64 = restored
+            .query_row("SELECT sum(tokens) FROM latest_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(tokens, 12345);
+        assert!(quick_check_ok(&restored));
+        assert_eq!(
+            writer
+                .query_row("SELECT sum(tokens) FROM latest_history", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            12345
+        );
+    }
+
+    fn indexed_runtime_fixture(temporary: &Path) -> (UsageRuntime, PathBuf) {
+        let codex_home = temporary.join("codex");
+        let source = codex_home
+            .join("sessions")
+            .join("rollout-2026-08-28T00-00-00-00000000-0000-4000-8000-000000000001.jsonl");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let lines = [
+            serde_json::json!({"timestamp":"2026-08-28T00:00:00Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000001","cwd":"C:\\fixture","source":"cli"}}),
+            serde_json::json!({"timestamp":"2026-08-28T00:00:00Z","type":"turn_context","payload":{"cwd":"C:\\fixture","model":"gpt-6-sol"}}),
+            serde_json::json!({"timestamp":"2026-08-28T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":5,"reasoning_output_tokens":0,"total_tokens":105}}}}),
+        ];
+        fs::write(
+            &source,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let runtime = UsageRuntime::new(temporary.join("data"), codex_home, temporary.join("home"));
+        let mut index = IncrementalIndex::open(&runtime.codex_database_path).unwrap();
+        index.scan_file(&source).unwrap();
+        assert_eq!(index.aggregate().unwrap().total.total_tokens, 105);
+        (runtime, source)
+    }
+
+    #[test]
+    fn rebuild_keeps_usage_when_original_source_is_missing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (runtime, source) = indexed_runtime_fixture(temporary.path());
+        fs::remove_file(&source).unwrap();
+        let rebuilt = runtime.rebuild_indexes_with_progress(|_| {}).unwrap();
+        assert!(rebuilt.backup_created_at.is_some());
+        let summary = rebuilt.snapshot.device_usage.unwrap();
+        let codex = summary
+            .sources
+            .iter()
+            .find(|source| source.id == "codex")
+            .unwrap();
+        assert_eq!(codex.total.total_tokens, 105);
+        assert_eq!(codex.indexed_events, 1);
+        assert_eq!(
+            IncrementalIndex::open(&runtime.codex_database_path)
+                .unwrap()
+                .aggregate()
+                .unwrap()
+                .total
+                .total_tokens,
+            105
+        );
+    }
+
+    #[test]
+    fn rebuild_keeps_multi_source_usage_without_source_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (runtime, _) = indexed_runtime_fixture(temporary.path());
+        MultiSourceIndex::open(&runtime.multi_source_database_path).unwrap();
+        let connection = Connection::open(&runtime.multi_source_database_path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO source_files(source, file_key, size_bytes, modified_at_ms, present)
+             VALUES('claude-code', zeroblob(32), 100, 1, 1);
+             INSERT INTO source_events(event_key, source, source_file_key, occurred_at_ms,
+               model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens,
+               output_tokens, reasoning_output_tokens, total_tokens)
+             VALUES(zeroblob(32), 'claude-code', zeroblob(32), 1787875200000,
+               'claude-sonnet-4', 'fixture', 40, 0, 0, 5, 0, 45);
+             INSERT INTO source_event_files(source, source_file_key, event_key)
+             VALUES('claude-code', zeroblob(32), zeroblob(32));",
+            )
+            .unwrap();
+        drop(connection);
+        let rebuilt = runtime.rebuild_indexes_with_progress(|_| {}).unwrap();
+        let summary = rebuilt.snapshot.device_usage.unwrap();
+        let claude = summary
+            .sources
+            .iter()
+            .find(|source| source.id == "claude-code")
+            .unwrap();
+        assert_eq!(claude.total.total_tokens, 45);
+        assert_eq!(claude.indexed_events, 1);
+        let connection = open_read_only(&runtime.multi_source_database_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT sum(total_tokens) FROM source_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            45
+        );
+    }
+
+    #[test]
+    fn scan_failure_keeps_codex_history_visible_with_a_warning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (runtime, source) = indexed_runtime_fixture(temporary.path());
+        fs::remove_file(&source).unwrap();
+        fs::remove_dir(source.parent().unwrap()).unwrap();
+        // A directory that has become a file reproduces a traversal failure
+        // without platform-specific permission changes.
+        fs::write(
+            runtime.codex_home.join("sessions"),
+            b"temporarily unavailable",
+        )
+        .unwrap();
+        let snapshot = runtime.collect();
+        let summary = snapshot.device_usage.unwrap();
+        let codex = summary
+            .sources
+            .iter()
+            .find(|source| source.id == "codex")
+            .unwrap();
+        assert_eq!(codex.total.total_tokens, 105);
+        assert_eq!(codex.new_events, None);
+        assert!(codex
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("未能完整读取")));
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("未能完整读取")));
+    }
+
+    #[test]
+    fn failed_backup_aborts_rebuild_without_changing_original_index() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (runtime, source) = indexed_runtime_fixture(temporary.path());
+        let source_before = fs::read(&source).unwrap();
+        let original = open_read_only(&runtime.codex_database_path).unwrap();
+        let parser_before: i64 = original
+            .query_row("SELECT parser_version FROM rollout_files", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        drop(original);
+        fs::write(
+            runtime.app_data_directory.join("index-backups"),
+            b"blocked destination",
+        )
+        .unwrap();
+        assert!(runtime.rebuild_indexes_with_progress(|_| {}).is_err());
+        let original = open_read_only(&runtime.codex_database_path).unwrap();
+        assert!(quick_check_ok(&original));
+        let parser_after: i64 = original
+            .query_row("SELECT parser_version FROM rollout_files", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let tokens_after: i64 = original
+            .query_row("SELECT sum(total_tokens) FROM usage_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(parser_after, parser_before);
+        assert_eq!(tokens_after, 105);
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert_eq!(
+            settings::read_last_index_backup_at(&runtime.settings_path).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn second_database_backup_failure_leaves_both_originals_untouched() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (runtime, source) = indexed_runtime_fixture(temporary.path());
+        let corrupt = b"unreadable second database";
+        fs::write(&runtime.multi_source_database_path, corrupt).unwrap();
+        assert!(runtime.rebuild_indexes_with_progress(|_| {}).is_err());
+        let original = open_read_only(&runtime.codex_database_path).unwrap();
+        let (tokens, parser): (i64, i64) = original
+            .query_row(
+                "SELECT sum(e.total_tokens), min(f.parser_version)
+                 FROM usage_events e JOIN rollout_files f ON f.id = e.file_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tokens, 105);
+        assert_eq!(parser, PARSER_SEMANTICS_VERSION);
+        assert!(source.is_file());
+        assert_eq!(
+            fs::read(&runtime.multi_source_database_path).unwrap(),
+            corrupt
+        );
+        assert_eq!(
+            settings::read_last_index_backup_at(&runtime.settings_path).unwrap(),
+            None
         );
     }
 

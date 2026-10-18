@@ -29,7 +29,6 @@ export function getRolloutSessionsDirectory(codexHome: string): string {
 }
 
 export async function listRolloutFiles(codexHome: string): Promise<string[]> {
-  const sessionsDirectory = getRolloutSessionsDirectory(codexHome);
   const files: string[] = [];
 
   async function visit(directory: string): Promise<void> {
@@ -49,19 +48,20 @@ export async function listRolloutFiles(codexHome: string): Promise<string[]> {
       } else if (
         entry.isFile() &&
         entry.name.startsWith("rollout-") &&
-        entry.name.endsWith(".jsonl")
+        (entry.name.endsWith(".jsonl") || entry.name.endsWith(".jsonl.zst"))
       ) {
         files.push(entryPath);
       }
     }
   }
 
-  await visit(sessionsDirectory);
+  await visit(getRolloutSessionsDirectory(codexHome));
+  await visit(path.join(codexHome, "archived_sessions"));
   return files.sort((left, right) => left.localeCompare(right));
 }
 
 export function rolloutKeyFromPath(filePath: string): string {
-  const baseName = path.basename(filePath, path.extname(filePath));
+  const baseName = path.basename(filePath).replace(/\.jsonl(?:\.zst)?$/i, "");
   const uuid = baseName.match(
     /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i,
   );

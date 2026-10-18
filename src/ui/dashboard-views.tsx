@@ -1611,12 +1611,13 @@ function SourceHealthGrid({
           const newEvents = detail?.newEvents ?? source.newEvents;
           const skipped = detail?.skippedRecords ?? source.skippedRecords;
           const lastIndexedAt = detail?.lastIndexedAt ?? source.lastIndexedAt;
+          const status = detail?.status ?? source.status;
           return (
             <article key={source.id} className="health-card">
               <header>
-                <span className={`source-dot source-dot--${source.status}`} />
+                <span className={`source-dot source-dot--${status}`} />
                 <strong>{source.label}</strong>
-                <small>{sourceStatusLabel(source.status)}</small>
+                <small>{sourceStatusLabel(status)}</small>
               </header>
               <dl>
                 <div>
@@ -1643,7 +1644,7 @@ function SourceHealthGrid({
                 </div>
               </dl>
               <p>
-                {source.message ??
+                {detail?.message ?? source.message ??
                   (lastIndexedAt
                     ? `最近成功：${formatDateTime(lastIndexedAt)}`
                     : "尚无成功索引记录。")}
@@ -2334,7 +2335,7 @@ export function SettingsView({
                 确认重建两套派生索引？
               </strong>
               <p>
-                应用会先备份 usage-index-v1/v2 及其 WAL/SHM，再删除旧派生索引并全量重扫。本机原始会话日志、设置库和费用价格表不会被修改。
+                应用会先创建包含已提交 WAL 数据的一致性备份，再保留已有用量历史并重新扫描普通、压缩及归档日志。来源暂时缺失或读取失败时会保留原记录。本机原始会话日志、设置库和费用价格表不会被修改。
               </p>
               <div className="inline-actions">
                 <button

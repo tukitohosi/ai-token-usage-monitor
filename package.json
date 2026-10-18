@@ -1,6 +1,6 @@
 {
   "name": "codex-usage-monitor",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "private": true,
   "type": "module",
   "description": "Local-first AI quota, token activity, and cost monitor for Windows.",
@@ -18,7 +18,7 @@
     "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.15"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

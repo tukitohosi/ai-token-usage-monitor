@@ -24,6 +24,8 @@ pub struct IncrementalIndex {
 #[derive(Debug)]
 struct FileRow {
     id: i64,
+    source_stamp: Option<String>,
+    parser_version: i64,
     creation_ms: Option<i64>,
     committed_offset: i64,
     committed_lines: i64,
@@ -32,6 +34,7 @@ struct FileRow {
     guard_offset: i64,
     guard_len: i64,
     guard_hash: Option<Vec<u8>>,
+    incomplete_tail: bool,
 }
 
 #[derive(Debug)]
@@ -70,7 +73,9 @@ impl IncrementalIndex {
         if let Some(parent) = database_path.as_ref().parent() {
             fs::create_dir_all(parent)?;
         }
+        let database_path = database_path.as_ref();
         let mut connection = Connection::open(database_path)?;
+        backup_before_migration(&connection, database_path)?;
         configure(&connection)?;
         migrate(&mut connection)?;
         Ok(Self { connection })
@@ -87,7 +92,7 @@ impl IncrementalIndex {
         Ok(Self { connection })
     }
 
-    /// Scans every rollout file under `<codex_home>/sessions`. Discovery must
+    /// Scans active and archived, plain and compressed rollout files. Discovery must
     /// finish successfully before unseen database rows are marked absent.
     pub fn scan_codex_home(&mut self, codex_home: impl AsRef<Path>) -> IndexResult<ScanSummary> {
         self.scan_codex_home_with_progress(codex_home, |_, _| {})
@@ -103,6 +108,7 @@ impl IncrementalIndex {
     {
         let mut files = Vec::new();
         discover_rollouts(&codex_home.as_ref().join("sessions"), &mut files)?;
+        discover_rollouts(&codex_home.as_ref().join("archived_sessions"), &mut files)?;
         files.sort();
         on_progress(0, files.len());
 
@@ -111,9 +117,25 @@ impl IncrementalIndex {
             ..ScanSummary::default()
         };
         let mut visible_keys = Vec::with_capacity(files.len());
+        let mut failed_compressed_files = 0_i64;
+        let mut failed_plain_files = 0_i64;
         for (index, path) in files.iter().enumerate() {
             visible_keys.push(path_key(path)?);
-            let report = self.scan_file(path)?;
+            let report = match self.scan_file(path) {
+                Ok(report) => report,
+                Err(error) if matches!(&error, IndexError::Io(_) | IndexError::InvalidState(_)) => {
+                    // A truncated frame may already have emitted valid JSONL.
+                    // scan_file commits nothing until the decoder reaches EOF.
+                    if is_compressed(path) {
+                        failed_compressed_files += 1;
+                    } else {
+                        failed_plain_files += 1;
+                    }
+                    on_progress(index + 1, files.len());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if report.complete_lines_added > 0 || report.reset {
                 summary.changed_files += 1;
             }
@@ -134,6 +156,16 @@ impl IncrementalIndex {
                 [key],
             )?;
         }
+        transaction.execute(
+            "INSERT INTO app_meta(key, value) VALUES ('compressed-read-failures', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [failed_compressed_files.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO app_meta(key, value) VALUES ('plain-read-failures', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [failed_plain_files.to_string()],
+        )?;
         transaction.commit()?;
         Ok(summary)
     }
@@ -147,15 +179,36 @@ impl IncrementalIndex {
             .map_err(|_| IndexError::InvalidState("rollout file exceeds SQLite integer range"))?;
         let creation_ms = metadata.created().ok().and_then(system_time_ms);
         let mtime_ms = metadata.modified().ok().and_then(system_time_ms);
+        let stamp = source_stamp(&metadata);
+        let compressed = is_compressed(path);
 
-        let mut file_row = self.ensure_file(
+        let file_row = self.ensure_file(
             &path_key,
             &rollout_key_hash,
             creation_ms,
             current_size,
             mtime_ms,
         )?;
-        let reset = self.requires_reset(path, &file_row, creation_ms, current_size)?;
+        let source_changed = file_row.source_stamp.as_ref() != Some(&stamp);
+        if compressed
+            && file_row.source_stamp.as_ref() == Some(&stamp)
+            && file_row.parser_version == PARSER_SEMANTICS_VERSION
+        {
+            self.connection.execute(
+                "UPDATE rollout_files SET present = 1 WHERE id = ?1",
+                [file_row.id],
+            )?;
+            return Ok(FileScanReport {
+                file_id: file_row.id,
+                complete_lines_added: 0,
+                indexed_events_added: 0,
+                committed_offset: 0,
+                incomplete_tail: file_row.incomplete_tail,
+                reset: false,
+            });
+        }
+        let reset =
+            compressed || self.requires_reset(path, &file_row, creation_ms, current_size)?;
         let mut state = if reset {
             initial_state()
         } else {
@@ -163,27 +216,71 @@ impl IncrementalIndex {
         };
         let start_offset = if reset { 0 } else { file_row.committed_offset };
         let start_lines = if reset { 0 } else { file_row.committed_lines };
-        let read = read_increment(
-            path,
-            start_offset,
-            start_lines,
-            &mut state,
-            &rollout_key_hash,
-        )?;
+        let read = if compressed {
+            let decoder = zstd::stream::read::Decoder::new(File::open(path)?)?;
+            read_stream(
+                BufReader::with_capacity(64 * 1024, decoder),
+                0,
+                0,
+                &mut state,
+                &rollout_key_hash,
+            )?
+        } else {
+            read_increment(
+                path,
+                start_offset,
+                start_lines,
+                &mut state,
+                &rollout_key_hash,
+            )?
+        };
 
         let final_metadata = fs::metadata(path)?;
         let final_size = i64::try_from(final_metadata.len())
             .map_err(|_| IndexError::InvalidState("rollout file exceeds SQLite integer range"))?;
         let final_creation_ms = final_metadata.created().ok().and_then(system_time_ms);
         let final_mtime_ms = final_metadata.modified().ok().and_then(system_time_ms);
-        let incomplete_tail = read.incomplete_tail || final_size > read.committed_offset;
-        let prefix_len = read.committed_offset.min(HASH_WINDOW_BYTES as i64);
+        if compressed && source_stamp(&final_metadata) != stamp {
+            return Err(IndexError::InvalidState(
+                "compressed source changed while reading",
+            ));
+        }
+        let incomplete_tail =
+            read.incomplete_tail || (!compressed && final_size > read.committed_offset);
+        let stored_offset = if compressed { 0 } else { read.committed_offset };
+        let prefix_len = stored_offset.min(HASH_WINDOW_BYTES as i64);
         let prefix_hash = hash_segment(path, 0, prefix_len)?;
-        let guard_len = read.committed_offset.min(HASH_WINDOW_BYTES as i64);
-        let guard_offset = read.committed_offset - guard_len;
+        let guard_len = stored_offset.min(HASH_WINDOW_BYTES as i64);
+        let guard_offset = stored_offset - guard_len;
         let guard_hash = hash_segment(path, guard_offset, guard_len)?;
 
         let transaction = self.connection.transaction()?;
+        // Any full read can replace the session snapshot, including a newly
+        // discovered copy. Protect known history across all paths/formats;
+        // normal active-file increments may still commit complete new lines.
+        let has_known_history = start_offset == 0
+            && (file_row.committed_lines > 0
+                || transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM usage_events e
+                   JOIN rollout_files f ON f.id = e.file_id
+                   WHERE f.rollout_key_hash = ?1)",
+                    [&rollout_key_hash],
+                    |row| row.get::<_, bool>(0),
+                )?);
+        if has_known_history
+            && (!read.state.first_record_seen
+                || incomplete_tail
+                || read.warnings.keys().any(|code| {
+                    matches!(
+                        *code,
+                        "invalid-json" | "invalid-session-meta" | "invalid-token-count"
+                    )
+                }))
+        {
+            return Err(IndexError::InvalidState(
+                "replacement source is incomplete or malformed",
+            ));
+        }
         if reset {
             transaction.execute("DELETE FROM usage_events WHERE file_id = ?1", [file_row.id])?;
             transaction.execute(
@@ -228,7 +325,8 @@ impl IncrementalIndex {
                incomplete_tail = ?14,
                present = 1,
                parser_version = ?15,
-               updated_at_ms = ?16
+               updated_at_ms = ?16,
+               source_stamp = ?17
              WHERE id = ?1",
             params![
                 file_row.id,
@@ -237,7 +335,7 @@ impl IncrementalIndex {
                 final_creation_ms,
                 final_size,
                 final_mtime_ms,
-                read.committed_offset,
+                stored_offset,
                 start_lines + read.complete_lines_added,
                 prefix_len,
                 prefix_hash,
@@ -247,19 +345,47 @@ impl IncrementalIndex {
                 i64::from(incomplete_tail),
                 PARSER_SEMANTICS_VERSION,
                 Utc::now().timestamp_millis(),
+                stamp,
             ],
+        )?;
+        // Keep one complete snapshot per session, including after its source
+        // vanishes. A newly found short copy cannot hide a longer history.
+        // Rereading the selected file can deliberately correct that history.
+        transaction.execute(
+            "INSERT INTO session_snapshots(rollout_key_hash, file_id) VALUES (?1, ?2)
+             ON CONFLICT(rollout_key_hash) DO UPDATE SET file_id = excluded.file_id
+             WHERE session_snapshots.file_id = excluded.file_id
+                OR (session_snapshots.file_id IS NULL AND ?5 AND (
+                     ?6 OR (SELECT committed_lines FROM rollout_files WHERE id = excluded.file_id)
+                       >= (SELECT max(committed_lines) FROM rollout_files WHERE rollout_key_hash = ?1)))
+                OR ?4
+                OR (SELECT committed_lines FROM rollout_files WHERE id = excluded.file_id)
+                   >= (SELECT committed_lines FROM rollout_files WHERE id = session_snapshots.file_id)
+                   AND ?3",
+            params![rollout_key_hash, file_row.id, i64::from(source_changed || (!reset && read.complete_lines_added > 0)),
+                i64::from(reset && file_row.committed_lines > 0
+                    && source_changed && file_row.parser_version == PARSER_SEMANTICS_VERSION),
+                i64::from(start_offset == 0 && !incomplete_tail),
+                i64::from(file_row.committed_lines > 0)],
         )?;
         transaction.commit()?;
 
-        file_row.committed_offset = read.committed_offset;
         Ok(FileScanReport {
             file_id: file_row.id,
             complete_lines_added: read.complete_lines_added,
             indexed_events_added: inserted_events,
-            committed_offset: read.committed_offset,
+            committed_offset: stored_offset,
             incomplete_tail,
             reset,
         })
+    }
+
+    /// Rebuild by rereading available sources. Historical events remain intact
+    /// until each replacement has been read successfully and committed.
+    pub(crate) fn invalidate_scan_state_for_rebuild(&mut self) -> IndexResult<()> {
+        self.connection
+            .execute("UPDATE rollout_files SET parser_version = 0", [])?;
+        Ok(())
     }
 
     pub fn aggregate(&self) -> IndexResult<LocalUsageSummary> {
@@ -300,15 +426,11 @@ impl IncrementalIndex {
             [],
             |row| row.get(0),
         )?;
-        let raw_events: i64 = self.connection.query_row(
-            "SELECT count(*) FROM usage_events e
-             JOIN rollout_files f ON f.id = e.file_id WHERE f.present = 1",
-            [],
-            |row| row.get(0),
-        )?;
+        let raw_events: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM usage_events", [], |row| row.get(0))?;
         let indexed_events: i64 = self.connection.query_row(
-            "SELECT count(DISTINCT e.logical_event_key) FROM usage_events e
-             JOIN rollout_files f ON f.id = e.file_id WHERE f.present = 1",
+            &format!("{CANONICAL_CTE} SELECT count(*) FROM canonical"),
             [],
             |row| row.get(0),
         )?;
@@ -317,7 +439,8 @@ impl IncrementalIndex {
                     coalesce(sum(s.filtered_parent_events), 0)
              FROM rollout_parser_state s
              JOIN rollout_files f ON f.id = s.file_id
-             WHERE f.present = 1",
+             JOIN session_snapshots snapshot ON snapshot.rollout_key_hash = f.rollout_key_hash
+             WHERE snapshot.file_id IS NULL OR snapshot.file_id = s.file_id",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -424,6 +547,9 @@ impl IncrementalIndex {
         creation_ms: Option<i64>,
         current_size: i64,
     ) -> IndexResult<bool> {
+        if file.parser_version != PARSER_SEMANTICS_VERSION {
+            return Ok(true);
+        }
         if current_size < file.committed_offset {
             return Ok(true);
         }
@@ -450,7 +576,8 @@ fn load_file_row(connection: &Connection, path_key: &[u8]) -> IndexResult<Option
     connection
         .query_row(
             "SELECT id, creation_ms, committed_offset, committed_lines,
-                    prefix_len, prefix_hash, guard_offset, guard_len, guard_hash
+                    prefix_len, prefix_hash, guard_offset, guard_len, guard_hash,
+                    source_stamp, parser_version, incomplete_tail
              FROM rollout_files WHERE path_key = ?1",
             [path_key],
             |row| {
@@ -464,6 +591,9 @@ fn load_file_row(connection: &Connection, path_key: &[u8]) -> IndexResult<Option
                     guard_offset: row.get(6)?,
                     guard_len: row.get(7)?,
                     guard_hash: row.get(8)?,
+                    source_stamp: row.get(9)?,
+                    parser_version: row.get(10)?,
+                    incomplete_tail: row.get::<_, i64>(11)? != 0,
                 })
             },
         )
@@ -712,7 +842,22 @@ fn read_increment(
 ) -> IndexResult<ReadResult> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start_offset as u64))?;
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    read_stream(
+        BufReader::with_capacity(64 * 1024, file),
+        start_offset,
+        start_lines,
+        state,
+        rollout_key_hash,
+    )
+}
+
+fn read_stream(
+    mut reader: impl BufRead,
+    start_offset: i64,
+    start_lines: i64,
+    state: &mut ParserState,
+    rollout_key_hash: &[u8],
+) -> IndexResult<ReadResult> {
     let mut line = Vec::new();
     let mut oversized = false;
     let mut scanned_offset = start_offset;
@@ -809,15 +954,19 @@ fn path_key(path: &Path) -> IndexResult<Vec<u8>> {
 }
 
 fn rollout_key_hash(path: &Path) -> IndexResult<Vec<u8>> {
-    let stem = path
-        .file_stem()
+    let name = path
+        .file_name()
         .and_then(|value| value.to_str())
         .ok_or(IndexError::InvalidPath)?;
-    let lower = stem.to_lowercase();
+    let lower_name = name.to_lowercase();
+    let lower = lower_name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| lower_name.strip_suffix(".jsonl"))
+        .unwrap_or(&lower_name);
     let key = lower
         .get(lower.len().saturating_sub(36)..)
         .filter(|candidate| is_uuid(candidate))
-        .unwrap_or(&lower);
+        .unwrap_or(lower);
     Ok(hash_bytes(key.as_bytes()).to_vec())
 }
 
@@ -839,6 +988,53 @@ fn system_time_ms(value: SystemTime) -> Option<i64> {
     i64::try_from(duration.as_millis()).ok()
 }
 
+fn is_compressed(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"))
+}
+
+fn source_stamp(metadata: &fs::Metadata) -> String {
+    let nanos = |time: std::io::Result<SystemTime>| {
+        time.ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+    };
+    format!(
+        "{}:{:?}:{:?}",
+        metadata.len(),
+        nanos(metadata.modified()),
+        nanos(metadata.created())
+    )
+}
+
+fn backup_before_migration(connection: &Connection, database_path: &Path) -> IndexResult<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let application_id: i64 =
+        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    if version <= 0
+        || version >= super::schema::SCHEMA_VERSION
+        || application_id != super::schema::APPLICATION_ID
+    {
+        return Ok(());
+    }
+    let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = parent.join("index-migration-backups");
+    fs::create_dir_all(&directory)?;
+    let filename = database_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(IndexError::InvalidPath)?;
+    let destination = directory.join(format!(
+        "{}-schema{version}-{filename}",
+        Utc::now().format("%Y%m%dT%H%M%S%.9fZ")
+    ));
+    // SQLite's backup API includes committed WAL pages and yields one
+    // consistent database. A failed backup aborts opening/migration.
+    connection.backup(rusqlite::DatabaseName::Main, destination, None)?;
+    Ok(())
+}
+
 fn discover_rollouts(directory: &Path, files: &mut Vec<PathBuf>) -> IndexResult<()> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -853,7 +1049,9 @@ fn discover_rollouts(directory: &Path, files: &mut Vec<PathBuf>) -> IndexResult<
         } else if file_type.is_file() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+            if name.starts_with("rollout-")
+                && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+            {
                 files.push(entry.path());
             }
         }
@@ -930,7 +1128,8 @@ WITH canonical AS (
   SELECT min(e.id) AS id
   FROM usage_events e
   JOIN rollout_files f ON f.id = e.file_id
-  WHERE f.present = 1
+  JOIN session_snapshots snapshot ON snapshot.rollout_key_hash = f.rollout_key_hash
+  WHERE snapshot.file_id IS NULL OR snapshot.file_id = e.file_id
   GROUP BY e.logical_event_key
 )
 "#;
@@ -1007,7 +1206,8 @@ fn query_warnings(
         "SELECT w.code, sum(w.count)
          FROM file_warning_counts w
          JOIN rollout_files f ON f.id = w.file_id
-         WHERE f.present = 1
+         JOIN session_snapshots snapshot ON snapshot.rollout_key_hash = f.rollout_key_hash
+         WHERE snapshot.file_id IS NULL OR snapshot.file_id = w.file_id
          GROUP BY w.code ORDER BY w.code",
     )?;
     let stored = statement
@@ -1018,19 +1218,65 @@ fn query_warnings(
     let unresolved_files: i64 = connection.query_row(
         "SELECT count(*) FROM rollout_parser_state s
          JOIN rollout_files f ON f.id = s.file_id
-         WHERE f.present = 1 AND s.is_subagent = 1 AND s.ownership_mode = 'unresolved'",
+         JOIN session_snapshots snapshot ON snapshot.rollout_key_hash = f.rollout_key_hash
+         WHERE (snapshot.file_id IS NULL OR snapshot.file_id = s.file_id)
+           AND s.is_subagent = 1 AND s.ownership_mode = 'unresolved'",
         [],
         |row| row.get(0),
     )?;
     let filtered_files: i64 = connection.query_row(
         "SELECT count(*) FROM rollout_parser_state s
          JOIN rollout_files f ON f.id = s.file_id
-         WHERE f.present = 1 AND s.filtered_parent_events > 0",
+         JOIN session_snapshots snapshot ON snapshot.rollout_key_hash = f.rollout_key_hash
+         WHERE (snapshot.file_id IS NULL OR snapshot.file_id = s.file_id)
+           AND s.filtered_parent_events > 0",
         [],
         |row| row.get(0),
     )?;
 
     let mut messages = Vec::new();
+    let missing_sources: i64 = connection.query_row(
+        "SELECT count(*) FROM session_snapshots snapshot
+         WHERE NOT EXISTS (SELECT 1 FROM rollout_files f
+           WHERE f.rollout_key_hash = snapshot.rollout_key_hash AND f.present = 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing_sources > 0 {
+        messages.push(format!(
+            "有 {missing_sources} 个会话的源日志当前不可用，已保留此前成功记录的历史用量。"
+        ));
+    }
+    let failed_compressed: Option<String> = connection
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'compressed-read-failures'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(count) = failed_compressed
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|count| *count > 0)
+    {
+        messages.push(format!(
+            "有 {count} 个压缩日志未能完整读取，已保留其此前成功记录的用量。"
+        ));
+    }
+    let failed_plain: Option<String> = connection
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'plain-read-failures'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(count) = failed_plain
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|count| *count > 0)
+    {
+        messages.push(format!(
+            "有 {count} 个日志暂时无法安全重读，已保留其此前成功记录的用量。"
+        ));
+    }
     if incomplete_files > 0 {
         messages.push(format!(
             "有 {incomplete_files} 个活动日志末行尚未写完，已延后到下次扫描。"
