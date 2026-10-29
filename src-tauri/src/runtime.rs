@@ -144,6 +144,42 @@ impl UsageRuntime {
         self.collect_with_progress(|_| {})
     }
 
+    pub(crate) fn emit_local_progress<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        progress: snapshot::RefreshProgress,
+    ) {
+        self.publish_local_progress(
+            progress,
+            |snapshot| { let _ = app.emit(SNAPSHOT_EVENT, snapshot); },
+            |progress| { let _ = app.emit(PROGRESS_EVENT, progress); },
+        );
+    }
+
+    fn publish_local_progress<S, P>(
+        &self,
+        progress: snapshot::RefreshProgress,
+        emit_snapshot: S,
+        emit_progress: P,
+    ) where
+        S: FnOnce(DashboardSnapshot),
+        P: FnOnce(snapshot::RefreshProgress),
+    {
+        if progress.phase == "complete" {
+            // collect_locked still holds refresh_gate here, so the next scan's
+            // progress cannot overtake this committed snapshot and completion.
+            let snapshot = self
+                .latest_snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if let Some(snapshot) = snapshot {
+                emit_snapshot(snapshot);
+            }
+        }
+        emit_progress(progress);
+    }
+
     pub(crate) fn collect_with_progress<F>(&self, mut on_progress: F) -> DashboardSnapshot
     where
         F: FnMut(snapshot::RefreshProgress),
@@ -257,7 +293,7 @@ impl UsageRuntime {
                 append_message(&mut snapshot, "本机 AI 用量索引暂不可用。");
             }
         }
-        let complete = snapshot::RefreshProgress::new("complete", "刷新完成", 6);
+        let complete = snapshot::RefreshProgress::new("complete", "本机统计已更新", 6);
         snapshot.index_diagnostics = Some(snapshot::IndexDiagnostics {
             total_duration_ms: elapsed_milliseconds(total_started),
             codex_duration_ms,
@@ -275,23 +311,40 @@ impl UsageRuntime {
             ],
         });
         snapshot.refresh_progress = Some(complete.clone());
-        snapshot.refresh_schedule = Some(self.reset_refresh_schedule());
-        on_progress(complete);
         let mut latest = self
             .latest_snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut account = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
-        account.invalidate_credentials(credential_fingerprint(&self.codex_home));
+        self.invalidate_account_cache_for_local_read(&mut account);
         if self.local_only.load(Ordering::Acquire) {
             account.mark_stale("localOnly");
         }
         account.apply(&mut snapshot);
+        snapshot.refresh_schedule = Some(self.reset_refresh_schedule());
         snapshot.revision = latest.as_ref().map_or(1, |s| s.revision + 1);
         self.store_cached_snapshot(&snapshot);
         *latest = Some(snapshot.clone());
         self.local_generation.fetch_add(1, Ordering::Release);
+        drop(account);
+        drop(latest);
+        on_progress(complete);
         snapshot
+    }
+
+    fn invalidate_account_cache_for_local_read(
+        &self,
+        account: &mut crate::account_sync::AccountCache,
+    ) {
+        // Keep transport state when clearing data that has no verifiable owner.
+        let fingerprint = credential_fingerprint(&self.codex_home);
+        let status = (account.sync.status == "syncing"
+            || (fingerprint.is_none() && account.credential_fingerprint.is_none()))
+            .then(|| account.sync.status.clone());
+        account.invalidate_credentials(fingerprint);
+        if let Some(status) = status {
+            account.mark_stale(&status);
+        }
     }
 
     pub(crate) fn read_cached_dashboard_snapshot(&self) -> Option<serde_json::Value> {
@@ -300,7 +353,7 @@ impl UsageRuntime {
         let object = value.as_object_mut()?;
         // Legacy cache account data has no verifiable ownership/freshness.
         let mut account = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
-        account.invalidate_credentials(credential_fingerprint(&self.codex_home));
+        self.invalidate_account_cache_for_local_read(&mut account);
         let mut sanitized = DashboardSnapshot::empty("ready", Utc::now().to_rfc3339(), "");
         account.apply(&mut sanitized);
         let fields = serde_json::to_value(sanitized).ok()?;
@@ -777,19 +830,22 @@ impl UsageRuntime {
         if self.event_refresh_in_flight.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.emit_local_progress(
+            &app,
+            snapshot::RefreshProgress::new("codex", "正在读取本机与账号用量", 0),
+        );
         let pending_schedule = self.reset_refresh_schedule();
         let _ = app.emit(REFRESH_SCHEDULE_EVENT, pending_schedule);
         let runtime = self.clone();
         thread::spawn(move || {
+            runtime.request_account_refresh(app.clone());
             let progress_app = app.clone();
             let snapshot = runtime.collect_with_progress(|progress| {
-                let _ = progress_app.emit(PROGRESS_EVENT, progress);
+                runtime.emit_local_progress(&progress_app, progress);
             });
             if !runtime.shutdown.load(Ordering::Acquire) {
                 update_tray_tooltip(&app, &snapshot);
                 runtime.maybe_notify(&app, &snapshot);
-                let _ = app.emit(SNAPSHOT_EVENT, snapshot);
-                runtime.request_account_refresh(app.clone());
             }
             runtime
                 .event_refresh_in_flight
@@ -808,7 +864,7 @@ impl UsageRuntime {
         }
     }
 
-    pub(crate) fn publish_account<R: Runtime>(&self, app: &AppHandle<R>) {
+    fn cache_account_snapshot(&self) -> Option<DashboardSnapshot> {
         let mut latest = self
             .latest_snapshot
             .lock()
@@ -816,14 +872,21 @@ impl UsageRuntime {
         let account = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(snapshot) = latest.as_mut() {
             account.apply(snapshot);
+            snapshot.refresh_schedule = Some(self.refresh_schedule());
             snapshot.revision += 1;
             self.store_cached_snapshot(snapshot);
-            let _ = app.emit(SNAPSHOT_EVENT, snapshot.clone());
-            update_tray_tooltip(app, snapshot);
         }
         if let Ok(bytes) = serde_json::to_vec(&*account) {
             let _ = fs::create_dir_all(&self.app_data_directory);
             let _ = fs::write(self.app_data_directory.join("account-cache-v1.json"), bytes);
+        }
+        latest.clone()
+    }
+
+    pub(crate) fn publish_account<R: Runtime>(&self, app: &AppHandle<R>) {
+        if let Some(snapshot) = self.cache_account_snapshot() {
+            let _ = app.emit(SNAPSHOT_EVENT, &snapshot);
+            update_tray_tooltip(app, &snapshot);
         }
     }
 
@@ -872,6 +935,7 @@ impl UsageRuntime {
                         cache.invalidate_credentials(credential_fingerprint(&runtime.codex_home));
                     }
                 }
+                runtime.reset_refresh_schedule();
                 runtime.publish_account(&app);
                 let latest = runtime
                     .latest_snapshot
@@ -1226,6 +1290,167 @@ pub(crate) fn update_tray_tooltip<R: Runtime>(app: &AppHandle<R>, snapshot: &Das
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_progress_observes_the_committed_snapshot_without_account_or_snapshot_locks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        let pending = Arc::new(AtomicBool::new(false));
+        *runtime.account_task.lock().unwrap() = Some(pending.clone());
+        runtime.account_cache.lock().unwrap().mark_stale("syncing");
+        let mut completed_revision = None;
+        let snapshot = runtime.collect_with_progress(|progress| {
+            if progress.phase != "complete" {
+                return;
+            }
+            let latest = runtime.latest_snapshot.try_lock().expect("snapshot lock released");
+            let latest = latest.as_ref().expect("latest snapshot committed");
+            assert!(runtime.account_cache.try_lock().is_ok(), "account lock released");
+            assert_eq!(runtime.local_generation.load(Ordering::Acquire), 1);
+            let cached: serde_json::Value = serde_json::from_slice(
+                &fs::read(&runtime.snapshot_cache_path).expect("snapshot persisted"),
+            ).unwrap();
+            assert_eq!(cached["revision"], latest.revision);
+            assert_eq!(cached["refreshProgress"]["phase"], "complete");
+            let cached = runtime.read_cached_dashboard_snapshot().unwrap();
+            assert_eq!(cached["accountSync"]["status"], "syncing");
+            assert!(latest.device_usage.is_some());
+            completed_revision = Some(latest.revision);
+        });
+        assert_eq!(completed_revision, Some(snapshot.revision));
+        assert_eq!(snapshot.account_sync.unwrap().status, "syncing");
+        assert!(runtime.account_task.lock().unwrap().is_some());
+        assert!(!pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn the_next_local_scan_cannot_overtake_snapshot_and_completion_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut second_scan = None;
+        runtime.collect_with_progress(|progress| {
+            if progress.phase != "complete" {
+                return;
+            }
+            runtime.publish_local_progress(
+                progress,
+                |snapshot| {
+                    assert_eq!(snapshot.revision, 1);
+                    assert!(runtime.refresh_gate.try_lock().is_err());
+                    events.lock().unwrap().push("first snapshot");
+                    let runtime = runtime.clone();
+                    let events = events.clone();
+                    let (attempted, receive_attempt) = std::sync::mpsc::channel();
+                    second_scan = Some(thread::spawn(move || {
+                        attempted.send(()).unwrap();
+                        let mut started = false;
+                        runtime.collect_with_progress(|_| {
+                            if !started {
+                                events.lock().unwrap().push("second started");
+                                started = true;
+                            }
+                        })
+                    }));
+                    receive_attempt.recv_timeout(Duration::from_secs(5)).unwrap();
+                },
+                |progress| {
+                    assert_eq!(progress.phase, "complete");
+                    events.lock().unwrap().push("first complete");
+                },
+            );
+        });
+        assert_eq!(second_scan.unwrap().join().unwrap().revision, 2);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["first snapshot", "first complete", "second started"],
+        );
+    }
+
+    #[test]
+    fn a_local_scan_preserves_an_earlier_account_failure_without_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        for status in ["unauthenticated", "offline"] {
+            runtime.account_cache.lock().unwrap().mark_stale(status);
+            let snapshot = runtime.collect();
+            assert_eq!(snapshot.account_sync.unwrap().status, status);
+            let cached = runtime.read_cached_dashboard_snapshot().unwrap();
+            assert_eq!(cached["accountSync"]["status"], status);
+        }
+    }
+
+    #[test]
+    fn local_credential_validation_preserves_fresh_data_only_for_unchanged_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let codex_home = temporary.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), b"credential-a").unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            codex_home.clone(),
+            temporary.path().join("home"),
+        );
+        let mut account = runtime.account_cache.lock().unwrap();
+        account.sync.status = "ready".into();
+        account.sync.quota.stale = false;
+        account.sync.usage.stale = false;
+        runtime.invalidate_account_cache_for_local_read(&mut account);
+        assert_eq!(account.sync.status, "ready");
+        assert!(!account.sync.quota.stale && !account.sync.usage.stale);
+
+        fs::write(codex_home.join("auth.json"), b"credential-b").unwrap();
+        runtime.invalidate_account_cache_for_local_read(&mut account);
+        assert_eq!(account.sync.status, "idle");
+        account.mark_stale("syncing");
+        fs::write(codex_home.join("auth.json"), b"credential-c").unwrap();
+        runtime.invalidate_account_cache_for_local_read(&mut account);
+        assert_eq!(account.sync.status, "syncing");
+    }
+
+    #[test]
+    fn the_last_finishing_local_or_account_stage_supplies_the_published_refresh_schedule() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        // Account finishes first; the following local scan sets a fresh deadline.
+        runtime.reset_refresh_schedule();
+        assert!(runtime.cache_account_snapshot().is_none());
+        runtime.next_refresh_at_ms.store(1, Ordering::Release);
+        let before_local = epoch_milliseconds();
+        let local = runtime.collect();
+        let local_deadline = local.refresh_schedule.unwrap().next_refresh_at_ms.unwrap();
+        assert!(local_deadline >= before_local + 60_000);
+
+        // Account finishes last; its snapshot must carry that newer deadline.
+        runtime.next_refresh_at_ms.store(1, Ordering::Release);
+        let before_account = epoch_milliseconds();
+        let schedule = runtime.reset_refresh_schedule();
+        let account = runtime.cache_account_snapshot().unwrap();
+        assert_eq!(account.revision, local.revision + 1);
+        let account_deadline = account.refresh_schedule.unwrap().next_refresh_at_ms.unwrap();
+        assert_eq!(Some(account_deadline), schedule.next_refresh_at_ms);
+        assert!(account_deadline >= before_account + 60_000);
+        let cached: serde_json::Value = serde_json::from_slice(
+            &fs::read(&runtime.snapshot_cache_path).unwrap(),
+        ).unwrap();
+        assert_eq!(cached["refreshSchedule"]["nextRefreshAtMs"], account_deadline);
+    }
 
     #[test]
     fn local_scan_and_pricing_save_do_not_wait_for_account_task() {

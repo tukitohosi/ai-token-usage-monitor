@@ -1,6 +1,6 @@
 [package]
 name = "codex-usage-monitor"
-version = "0.9.8"
+version = "0.9.9"
 description = "Local-first AI token activity monitor for Windows."
 authors = ["L.Q"]
 license = ""

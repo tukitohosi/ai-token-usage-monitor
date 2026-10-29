@@ -4,7 +4,7 @@
 
 A Windows app for viewing AI token usage, model activity and estimated costs alongside Codex account limits. It reads local records from Codex, Claude Code, OpenCode, WorkBuddy and WorkBuddy AI.
 
-The current release is **v0.9.8**. [Download](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.8)
+The current release is **v0.9.9**. [Download](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.9)
 
 ## Features
 
@@ -12,7 +12,7 @@ The current release is **v0.9.8**. [Download](https://github.com/tukitohosi/ai-t
 - Read plain, Zstandard-compressed and archived Codex logs. Keep recorded history when source files move or disappear.
 - Merge Claude Code streaming usage snapshots by reply, including other models used through Claude Code, so each reply is counted once.
 - See daily trends and the past 24 hours of activity.
-- View Codex account limits and account daily activity separately from local records.
+- Refresh local usage and Codex account data in parallel. The refresh indicator ends after both return this cycle's result, so account cards do not briefly show stale values as refreshed. Local statistics remain available when account sync fails or the account is signed out.
 - Enter input, cache-read, cache-write and output prices for each model. Missing prices remain unpriced.
 - Model Pricing lists models by all-time local token usage across all sources, highest first. It checks the order after each refresh and when the app opens. Rows stay in place while you type, then reorder when focus leaves the field; refreshes preserve unsaved edits.
 - Set weekly peak-pricing windows, multipliers, city time zones and special dates for selected models.
@@ -22,7 +22,7 @@ The current release is **v0.9.8**. [Download](https://github.com/tukitohosi/ai-t
 
 ## Install and use
 
-1. Download AI-Token-Usage-Monitor-0.9.8-Setup.exe from the [v0.9.8 release](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.8).
+1. Download AI-Token-Usage-Monitor-0.9.9-Setup.exe from the [v0.9.9 release](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.9).
 2. Start the app and wait for the first local scan. A large history may take tens of seconds.
 3. Open Local Activity for usage, Model Pricing for rates and Cost for estimates.
 4. Enable local-only mode in Settings if you do not need account synchronization.

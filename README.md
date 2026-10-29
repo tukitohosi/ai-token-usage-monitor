@@ -4,7 +4,7 @@
 
 在 Windows 上查看 AI 工具的 Token 用量、模型分布和估算费用，同时查看 Codex 账号剩余额度。支持 Codex、Claude Code、OpenCode、WorkBuddy 和 WorkBuddy AI 的本机记录。
 
-当前发布版本为 **v0.9.8**。[下载安装包](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.8) · [使用指南](项目介绍与使用指南.md)
+当前发布版本为 **v0.9.9**。[下载安装包](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.9) · [使用指南](项目介绍与使用指南.md)
 
 ## 主要功能
 
@@ -12,7 +12,7 @@
 - 读取 Codex 普通、Zstandard 压缩与归档日志；已采集的历史不会因源文件移动或消失而自动减少。
 - Claude Code 按回复合并流式用量快照，避免同一回复重复累计；该规则也适用于通过 Claude Code 调用的其他模型。
 - 查看每日趋势和过去 24 小时活动，快速找到用量较高的模型与项目。
-- 单独显示 Codex 账号额度和账号每日活动；账号同步与本机统计各自运行。
+- 本机用量与 Codex 账号数据并行刷新；等两边都返回本轮结果后再结束刷新提示，避免额度卡片短暂显示旧数据。账号未登录或同步失败时，本机统计仍可用。
 - 自行填写模型价格，分别设置新输入、缓存读入、缓存写入和输出单价。没有价格的部分显示为“未定价”。
 - 模型定价按所有来源的累计 Token 用量从高到低排列，刷新和重新打开应用时自动核对。输入价格时保持行位置，离开输入框后更新顺序，未保存内容不会被刷新清空。
 - 为选定模型设置多个每周高峰时段、计费倍率、城市时区和特殊日期；可排除已收录的中国大陆节假日。
@@ -22,7 +22,7 @@
 
 ## 安装与使用
 
-1. 在 [v0.9.8 发布页](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.8) 下载 AI-Token-Usage-Monitor-0.9.8-Setup.exe 并安装。
+1. 在 [v0.9.9 发布页](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v0.9.9) 下载 AI-Token-Usage-Monitor-0.9.9-Setup.exe 并安装。
 2. 首次启动等待本机记录扫描完成；历史较多时可能需要几十秒。
 3. 在“本机活动”查看用量，在“模型定价”填写价格，在“费用”查看估算结果。
 4. 只需要本机统计时，在设置中开启“纯本地模式”。

@@ -43,14 +43,14 @@ async fn read_dashboard_snapshot(
 ) -> Result<snapshot::DashboardSnapshot, String> {
     let runtime = runtime.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if !local_only.unwrap_or(false) {
+            runtime.request_account_refresh(app.clone());
+        }
         let snapshot = runtime.collect_with_progress(|progress| {
-            let _ = app.emit(runtime::PROGRESS_EVENT, progress);
+            runtime.emit_local_progress(&app, progress);
         });
         runtime::update_tray_tooltip(&app, &snapshot);
         runtime.maybe_notify(&app, &snapshot);
-        if !local_only.unwrap_or(false) {
-            runtime.request_account_refresh(app);
-        }
         snapshot
     })
     .await
@@ -306,7 +306,7 @@ async fn rebuild_indexes(
         let progress_app = app.clone();
         let result = runtime
             .rebuild_indexes_with_progress(|progress| {
-                let _ = progress_app.emit(runtime::PROGRESS_EVENT, progress);
+                runtime.emit_local_progress(&progress_app, progress);
             })
             .map_err(|_| "无法完成索引重建；原始来源日志未被修改。如已创建维护备份，它会继续保留，可再次刷新或重建恢复派生索引。".to_owned())?;
         runtime::update_tray_tooltip(&app, &result.snapshot);

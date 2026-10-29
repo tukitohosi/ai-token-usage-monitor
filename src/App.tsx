@@ -182,7 +182,9 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
   const [savedPreferences, setSavedPreferences] = useState<AppPreferences>(DEFAULT_PREFERENCES);
   const [pendingView, setPendingView] = useState<AppView | null>(null);
   const [progress, setProgress] = useState<RefreshProgress | null>(null);
-  const [isRefreshing, setIsRefreshing] = useState(true);
+  const [isLocalRefreshing, setIsLocalRefreshing] = useState(true);
+  const [isRefreshRequested, setIsRefreshRequested] = useState(false);
+  const [snapshotPushFailed, setSnapshotPushFailed] = useState(false);
   const [statusOpen, setStatusOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
@@ -204,49 +206,73 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
   const [pricingMessage, setPricingMessage] = useState<string | null>(null);
   const [isSavingPricing, setIsSavingPricing] = useState(false);
   const requestSequence = useRef(0);
+  const latestSnapshot = useRef<DashboardSnapshot>(INITIAL_SNAPSHOT);
   const now = useClock();
   const systemTheme = useSystemTheme();
 
+  const applySnapshot = useCallback((next: DashboardSnapshot) => {
+    const current = latestSnapshot.current;
+    if (newerSnapshot(current, next) !== next) return false;
+    latestSnapshot.current = next;
+    setSnapshot(value => newerSnapshot(value, next));
+    // Account pushes reuse the local timestamp and must not finish a newer scan.
+    if (next.fetchedAt !== current.fetchedAt || !adapter.subscribeProgress) {
+      setProgress(next.refreshProgress ?? null);
+      if (!next.refreshProgress || next.refreshProgress.phase === "complete") {
+        setIsLocalRefreshing(false);
+      }
+    }
+    return true;
+  }, [adapter]);
+
   const refresh = useCallback(async () => {
     const requestId = ++requestSequence.current;
-    setIsRefreshing(true);
+    setIsRefreshRequested(true);
+    setIsLocalRefreshing(true);
     setProgress({ phase: "codex", label: "正在读取本机与账号用量", processedSources: 0, totalSources: 6, currentSource: "Codex", processedFiles: 0, totalFiles: 0 });
     try {
       const next = adapter.refresh ? await adapter.refresh() : await adapter.readSnapshot();
       if (requestSequence.current === requestId) {
-        setSnapshot(current => newerSnapshot(current, next));
-        setProgress(next.refreshProgress ?? { phase: "complete", label: "刷新完成", processedSources: 6, totalSources: 6, currentSource: null, processedFiles: 0, totalFiles: 0 });
+        applySnapshot(next);
       }
     } catch {
       if (requestSequence.current === requestId) {
         setSnapshot((current) => ({ ...current, status: "error", message: "无法更新真实用量数据，请稍后重试。" }));
+        setProgress(null);
+        setIsLocalRefreshing(false);
       }
     } finally {
-      if (requestSequence.current === requestId) setIsRefreshing(false);
+      if (requestSequence.current === requestId) {
+        setIsRefreshRequested(false);
+      }
     }
-  }, [adapter]);
+  }, [adapter, applySnapshot]);
 
   useEffect(() => {
     let disposed = false;
+    let pushFailed = false;
+    setSnapshotPushFailed(false);
     const stops: Array<() => void> = [];
     if (adapter.subscribe) {
       void adapter.subscribe((next) => {
         if (disposed) return;
-        setSnapshot(current => newerSnapshot(current, next));
-        // Account pushes reuse the current local result; local progress has its own channel.
-        if (!adapter.subscribeProgress) {
-          setProgress(next.refreshProgress ?? null);
-          setIsRefreshing(false);
-        }
+        applySnapshot(next);
       }).then((stop) => disposed ? stop() : stops.push(stop)).catch(() => {
-        if (!disposed) setSnapshot((current) => ({ ...current, message: "后台推送通道暂不可用，可继续手动刷新。" }));
+        pushFailed = true;
+        if (!disposed) {
+          setSnapshotPushFailed(true);
+          setIsLocalRefreshing(false);
+          setProgress(null);
+          setSnapshot((current) => ({ ...current, message: "后台更新通道中断，可继续手动刷新。" }));
+        }
       });
     }
     if (adapter.subscribeProgress) {
       void adapter.subscribeProgress((next) => {
-        if (!disposed) {
+        // Completion is committed with the full snapshot, never from progress alone.
+        if (!disposed && !pushFailed && next.phase !== "complete") {
           setProgress(next);
-          setIsRefreshing(next.phase !== "complete");
+          setIsLocalRefreshing(true);
         }
       }).then((stop) => disposed ? stop() : stops.push(stop)).catch(() => {
         // Progress events are optional; the completed snapshot remains authoritative.
@@ -263,7 +289,8 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
       if (adapter.readCachedSnapshot) {
         try {
           const cached = await adapter.readCachedSnapshot();
-          if (!disposed && cached) {
+          if (!disposed && cached && !latestSnapshot.current.revision) {
+            latestSnapshot.current = cached;
             setSnapshot(current => current.revision ? current : cached);
             setProgress(cached.refreshProgress ?? null);
           }
@@ -279,7 +306,7 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
       requestSequence.current += 1;
       stops.forEach((stop) => stop());
     };
-  }, [adapter, refresh]);
+  }, [adapter, applySnapshot, refresh]);
 
   useEffect(() => {
     if (!successToast) return;
@@ -397,13 +424,13 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
       if (!adapter.refreshLocal) throw new Error("当前环境不支持本机重算");
       const next = await adapter.refreshLocal();
       if (!next.deviceUsage || next.status === "error") throw new Error("本机汇总失败");
-      setSnapshot(current => newerSnapshot(current, next));
+      applySnapshot(next);
       setPricingMessage("价格已保存，并已按新规则重新汇总本机费用。");
     } catch {
       setPricingRecalculationFailed(true);
       setPricingMessage("价格已保存，费用重算失败。请重试费用重算。");
     }
-  }, [adapter]);
+  }, [adapter, applySnapshot]);
 
   const savePricingSettings = async () => {
     if (pricingSaveInFlight.current || !pricingEditor.draft || !adapter.setPricingSettings) return;
@@ -569,7 +596,7 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
     setSettingsMessage(null);
     try {
       const result = await adapter.rebuildIndexes();
-      setSnapshot(result.snapshot);
+      applySnapshot(result.snapshot);
       setProgress(result.snapshot.refreshProgress ?? null);
       setIndexMaintenance(result.report);
       setSettingsMessage(result.backupCreatedAt
@@ -580,9 +607,22 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
     } finally {
       setIsMaintainingIndexes(false);
     }
-  }, [adapter]);
+  }, [adapter, applySnapshot]);
 
   const stale = isSnapshotStale(snapshot.fetchedAt, now);
+  const isAccountRefreshing = snapshot.accountSync?.status === "syncing";
+  const isRefreshing = isRefreshRequested || (!snapshotPushFailed && (isLocalRefreshing || isAccountRefreshing));
+  const refreshProgress: RefreshProgress | null = snapshotPushFailed && !isRefreshRequested ? null : isAccountRefreshing && !isLocalRefreshing
+    ? { phase: "account", label: "正在更新账号用量", processedSources: 6, totalSources: 6, currentSource: null, processedFiles: 0, totalFiles: 0 }
+    : progress;
+  const accountStatusLabels: Partial<Record<NonNullable<DashboardSnapshot["accountSync"]>["status"], string>> = {
+    partial: "账号部分数据未更新",
+    offline: "账号连接失败",
+    error: "账号读取失败",
+    unauthenticated: "账号未登录",
+    unsupported: "账号接口不可用",
+  };
+  const accountIssue = snapshotPushFailed ? "后台更新通道中断" : snapshot.accountSync ? accountStatusLabels[snapshot.accountSync.status] : undefined;
   const effectiveTheme = preferences.themePreference === "system" ? systemTheme : preferences.themePreference;
   const developmentWallpaperUrl = readDevelopmentWallpaperUrl();
   const wallpaperUrl = preferences.backgroundAssetPath && isTauri()
@@ -665,18 +705,18 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
           </nav>
           <div className="topbar-actions">
             <div className="status-menu">
-              <button className={`status-chip status-chip--${stale && snapshot.status === "ready" ? "warning" : snapshot.status}`} type="button" aria-expanded={statusOpen} onClick={() => setStatusOpen((value) => !value)}><span className="status-chip__dot" />{stale && snapshot.status === "ready" ? "数据已过期" : snapshot.status === "ready" ? "数据已就绪" : snapshot.status === "loading" ? "正在同步" : snapshot.status === "offline" ? "离线" : snapshot.status === "unauthenticated" ? "未登录" : snapshot.status === "unsupported" ? "版本不支持" : "读取失败"}</button>
-              {statusOpen && <StatusPopover snapshot={snapshot} progress={progress} now={now} onClose={() => setStatusOpen(false)} />}
+              <button className={`status-chip status-chip--${isRefreshing ? "loading" : (stale || accountIssue) && snapshot.status === "ready" ? "warning" : snapshot.status}`} type="button" aria-expanded={statusOpen} onClick={() => setStatusOpen((value) => !value)}><span className="status-chip__dot" />{isRefreshing ? "正在同步" : stale && snapshot.status === "ready" ? "数据已过期" : snapshot.status === "ready" ? accountIssue ?? "数据已就绪" : snapshot.status === "loading" ? "正在同步" : snapshot.status === "offline" ? "离线" : snapshot.status === "unauthenticated" ? "未登录" : snapshot.status === "unsupported" ? "版本不支持" : "读取失败"}</button>
+              {statusOpen && <StatusPopover snapshot={snapshot} progress={refreshProgress} isRefreshing={isRefreshing} now={now} onClose={() => setStatusOpen(false)} />}
             </div>
             <span className="refresh-countdown" role="status" aria-live="polite">
-              本机：{formatRefreshCountdown(snapshot.refreshSchedule?.nextRefreshAtMs, isRefreshing, now)}
+              {snapshotPushFailed && !isRefreshRequested ? "后台更新通道中断" : isAccountRefreshing && !isLocalRefreshing ? "正在更新账号用量" : formatRefreshCountdown(snapshot.refreshSchedule?.nextRefreshAtMs, isRefreshing, now)}
             </span>
             <button className="refresh-button" type="button" onClick={() => void refresh()} disabled={isRefreshing} aria-label={isRefreshing ? "正在刷新数据" : "刷新数据"}><span className={isRefreshing ? "spin" : ""}><Icon name="refresh" /></span><span>{isRefreshing ? "同步中" : "刷新"}</span></button>
           </div>
         </div>
       </header>
       <main>
-        <StatusNotice snapshot={snapshot} stale={stale} progress={progress} onRefresh={() => void refresh()} onOpenSettings={() => requestViewChange("settings")} />
+        <StatusNotice snapshot={snapshot} stale={stale} progress={refreshProgress} onRefresh={() => void refresh()} onOpenSettings={() => requestViewChange("settings")} />
         {view === "overview" && <OverviewView snapshot={snapshot} now={now} onOpenDay={openDayDetail} onOpenActivity={() => requestViewChange("activity")} />}
         {view === "activity" && <ActivityView onOpenExport={() => setExportOpen(true)} usage={effectiveDeviceUsage} sourceHealth={snapshot.sourceHealth ?? []} range={range} onRangeChange={setRange} selectedSources={activitySources} selectionMode={activitySourceMode} onSelectionModeChange={(mode) => { setActivitySourceMode(mode); if (mode === "single") setActivitySources((current) => current.slice(-1)); }} onSourcesChange={(source) => setActivitySources((current) => toggleSourceSelection(current, source, activitySourceMode))} onClearSources={() => setActivitySources([])} summary={activityRange} insightSummary={insightRange} now={now} onOpenDay={openDayDetail} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} projectMergeRules={projectMergeRules} projectMergeMessage={projectMergeMessage} onSaveProjectMergeRules={saveProjectMergeRules} />}
         {view === "cost" && <CostView onOpenExport={() => setExportOpen(true)} usage={effectiveDeviceUsage} range={range} onRangeChange={setRange} selectedSources={costSources} selectionMode={costSourceMode} onSelectionModeChange={(mode) => { setCostSourceMode(mode); if (mode === "single") setCostSources((current) => current.slice(-1)); }} onSourcesChange={(source) => setCostSources((current) => toggleSourceSelection(current, source, costSourceMode))} onClearSources={() => setCostSources([])} summary={costRange} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} onOpenPricing={() => requestViewChange("pricing")} />}

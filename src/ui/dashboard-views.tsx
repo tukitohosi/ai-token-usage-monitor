@@ -205,11 +205,13 @@ export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 export function StatusPopover({
   snapshot,
   progress,
+  isRefreshing = false,
   now,
   onClose,
 }: {
   snapshot: DashboardSnapshot;
   progress: RefreshProgress | null;
+  isRefreshing?: boolean;
   now: number;
   onClose: () => void;
 }) {
@@ -225,7 +227,7 @@ export function StatusPopover({
       <dl>
         <div>
           <dt>当前状态</dt>
-          <dd>{statusLabel(snapshot.status)}</dd>
+          <dd>{isRefreshing ? "正在同步" : statusLabel(snapshot.status)}</dd>
         </div>
         <div>
           <dt>账号最近读取</dt>

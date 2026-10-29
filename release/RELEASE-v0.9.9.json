@@ -1,0 +1,13 @@
+{
+  "version": "0.9.9",
+  "productName": "AI Token 用量监控",
+  "appIdentifier": "com.lq.codexusagemonitor",
+  "architecture": "x64",
+  "installerBytes": 221250710,
+  "sourceBytes": 862594,
+  "build": "npm run desktop:build succeeded",
+  "createdAt": "2026-10-29T16:21:49.592Z",
+  "installerAsset": "AI-Token-Usage-Monitor-0.9.9-Setup.exe",
+  "sourceAsset": "AI-Token-Usage-Monitor-0.9.9-Source.zip",
+  "sourceFileCount": 110
+}
