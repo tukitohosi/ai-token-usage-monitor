@@ -160,10 +160,9 @@ pub(crate) fn estimate(
     occurred_at_ms: Option<i64>,
     settings: &PricingSettings,
 ) -> CostSummary {
-    let model = model_label.trim();
-    let Some(rule) = settings.models.iter().find(|rule| {
-        rule.model_id.eq_ignore_ascii_case(model) || rule.display_name.eq_ignore_ascii_case(model)
-    }) else {
+    let model = model_label.trim().to_lowercase();
+    let Some(rule) = settings.models.iter().find(|rule| rule.model_id.to_lowercase() == model)
+        .or_else(|| settings.models.iter().find(|rule| rule.display_name.to_lowercase() == model)) else {
         return CostSummary {
             unpriced_tokens: usage.total_tokens.max(0),
             ..CostSummary::default()
@@ -347,6 +346,20 @@ mod tests {
                 peak_enabled: false,
             }],
         }
+    }
+
+    #[test]
+    fn model_id_wins_over_another_rules_display_name_regardless_of_order() {
+        let mut configured = settings();
+        let mut other = configured.models[0].clone();
+        other.model_id = "other-model".into();
+        other.display_name = "manual-model".into();
+        other.input_per_million = Some(999.0);
+        configured.models.insert(0, other);
+        let cost = estimate("MANUAL-MODEL", small_usage(), None, &configured);
+        assert!((cost.usd - 0.0244).abs() < 0.000_001);
+        // Old display-name aliases remain usable after all IDs are checked.
+        assert!(estimate("Manual model", small_usage(), None, &configured).usd > 0.0);
     }
 
     #[test]

@@ -1669,6 +1669,9 @@ export function PricingView({
   isSaving,
   message,
   onSave,
+  onImport,
+  onExport,
+  transferBusy = false,
 }: {
   usage: DeviceUsageSummary | null;
   draft: PricingDraft;
@@ -1679,6 +1682,9 @@ export function PricingView({
   isSaving: boolean;
   message: string | null;
   onSave: () => Promise<void>;
+  onImport?: () => void;
+  onExport?: () => void;
+  transferBusy?: boolean;
 }) {
   const { models: usedModels, tokenTotals, onFocusCapture, onBlurCapture } = usePricingOrder(draft.models, usage);
   const updateModel = (modelId: string, patch: Partial<PricingDraft["models"][number]>) => {
@@ -1719,7 +1725,7 @@ export function PricingView({
         eyebrow="MANUAL API PRICING"
         title="模型定价"
         description="价格完全由你在本机维护；应用不再内置或自动回退到任何模型 API 价格。"
-        actions={<div className="pricing-actions"><span role="status">{dirty ? "有未保存修改" : "价格已保存"}</span><button className="secondary-button" type="button" disabled={!dirty || isSaving} onClick={onDiscard}>放弃修改</button><button className="primary-button" type="button" disabled={isSaving || !dirty} onClick={() => void onSave()}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>{onRecalculate && <button className="secondary-button" type="button" disabled={isSaving} onClick={onRecalculate}>重试费用重算</button>}</div>}
+        actions={<div className="pricing-actions"><span role="status">{dirty ? "有未保存修改" : "价格已保存"}</span>{onImport && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onImport}>导入 JSON</button>}{onExport && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onExport} title="导出已保存的整套配置，未保存修改不会包含在文件中">导出 JSON</button>}<button className="secondary-button" type="button" disabled={!dirty || isSaving || transferBusy} onClick={onDiscard}>放弃修改</button><button className="primary-button" type="button" disabled={isSaving || transferBusy || !dirty} onClick={() => void onSave()}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>{onRecalculate && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onRecalculate}>重试费用重算</button>}</div>}
       />
       <article className="content-card peak-pricing-card">
         <header><div><p className="eyebrow">PEAK PRICING</p><h2>高峰期定价</h2><p>按指定时区、星期和时段计算；只有加入下方白名单的模型才会使用高峰倍率。</p></div><span className="soft-pill">跨午夜时段也支持</span></header>
@@ -1976,6 +1982,7 @@ export function SettingsView({
   isMaintainingIndexes,
   hasUnsavedChanges,
   message,
+  petSettings,
 }: {
   snapshot: DashboardSnapshot;
   preferences: AppPreferences;
@@ -1993,6 +2000,7 @@ export function SettingsView({
   isMaintainingIndexes: boolean;
   hasUnsavedChanges: boolean;
   message: string | null;
+  petSettings?: ReactNode;
 }) {
   const update = <K extends keyof AppPreferences>(
     key: K,
@@ -2197,6 +2205,7 @@ export function SettingsView({
             onChange={onUpdateRenewal}
           />
         </SettingsCard>
+        {petSettings}
         <SettingsCard
           title="索引可靠性"
           description="自检只读；重建只处理应用派生数据库，并在清理前创建可恢复备份。"

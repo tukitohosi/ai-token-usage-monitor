@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "AI Token 用量监控",
-  "version": "0.9.9",
+  "version": "0.10.0",
   "identifier": "com.lq.codexusagemonitor",
   "build": {
     "frontendDist": "../dist",
@@ -36,11 +36,13 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$APPDATA/backgrounds/**"
+          "$APPDATA/backgrounds/**",
+          "$APPDATA/pets/**"
         ]
       },
       "capabilities": [
-        "main-window"
+        "main-window",
+        "pet-window"
       ],
       "csp": {
         "default-src": "'self' customprotocol: asset:",

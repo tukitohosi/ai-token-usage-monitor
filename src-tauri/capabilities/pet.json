@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pet-window",
+  "description": "The local pet only listens for application data; file and window operations are managed by Rust.",
+  "windows": ["pet"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

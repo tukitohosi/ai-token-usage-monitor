@@ -3,6 +3,9 @@ mod app_server;
 pub mod index;
 mod multisource;
 mod pricing;
+mod pricing_transfer;
+mod pets;
+mod pet_window;
 mod runtime;
 mod settings;
 mod snapshot;
@@ -101,14 +104,17 @@ async fn read_visual_preferences(
 
 #[tauri::command(rename_all = "camelCase")]
 async fn set_theme_preference(
+    app: tauri::AppHandle,
     runtime: tauri::State<'_, runtime::UsageRuntime>,
     theme_preference: settings::ThemePreference,
 ) -> Result<settings::VisualPreferences, String> {
     let runtime = runtime.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.set_theme_preference(theme_preference))
+    let result = tauri::async_runtime::spawn_blocking(move || runtime.set_theme_preference(theme_preference))
         .await
         .map_err(|_| "后台视觉设置保存任务意外结束。".to_owned())?
-        .map_err(map_visual_settings_error)
+        .map_err(map_visual_settings_error)?;
+    let _ = app.emit("pet://app-theme", theme_preference);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -190,6 +196,7 @@ async fn set_app_preferences(
         _ => "无法保存本机应用设置。".to_owned(),
     })?;
     let _ = app.emit(runtime::REFRESH_SCHEDULE_EVENT, runtime.refresh_schedule());
+    let _ = app.emit("pet://app-theme", saved.theme_preference);
     runtime.publish_account(&app);
     if !saved.local_only {
         runtime.request_account_refresh(app);
@@ -356,15 +363,18 @@ pub fn run() {
                 .unwrap_or(app.path().home_dir()?.join(".codex"));
             let usage_runtime = runtime::UsageRuntime::new(
                 app.path().app_data_dir()?,
-                codex_home,
+                codex_home.clone(),
                 app.path().home_dir()?,
             );
             app.manage(usage_runtime.clone());
+            let pet_runtime = pets::PetRuntime::new(app.path().app_data_dir()?, codex_home, app.path().home_dir()?);
+            app.manage(pet_runtime.clone());
+            app.manage(pet_window::PetWindowRuntime::default());
 
             let initial_autostart = app.autolaunch().is_enabled().unwrap_or(false);
             let tray_runtime = usage_runtime.clone();
             let tray_handle =
-                tray::install(app, initial_autostart, move |app, action| match action {
+                tray::install(app, initial_autostart, pet_runtime.state().preferences.enabled, move |app, action| match action {
                     tray::TrayAction::RefreshRequested => {
                         tray_runtime.request_event_refresh(app.clone());
                     }
@@ -383,8 +393,34 @@ pub fn run() {
                         }
                     }
                     tray::TrayAction::ExitRequested => tray_runtime.stop(),
+                    tray::TrayAction::PetVisibilityChanged { enabled } => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let pets = app.state::<pets::PetRuntime>();
+                            let mut prefs = pets.state().preferences;
+                            prefs.enabled = enabled;
+                            if enabled && !pets.state().pets.iter().any(|pet|Some(&pet.id)==prefs.selected_pet_id.as_ref()) {
+                                tray::show_main_window(&app);
+                                let _ = app.emit("app://navigate", "settings");
+                            } else if let Ok(state) = pets.save_preferences(prefs) {
+                                if let Err(error) = pet_window::apply(&app, &state) {
+                                    log::warn!("Pet visibility update failed: {error}");
+                                    let mut rollback=state.preferences;rollback.enabled=false;
+                                    let _=pets.save_preferences(rollback);
+                                    tray::show_main_window(&app);
+                                }
+                            }
+                            pets.publish(&app);
+                        });
+                    }
                 })?;
             app.manage(tray_handle);
+            if let Err(error) = pet_window::apply(app.handle(), &pet_runtime.state()) {
+                log::warn!("Pet window startup failed: {error}");
+                let mut rollback=pet_runtime.state().preferences;rollback.enabled=false;
+                let _=pet_runtime.save_preferences(rollback);
+                pet_runtime.publish(app.handle());
+            }
             usage_runtime.start_scheduler(app.handle().clone());
 
             if std::env::args_os().any(|argument| argument == "--background") {
@@ -394,7 +430,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_window_event(tray::handle_window_event)
+        .on_window_event(|window, event| { pet_window::handle_window_event(window, event); tray::handle_window_event(window, event); })
         .invoke_handler(tauri::generate_handler![
             read_dashboard_snapshot,
             read_cached_dashboard_snapshot,
@@ -412,6 +448,21 @@ pub fn run() {
             set_project_merge_rules,
             read_pricing_settings,
             set_pricing_settings,
+            pricing_transfer::import_pricing_file,
+            pricing_transfer::export_pricing_file,
+            pets::read_pet_state,
+            pets::discover_codex_pets,
+            pets::read_pet_preview,
+            pets::import_codex_pet,
+            pets::select_pet_file,
+            pets::select_codex_pet_directory,
+            pets::set_pet_preferences,
+            pets::reset_pet_position,
+            pets::show_pet_dashboard,
+            pet_window::set_pet_layout,
+            pet_window::pet_drag_start,
+            pet_window::pet_drag_update,
+            pet_window::pet_drag_end,
             send_test_notification,
             read_index_maintenance_report,
             rebuild_indexes

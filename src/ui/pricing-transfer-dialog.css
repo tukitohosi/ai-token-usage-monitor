@@ -1,0 +1,20 @@
+.pricing-transfer-backdrop { position: fixed; z-index: 210; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(3,4,7,.66); backdrop-filter: blur(8px); }
+.pricing-transfer-dialog { width: min(560px,100%); max-height: calc(100dvh - 48px); overflow: auto; padding: 26px; border: 1px solid var(--border-strong); border-radius: 20px; background: var(--surface-strong); color: var(--text); box-shadow: 0 28px 100px rgba(0,0,0,.45); }
+.pricing-transfer-dialog header { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+.pricing-transfer-dialog .eyebrow { margin: 0 0 8px; color: var(--purple-bright); font-size: 11px; }
+.pricing-transfer-dialog h2 { margin: 0 0 14px; font-size: 25px; }
+.pricing-transfer-close { width: 36px; height: 36px; flex-shrink: 0; padding: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); color: var(--text); font-size: 24px; cursor: pointer; }
+#pricing-transfer-description, .pricing-transfer-hint, .pricing-transfer-meta { color: var(--text-soft); font-size: 13px; line-height: 1.7; }
+.pricing-transfer-stats { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; margin: 22px 0 12px; }
+.pricing-transfer-stats > div { display: grid; gap: 8px; padding: 15px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+.pricing-transfer-stats span { font-size: 12px; color: var(--text-soft); }
+.pricing-transfer-stats strong { font-size: 26px; font-variant-numeric: tabular-nums; }
+.pricing-transfer-stats small { font-size: 12px; font-weight: 400; color: var(--text-soft); }
+.pricing-transfer-meta { font-size: 11px; }
+.pricing-transfer-peak { display: flex; align-items: flex-start; gap: 10px; padding: 16px; margin-top: 22px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; }
+.pricing-transfer-peak input { accent-color: var(--purple); margin: 3px 0 0; }
+.pricing-transfer-peak span { display: grid; gap: 7px; font-size: 13px; }
+.pricing-transfer-peak small { color: var(--text-soft); font-size: 12px; line-height: 1.6; }
+.pricing-transfer-warning { padding: 12px; border: 1px solid color-mix(in srgb,var(--amber) 35%,transparent); border-radius: 10px; background: color-mix(in srgb,var(--amber) 7%,transparent); color: var(--amber); font-size: 12px; line-height: 1.7; }
+.pricing-transfer-dialog footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 24px; }
+@media(max-width:600px) { .pricing-transfer-backdrop { padding: 12px; } .pricing-transfer-dialog { padding: 20px; max-height: calc(100dvh - 24px); } .pricing-transfer-stats { gap: 7px; } }

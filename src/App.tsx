@@ -1,5 +1,9 @@
 import { parsePricingDraft, usePricingEditor } from "./ui/pricing-editor";
 import { UsageExportDialog } from "./ui/usage-export-dialog";
+import { PricingTransferDialog } from "./ui/pricing-transfer-dialog";
+import { mergePricingImport, type PricingTransferDocumentV1 } from "./core/pricing-transfer";
+import { exportSavedPricing, openPricingImport } from "./ui/pricing-transfer-api";
+import { PetSettings } from "./ui/pet-settings";
 import {
   useCallback,
   useEffect,
@@ -9,6 +13,7 @@ import {
   type CSSProperties,
 } from "react";
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import type {
   AppPreferences,
@@ -205,6 +210,9 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
   const pricingSaveInFlight = useRef(false);
   const [pricingMessage, setPricingMessage] = useState<string | null>(null);
   const [isSavingPricing, setIsSavingPricing] = useState(false);
+  const [pricingImport, setPricingImport] = useState<PricingTransferDocumentV1 | null>(null);
+  const [pricingTransferBusy, setPricingTransferBusy] = useState(false);
+  const pricingTransferInFlight = useRef(false);
   const requestSequence = useRef(0);
   const latestSnapshot = useRef<DashboardSnapshot>(INITIAL_SNAPSHOT);
   const now = useClock();
@@ -433,7 +441,7 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
   }, [adapter, applySnapshot]);
 
   const savePricingSettings = async () => {
-    if (pricingSaveInFlight.current || !pricingEditor.draft || !adapter.setPricingSettings) return;
+    if (pricingSaveInFlight.current || pricingTransferInFlight.current || pricingImport || !pricingEditor.draft || !adapter.setPricingSettings) return;
     let value: PricingSettings;
     try { value = parsePricingDraft(pricingEditor.draft); }
     catch (error) { setPricingMessage((error as Error).message); return; }
@@ -451,6 +459,40 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
     } finally {
       pricingSaveInFlight.current = false;
       setIsSavingPricing(false);
+    }
+  };
+
+  const importPricing = async () => {
+    if (pricingSaveInFlight.current || pricingTransferInFlight.current || pricingImport) return;
+    pricingTransferInFlight.current = true;
+    setPricingTransferBusy(true);
+    setPricingMessage(null);
+    try {
+      const document = await openPricingImport();
+      if (document) setPricingImport(document);
+    } catch (error) {
+      setPricingMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      pricingTransferInFlight.current = false;
+      setPricingTransferBusy(false);
+    }
+  };
+
+  const exportPricing = async () => {
+    if (pricingSaveInFlight.current || pricingTransferInFlight.current || pricingImport) return;
+    pricingTransferInFlight.current = true;
+    setPricingTransferBusy(true);
+    setPricingMessage(null);
+    try {
+      const result = await exportSavedPricing(pricingSettings);
+      if (result.status !== "cancelled") setPricingMessage(pricingEditor.dirty
+        ? "已导出已保存的模型定价；当前未保存修改未包含在文件中。"
+        : "已导出已保存的模型定价，包含高峰规则。");
+    } catch (error) {
+      setPricingMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      pricingTransferInFlight.current = false;
+      setPricingTransferBusy(false);
     }
   };
 
@@ -531,6 +573,16 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
     }
     setView(nextView);
   }, [hasUnsavedRuntimePreferences, view]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    void listen<string>("app://navigate", ({ payload }) => {
+      if (!disposed && VIEW_ITEMS.some(item => item.id === payload)) requestViewChange(payload as AppView);
+    }).then(unlisten => { if (disposed) unlisten(); else stop = unlisten; }).catch(() => {});
+    return () => { disposed = true; stop?.(); };
+  }, [requestViewChange]);
 
   useEffect(() => {
     if (!hasUnsavedRuntimePreferences) return;
@@ -720,10 +772,21 @@ export default function App({ adapter = dashboardAdapter }: AppProps) {
         {view === "overview" && <OverviewView snapshot={snapshot} now={now} onOpenDay={openDayDetail} onOpenActivity={() => requestViewChange("activity")} />}
         {view === "activity" && <ActivityView onOpenExport={() => setExportOpen(true)} usage={effectiveDeviceUsage} sourceHealth={snapshot.sourceHealth ?? []} range={range} onRangeChange={setRange} selectedSources={activitySources} selectionMode={activitySourceMode} onSelectionModeChange={(mode) => { setActivitySourceMode(mode); if (mode === "single") setActivitySources((current) => current.slice(-1)); }} onSourcesChange={(source) => setActivitySources((current) => toggleSourceSelection(current, source, activitySourceMode))} onClearSources={() => setActivitySources([])} summary={activityRange} insightSummary={insightRange} now={now} onOpenDay={openDayDetail} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} projectMergeRules={projectMergeRules} projectMergeMessage={projectMergeMessage} onSaveProjectMergeRules={saveProjectMergeRules} />}
         {view === "cost" && <CostView onOpenExport={() => setExportOpen(true)} usage={effectiveDeviceUsage} range={range} onRangeChange={setRange} selectedSources={costSources} selectionMode={costSourceMode} onSelectionModeChange={(mode) => { setCostSourceMode(mode); if (mode === "single") setCostSources((current) => current.slice(-1)); }} onSourcesChange={(source) => setCostSources((current) => toggleSourceSelection(current, source, costSourceMode))} onClearSources={() => setCostSources([])} summary={costRange} customStartDate={customStartDate} customEndDate={customEndDate} appliedCustomStartDate={appliedCustomStartDate} appliedCustomEndDate={appliedCustomEndDate} onCustomStartDateChange={setCustomStartDate} onCustomEndDateChange={setCustomEndDate} onApplyCustomRange={() => void applyCustomRange()} isLoadingCustomRange={isLoadingCustomRange} customRangeError={customRangeError} onOpenPricing={() => requestViewChange("pricing")} />}
-        {view === "pricing" && (pricingLoaded && pricingEditor.draft ? <PricingView usage={snapshot.deviceUsage ?? null} draft={pricingEditor.draft} setDraft={pricingEditor.update} dirty={pricingEditor.dirty} onDiscard={pricingEditor.reset} onRecalculate={pricingRecalculationFailed ? () => void recalculatePricing() : null} isSaving={isSavingPricing} message={pricingMessage} onSave={savePricingSettings} /> : <section className="content-card"><h1>模型定价</h1><p role="status">{pricingMessage ?? "正在读取已保存价格…"}</p></section>)}
-        {view === "settings" && <SettingsView snapshot={snapshot} preferences={preferences} indexMaintenance={indexMaintenance} onPreferencesChange={setPreferences} onSave={() => void savePreferences()} onTestNotification={() => void sendTestNotification()} onCheckIndexes={() => void checkIndexes()} onRebuildIndexes={() => void rebuildIndexes()} onThemeChange={(value) => void saveTheme(value)} onSelectWallpaper={() => void selectWallpaper()} onClearWallpaper={() => void clearWallpaper()} onUpdateRenewal={updatePlanRenewal} isSaving={isSavingSettings} isMaintainingIndexes={isMaintainingIndexes} hasUnsavedChanges={hasUnsavedRuntimePreferences} message={settingsMessage} />}
+        {view === "pricing" && (pricingLoaded && pricingEditor.draft ? <PricingView usage={snapshot.deviceUsage ?? null} draft={pricingEditor.draft} setDraft={pricingEditor.update} dirty={pricingEditor.dirty} onDiscard={pricingEditor.reset} onRecalculate={pricingRecalculationFailed ? () => void recalculatePricing() : null} isSaving={isSavingPricing} transferBusy={pricingTransferBusy || pricingImport !== null} onImport={() => void importPricing()} onExport={() => void exportPricing()} message={pricingMessage} onSave={savePricingSettings} /> : <section className="content-card"><h1>模型定价</h1><p role="status">{pricingMessage ?? "正在读取已保存价格…"}</p></section>)}
+        {view === "settings" && <SettingsView snapshot={snapshot} preferences={preferences} indexMaintenance={indexMaintenance} onPreferencesChange={setPreferences} onSave={() => void savePreferences()} onTestNotification={() => void sendTestNotification()} onCheckIndexes={() => void checkIndexes()} onRebuildIndexes={() => void rebuildIndexes()} onThemeChange={(value) => void saveTheme(value)} onSelectWallpaper={() => void selectWallpaper()} onClearWallpaper={() => void clearWallpaper()} onUpdateRenewal={updatePlanRenewal} isSaving={isSavingSettings} isMaintainingIndexes={isMaintainingIndexes} hasUnsavedChanges={hasUnsavedRuntimePreferences} message={settingsMessage} petSettings={<PetSettings appTheme={effectiveTheme} />} />}
       </main>
       {exportOpen && <UsageExportDialog adapter={adapter} isDemo={snapshot.message?.startsWith("演示模式") ?? false} onClose={() => setExportOpen(false)} />}
+      {pricingImport && pricingEditor.draft && <PricingTransferDialog document={pricingImport} draft={pricingEditor.draft} onClose={() => setPricingImport(null)} onConfirm={(includePeak) => {
+        try {
+          // Merge at confirmation time; unrelated in-progress decimal inputs remain untouched.
+          const merged = mergePricingImport(pricingEditor.draft!, pricingImport, includePeak);
+          pricingEditor.update(() => merged);
+          setPricingImport(null);
+          setPricingMessage("模型定价已导入编辑页；检查后点击“保存价格并重算”生效。");
+        } catch (error) {
+          setPricingMessage(error instanceof Error ? error.message : String(error));
+        }
+      }} />}
       {pendingView && (
         <div className="unsaved-dialog-backdrop" role="presentation">
           <section className="unsaved-dialog" role="alertdialog" aria-modal="true" aria-labelledby="unsaved-dialog-title">

@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { PetWindow } from "./ui/pet-window";
 import "./styles.css";
 
 const root = document.getElementById("root");
@@ -11,6 +12,6 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    {new URLSearchParams(window.location.search).get("window") === "pet" ? <PetWindow /> : <App />}
   </StrictMode>,
 );

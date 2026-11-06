@@ -617,6 +617,7 @@ function createMockUsageDayDetail(date: string): UsageDayDetail {
 }
 
 export class MockDashboardAdapter implements DashboardAdapter {
+  private snapshotRevision = 0;
   private manualPlanRenewalAt: string | null = null;
   private visualPreferences: VisualPreferences;
   private appPreferences: AppPreferences;
@@ -679,6 +680,7 @@ export class MockDashboardAdapter implements DashboardAdapter {
     const snapshot = createMockDashboardSnapshot(this.state);
     return {
       ...snapshot,
+      revision: ++this.snapshotRevision,
       accountSync: { status: this.appPreferences.localOnly ? "localOnly" : "ready", quota: { lastSuccessfulAt: snapshot.fetchedAt, stale: !!this.appPreferences.localOnly }, usage: { lastSuccessfulAt: snapshot.fetchedAt, stale: !!this.appPreferences.localOnly } },
       planRenewalAt: this.manualPlanRenewalAt,
       planRenewalSource: this.manualPlanRenewalAt === null ? null : "manual",

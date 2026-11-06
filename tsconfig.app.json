@@ -23,6 +23,8 @@
     "src/ui/**/*.ts",
     "src/core/types.ts",
     "src/core/usage-export.ts",
+    "src/core/pricing-transfer.ts",
+    "src/core/pet-types.ts",
     "src/vite-env.d.ts",
     "tests/**/*.test.tsx"
   ]

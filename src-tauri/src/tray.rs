@@ -14,6 +14,7 @@ pub const TRAY_ID: &str = "codex-usage-monitor";
 const MENU_SHOW: &str = "tray-show";
 const MENU_REFRESH: &str = "tray-refresh";
 const MENU_AUTOSTART: &str = "tray-autostart";
+const MENU_PET: &str = "tray-pet";
 const MENU_EXIT: &str = "tray-exit";
 
 /// Actions delegated to the application service layer by the tray menu.
@@ -25,6 +26,7 @@ const MENU_EXIT: &str = "tray-exit";
 pub enum TrayAction {
     RefreshRequested,
     AutostartChanged { enabled: bool },
+    PetVisibilityChanged { enabled: bool },
     ExitRequested,
 }
 
@@ -33,12 +35,14 @@ pub enum TrayAction {
 #[derive(Clone)]
 pub struct TrayMenuHandle<R: Runtime> {
     autostart_item: CheckMenuItem<R>,
+    pet_item: CheckMenuItem<R>,
 }
 
 impl<R: Runtime> TrayMenuHandle<R> {
     pub fn set_autostart_enabled(&self, enabled: bool) -> tauri::Result<()> {
         self.autostart_item.set_checked(enabled)
     }
+    pub fn set_pet_enabled(&self, enabled: bool) -> tauri::Result<()> { self.pet_item.set_checked(enabled) }
 }
 
 /// Builds the native tray and returns a handle suitable for `app.manage(...)`.
@@ -48,6 +52,7 @@ impl<R: Runtime> TrayMenuHandle<R> {
 pub fn install<R, F>(
     app: &App<R>,
     autostart_enabled: bool,
+    pet_enabled: bool,
     on_action: F,
 ) -> tauri::Result<TrayMenuHandle<R>>
 where
@@ -65,6 +70,7 @@ where
         None::<&str>,
     )?;
     let separator = PredefinedMenuItem::separator(app)?;
+    let pet_item = CheckMenuItem::with_id(app, MENU_PET, "显示桌面宠物", true, pet_enabled, None::<&str>)?;
     let exit_item = MenuItem::with_id(app, MENU_EXIT, "退出", true, None::<&str>)?;
 
     let menu = Menu::with_items(
@@ -73,6 +79,7 @@ where
             &show_item,
             &refresh_item,
             &autostart_item,
+            &pet_item,
             &separator,
             &exit_item,
         ],
@@ -81,6 +88,7 @@ where
     let action_handler = Arc::new(on_action);
     let menu_action_handler = Arc::clone(&action_handler);
     let menu_autostart_item = autostart_item.clone();
+    let menu_pet_item = pet_item.clone();
 
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("AI Token 用量监控")
@@ -96,6 +104,7 @@ where
                     menu_action_handler(app_handle, TrayAction::AutostartChanged { enabled });
                 }
             }
+            MENU_PET => { if let Ok(enabled)=menu_pet_item.is_checked(){ menu_action_handler(app_handle,TrayAction::PetVisibilityChanged{enabled}); } }
             MENU_EXIT => {
                 menu_action_handler(app_handle, TrayAction::ExitRequested);
                 app_handle.exit(0);
@@ -126,7 +135,7 @@ where
 
     tray_builder.build(app)?;
 
-    Ok(TrayMenuHandle { autostart_item })
+    Ok(TrayMenuHandle { autostart_item, pet_item })
 }
 
 /// Shows and focuses the single configured dashboard window.
@@ -154,7 +163,9 @@ pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) 
             api.prevent_close();
             let _ = window.hide();
         } else if let Some(runtime) = runtime {
+            api.prevent_close();
             runtime.stop();
+            window.app_handle().exit(0);
         }
     }
 }
