@@ -86,7 +86,7 @@ export function PetSettings({ appTheme, api = petApi }: { appTheme: "light" | "d
           <button type="button" className="secondary-button" disabled={disabled} onClick={() => void perform(async () => { const next = await api.selectFile(); if (next) { apply(next); setMessage("宠物已导入，可打开“显示宠物”。"); } })}>导入宠物文件</button>
           <button type="button" className="secondary-button" disabled={disabled || !selectedPet} onClick={() => void perform(async () => { apply(await api.resetPosition()); setMessage("宠物位置已重置。"); })}>重置位置</button>
         </div>
-        <p className="pet-settings__hint">可导入 pet.json、PNG 或 WebP 动画图集（v1 / v2）。资源保存在应用内，之后无需启动 Codex。</p>
+        <p className="pet-settings__hint">已内置狐仙地灵，也可导入 pet.json、PNG 或 WebP 动画图集（v1 / v2）。宠物可独立使用，无需启动 Codex。</p>
       </div>
     </div>
     {sources !== null && <section className="pet-settings__library" aria-label="本机 Codex 宠物库">

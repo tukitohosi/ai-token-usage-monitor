@@ -11,6 +11,10 @@ use tauri::{AppHandle, Emitter, Manager, Window};
 pub(crate) const STATE_EVENT: &str = "pet://state";
 const MAX_IMAGE: u64 = 20 * 1024 * 1024;
 const MAX_MANIFEST: u64 = 64 * 1024;
+const BUILTIN_NAME: &str = "狐仙地灵";
+const BUILTIN_DESCRIPTION: &str = "应用内置的白狐耳狐仙地灵，陪伴你查看 AI 用量。";
+const BUILTIN_SPRITESHEET: &[u8] =
+    include_bytes!("../resources/pets/foxian-diling/spritesheet.webp");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -199,10 +203,7 @@ fn validate_source(source: &Path) -> Result<ValidatedPet, String> {
     {
         return Err("宠物说明过长或含无效字符。".into());
     }
-    let mut hash = blake3::Hasher::new();
-    hash.update(&bytes);
-    hash.update(name.as_bytes());
-    let id = format!("pet-{}", &hash.finalize().to_hex()[..24]);
+    let id = pet_id(&bytes, &name);
     Ok(ValidatedPet {
         descriptor: PetDescriptor {
             id,
@@ -214,6 +215,13 @@ fn validate_source(source: &Path) -> Result<ValidatedPet, String> {
         bytes,
         extension,
     })
+}
+
+fn pet_id(bytes: &[u8], name: &str) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(bytes);
+    hash.update(name.as_bytes());
+    format!("pet-{}", &hash.finalize().to_hex()[..24])
 }
 
 fn validate_preferences(p: &PetPreferences) -> Result<(), String> {
@@ -265,21 +273,67 @@ impl PetRuntime {
             preference_gate: Arc::new(Mutex::new(())),
             import_gate: Arc::new(Mutex::new(())),
         };
+        let builtin = runtime
+            .ensure_builtin()
+            .map_err(|error| {
+                log::warn!("Built-in pet could not be restored: {error}");
+                error
+            })
+            .ok();
         let state = runtime.state();
-        if state.preferences.enabled
-            && !state
-                .pets
-                .iter()
-                .any(|p| Some(&p.id) == state.preferences.selected_pet_id.as_ref())
+        if !state
+            .pets
+            .iter()
+            .any(|p| Some(&p.id) == state.preferences.selected_pet_id.as_ref())
         {
-            runtime
+            let mut prefs = runtime
                 .preferences
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .enabled = false;
+                .unwrap_or_else(|p| p.into_inner());
+            prefs.enabled = false;
+            prefs.selected_pet_id = builtin.map(|pet| pet.id);
+            drop(prefs);
             let _ = runtime.persist();
         }
         runtime
+    }
+
+    fn ensure_builtin(&self) -> Result<PetDescriptor, String> {
+        let id = pet_id(BUILTIN_SPRITESHEET, BUILTIN_NAME);
+        let destination = self.directory.join(&id);
+        fs::create_dir_all(&destination).map_err(|_| "无法创建内置宠物目录。")?;
+        let image_path = destination.join("spritesheet.webp");
+        // Restore an absent or damaged bundled asset without depending on Codex.
+        // Reuse the import identity so an existing identical pet is not duplicated.
+        if read_bounded(&image_path, MAX_IMAGE).ok().as_deref() != Some(BUILTIN_SPRITESHEET) {
+            atomic_write(&image_path, BUILTIN_SPRITESHEET)?;
+        }
+        let mut descriptor = PetDescriptor {
+            id,
+            display_name: BUILTIN_NAME.into(),
+            description: BUILTIN_DESCRIPTION.into(),
+            sprite_version_number: 2,
+            spritesheet_path: image_path.to_string_lossy().into_owned(),
+        };
+        let manifest_path = destination.join("pet.json");
+        if let Some(existing) = read_bounded(&manifest_path, MAX_MANIFEST)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PetDescriptor>(&bytes).ok())
+            .filter(|pet| {
+                pet.id == descriptor.id
+                    && pet.display_name == BUILTIN_NAME
+                    && pet.sprite_version_number == 2
+                    && pet.description.chars().count() <= 2000
+                    && !pet.description.chars().any(|c| c.is_control() && c != '\n')
+            })
+        {
+            descriptor.description = existing.description;
+        }
+        let manifest = serde_json::to_vec_pretty(&descriptor).map_err(|_| "内置宠物信息无效。")?;
+        if read_bounded(&manifest_path, MAX_MANIFEST).ok().as_deref() != Some(manifest.as_slice()) {
+            atomic_write(&manifest_path, &manifest)?;
+        }
+        Ok(descriptor)
     }
 
     pub(crate) fn state(&self) -> PetState {
@@ -617,6 +671,83 @@ mod tests {
         image::RgbaImage::new(1536, height).save(path).unwrap();
     }
     #[test]
+    fn builtin_is_available_without_codex_and_restores_its_resources() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        let codex = temp.path().join("absent-codex");
+        let home = temp.path().join("absent-home");
+        let runtime = PetRuntime::new(app.clone(), codex.clone(), home.clone());
+        let state = runtime.state();
+        assert_eq!(state.pets.len(), 1);
+        let builtin = &state.pets[0];
+        println!("Built-in pet ID: {}", builtin.id);
+        assert_eq!(builtin.display_name, BUILTIN_NAME);
+        assert_eq!(builtin.sprite_version_number, 2);
+        assert_eq!(
+            state.preferences.selected_pet_id.as_ref(),
+            Some(&builtin.id)
+        );
+        assert!(!state.preferences.enabled);
+        let validated = validate_source(Path::new(&builtin.spritesheet_path)).unwrap();
+        assert_eq!(validated.bytes, BUILTIN_SPRITESHEET);
+        let dimensions = image::ImageReader::with_format(
+            std::io::Cursor::new(BUILTIN_SPRITESHEET),
+            image::ImageFormat::WebP,
+        )
+        .into_dimensions()
+        .unwrap();
+        assert_eq!(dimensions, (1536, 2288));
+
+        let mut preferences = state.preferences;
+        preferences.enabled = true;
+        preferences.position = Some(PetPosition { x: 85, y: 120 });
+        runtime.save_preferences(preferences.clone()).unwrap();
+        fs::write(&builtin.spritesheet_path, b"damaged").unwrap();
+        fs::remove_file(Path::new(&builtin.spritesheet_path).with_file_name("pet.json")).unwrap();
+        let restored = PetRuntime::new(app, codex, home).state();
+        assert_eq!(restored.preferences, preferences);
+        assert_eq!(restored.pets, state.pets);
+        assert_eq!(
+            fs::read(&restored.pets[0].spritesheet_path).unwrap(),
+            BUILTIN_SPRITESHEET
+        );
+    }
+
+    #[test]
+    fn builtin_reuses_import_identity_and_preserves_another_selected_pet() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        let codex = temp.path().join("codex");
+        let home = temp.path().join("home");
+        let runtime = PetRuntime::new(app.clone(), codex.clone(), home.clone());
+        let builtin = runtime.state().pets[0].clone();
+        let source_dir = temp.path().join("builtin-source");
+        fs::create_dir(&source_dir).unwrap();
+        fs::write(source_dir.join("spritesheet.webp"), BUILTIN_SPRITESHEET).unwrap();
+        let manifest = source_dir.join("pet.json");
+        fs::write(&manifest, r#"{"displayName":"狐仙地灵","spriteVersionNumber":2,"spritesheetPath":"spritesheet.webp"}"#).unwrap();
+        let imported = runtime.import(&manifest).unwrap();
+        assert_eq!(imported.pets.len(), 1);
+        assert_eq!(
+            imported.preferences.selected_pet_id.as_ref(),
+            Some(&builtin.id)
+        );
+
+        let source = temp.path().join("custom.png");
+        image(&source, 1872);
+        let imported = runtime.import(&source).unwrap();
+        assert_eq!(imported.pets.len(), 2);
+        let mut preferences = imported.preferences;
+        preferences.enabled = true;
+        preferences.size = 160;
+        preferences.theme = "dark".into();
+        runtime.save_preferences(preferences.clone()).unwrap();
+        let loaded = PetRuntime::new(app, codex, home).state();
+        assert_eq!(loaded.preferences, preferences);
+        assert_eq!(loaded.pets, imported.pets);
+    }
+
+    #[test]
     fn import_copies_and_survives_source_removal() {
         let temp = tempfile::tempdir().unwrap();
         let src = temp.path().join("source");
@@ -633,7 +764,7 @@ mod tests {
             temp.path().join("home"),
         );
         let state = runtime.import(&src.join("pet.json")).unwrap();
-        assert_eq!(state.pets.len(), 1);
+        assert_eq!(state.pets.len(), 2);
         assert!(!state.preferences.enabled);
         fs::remove_dir_all(&src).unwrap();
         assert!(Path::new(&runtime.state().pets[0].spritesheet_path).is_file());
@@ -700,7 +831,7 @@ mod tests {
         assert_eq!(before.preferences, after.preferences);
         assert_eq!(before.pets, after.pets);
         let duplicate = runtime.import(&source).unwrap();
-        assert_eq!(duplicate.pets.len(), 1);
+        assert_eq!(duplicate.pets.len(), 2);
     }
     #[test]
     #[ignore = "Optional local Codex fixtures; set AI_TOKEN_PET_FIXTURES to a pet library directory."]
@@ -720,7 +851,12 @@ mod tests {
             let state = runtime.import(Path::new(&source.source_path)).unwrap();
             assert!(state.pets.iter().any(|p| p.id == source.descriptor.id));
         }
-        assert_eq!(runtime.state().pets.len(), sources.len());
+        let expected_ids: std::collections::HashSet<_> = sources
+            .iter()
+            .map(|source| source.descriptor.id.clone())
+            .chain(std::iter::once(pet_id(BUILTIN_SPRITESHEET, BUILTIN_NAME)))
+            .collect();
+        assert_eq!(runtime.state().pets.len(), expected_ids.len());
         println!(
             "Imported and decoded {} local Codex pets into an isolated temporary library.",
             sources.len()

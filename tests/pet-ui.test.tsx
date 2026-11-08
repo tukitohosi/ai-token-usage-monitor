@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_PET_STATE, type PetState } from "../src/core/pet-types";
-import type { DashboardSnapshot } from "../src/core/types";
+import type { DashboardSnapshot, RefreshProgress, RefreshSchedule } from "../src/core/types";
 import type { DashboardAdapter } from "../src/ui/dashboard-adapter";
 import type { PetApi } from "../src/ui/pet-api";
 import { PetSettings } from "../src/ui/pet-settings";
@@ -98,6 +98,154 @@ describe("pet settings", () => {
 });
 
 describe("pet window subscription", () => {
+  function liveSnapshot(revision: number, accountStatus: "ready" | "syncing" | "offline" = "ready", localRevision = revision) {
+    const snapshot = createMockDashboardSnapshot("ready");
+    snapshot.revision = revision;
+    snapshot.fetchedAt = new Date(1_790_000_000_000 + localRevision * 1000).toISOString();
+    snapshot.refreshProgress = { phase: "complete", label: "本机统计已更新", processedSources: 6, totalSources: 6, currentSource: null, processedFiles: 0, totalFiles: 0 };
+    snapshot.accountSync = { status: accountStatus, quota: { stale: accountStatus !== "ready", lastSuccessfulAt: snapshot.fetchedAt }, usage: { stale: accountStatus !== "ready", lastSuccessfulAt: snapshot.fetchedAt } };
+    snapshot.refreshSchedule = { nextRefreshAtMs: Date.now() + 60_000, intervalSeconds: 60 };
+    return snapshot;
+  }
+
+  function liveAdapter(initial: DashboardSnapshot) {
+    const listeners: { snapshot?: (snapshot: DashboardSnapshot) => void; progress?: (progress: RefreshProgress) => void; schedule?: (schedule: RefreshSchedule) => void } = {};
+    const stops = [vi.fn(), vi.fn(), vi.fn()];
+    const adapter: DashboardAdapter = {
+      readSnapshot: vi.fn(), refresh: vi.fn(), refreshLocal: vi.fn(),
+      readCachedSnapshot: vi.fn().mockResolvedValue(initial),
+      subscribe: vi.fn().mockImplementation(async listener => { listeners.snapshot = listener; return stops[0]; }),
+      subscribeProgress: vi.fn().mockImplementation(async listener => { listeners.progress = listener; return stops[1]; }),
+      subscribeRefreshSchedule: vi.fn().mockImplementation(async listener => { listeners.schedule = listener; return stops[2]; }),
+    };
+    return { adapter, listeners, stops };
+  }
+
+  it("uses the real schedule and waits for the completed local and account values", async () => {
+    const { adapter, listeners, stops } = liveAdapter(liveSnapshot(1));
+    const result = render(<PetWindow api={makeApi()} adapter={adapter} />);
+    const label = await screen.findByLabelText("自动更新状态");
+    await waitFor(() => expect(label.textContent).toMatch(/约 \d+ 秒后自动更新/));
+    act(() => listeners.schedule?.({ nextRefreshAtMs: Date.now() + 25_000, intervalSeconds: 60 }));
+    expect(label.textContent).toMatch(/约 2[56] 秒后自动更新/);
+    act(() => {
+      listeners.progress?.({ phase: "codex", label: "正在读取", processedSources: 0, totalSources: 6, currentSource: "Codex", processedFiles: 0, totalFiles: 0 });
+      listeners.schedule?.({ nextRefreshAtMs: Date.now() + 60_000, intervalSeconds: 60 });
+      listeners.progress?.(liveSnapshot(2).refreshProgress!);
+    });
+    expect(label.textContent).toBe("正在更新");
+    act(() => listeners.snapshot?.(liveSnapshot(2, "syncing")));
+    expect(label.textContent).toBe("正在更新账号用量");
+    act(() => listeners.snapshot?.(liveSnapshot(3, "ready", 2)));
+    expect(label.textContent).toMatch(/约 \d+ 秒后自动更新/);
+    act(() => listeners.snapshot?.(liveSnapshot(2, "syncing")));
+    expect(label.textContent).toMatch(/约 \d+ 秒后自动更新/);
+    expect(adapter.readSnapshot).not.toHaveBeenCalled();
+    expect(adapter.refresh).not.toHaveBeenCalled();
+    expect(adapter.refreshLocal).not.toHaveBeenCalled();
+    result.unmount();
+    stops.forEach(stop => expect(stop).toHaveBeenCalledOnce());
+  });
+
+  it("counts down from the backend deadline without creating a refresh request", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-08T10:00:00Z"));
+    try {
+      const { adapter } = liveAdapter(liveSnapshot(1));
+      const result = render(<PetWindow api={makeApi()} adapter={adapter} />);
+      await act(async () => {});
+      const label = screen.getByLabelText("自动更新状态");
+      expect(label.textContent).toBe("约 60 秒后自动更新");
+      act(() => vi.advanceTimersByTime(1000));
+      expect(label.textContent).toBe("约 59 秒后自动更新");
+      act(() => vi.advanceTimersByTime(59_000));
+      expect(label.textContent).toBe("即将更新");
+      expect(adapter.refresh).not.toHaveBeenCalled();
+      result.unmount();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not let account-only pushes or completion events end the next local scan", async () => {
+    const { adapter, listeners } = liveAdapter(liveSnapshot(1));
+    render(<PetWindow api={makeApi()} adapter={adapter} />);
+    const label = await screen.findByLabelText("自动更新状态");
+    await waitFor(() => expect(label.textContent).toMatch(/约 \d+ 秒后自动更新/));
+    act(() => listeners.progress?.({ phase: "sources", label: "正在扫描", processedSources: 2, totalSources: 6, currentSource: null, processedFiles: 0, totalFiles: 0 }));
+    act(() => listeners.snapshot?.(liveSnapshot(2, "ready", 1)));
+    act(() => listeners.progress?.(liveSnapshot(2).refreshProgress!));
+    expect(label.textContent).toBe("正在更新");
+    act(() => listeners.snapshot?.(liveSnapshot(3, "offline")));
+    expect(label.textContent).toMatch(/约 \d+ 秒后自动更新/);
+    expect(screen.getByText(/旧额度/)).toBeTruthy();
+  });
+
+  it("does not let a delayed cached snapshot finish a newly started scan or replace its schedule", async () => {
+    const { adapter, listeners } = liveAdapter(liveSnapshot(1));
+    let cached!: (snapshot: DashboardSnapshot) => void;
+    vi.mocked(adapter.readCachedSnapshot!).mockImplementation(() => new Promise(resolve => { cached = resolve; }));
+    render(<PetWindow api={makeApi()} adapter={adapter} />);
+    await waitFor(() => expect(adapter.readCachedSnapshot).toHaveBeenCalledOnce());
+    act(() => {
+      listeners.progress?.({ phase: "codex", label: "正在扫描", processedSources: 0, totalSources: 6, currentSource: null, processedFiles: 0, totalFiles: 0 });
+      listeners.schedule?.({ nextRefreshAtMs: Date.now() + 10_000, intervalSeconds: 60 });
+    });
+    await act(async () => cached(liveSnapshot(1)));
+    expect(screen.getByLabelText("自动更新状态").textContent).toBe("正在更新");
+    act(() => listeners.snapshot?.(liveSnapshot(2)));
+    expect(screen.getByLabelText("自动更新状态").textContent).toMatch(/约 \d+ 秒后自动更新/);
+  });
+
+  it("shows an interrupted channel instead of a misleading countdown when subscription fails", async () => {
+    const { adapter, listeners } = liveAdapter(liveSnapshot(1));
+    vi.mocked(adapter.subscribe!).mockRejectedValue(new Error("订阅失败"));
+    render(<PetWindow api={makeApi()} adapter={adapter} />);
+    await screen.findByText("后台更新通道中断");
+    act(() => listeners.progress?.({ phase: "codex", label: "正在扫描", processedSources: 0, totalSources: 6, currentSource: null, processedFiles: 0, totalFiles: 0 }));
+    expect(screen.getByLabelText("自动更新状态").textContent).toBe("后台更新通道中断");
+    expect(adapter.readCachedSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it("uses waiting on hover and screen-coordinate direction during a captured drag", async () => {
+    const api = makeApi({ preferences: { ...DEFAULT_PET_STATE.preferences, enabled: true, selectedPetId: "fox" }, pets: [importedPet] });
+    const { adapter } = liveAdapter(liveSnapshot(1));
+    render(<PetWindow api={api} adapter={adapter} />);
+    const sprite = await screen.findByRole("img", { name: "狐仙" });
+    const handle = sprite.parentElement!;
+    handle.setPointerCapture = vi.fn(); handle.hasPointerCapture = () => true; handle.releasePointerCapture = vi.fn();
+    const pointer = (kind: string, screenX: number, screenY = 100) => {
+      const event = new MouseEvent(kind, { bubbles: true, button: 0, clientX: 140, clientY: 60, screenX, screenY });
+      Object.defineProperty(event, "pointerId", { value: 7 });
+      return event;
+    };
+    fireEvent.pointerEnter(handle);
+    expect(sprite.dataset.animation).toBe("waiting");
+    fireEvent(handle, pointer("pointerdown", 100));
+    fireEvent(handle, pointer("pointermove", 103));
+    expect(sprite.dataset.animation).toBe("waiting");
+    fireEvent(handle, pointer("pointermove", 104));
+    expect(sprite.dataset.animation).toBe("running-right");
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 125)); });
+    expect(sprite.dataset.frame).toBe("1");
+    fireEvent(handle, pointer("pointermove", 114));
+    expect(sprite.dataset.frame).toBe("1");
+    fireEvent(handle, pointer("pointermove", 114, 150));
+    expect(sprite.dataset.animation).toBe("running-right");
+    fireEvent(handle, pointer("pointermove", 110, 150));
+    expect(sprite.dataset.animation).toBe("running-left");
+    expect(sprite.dataset.frame).toBe("0");
+    fireEvent(handle, pointer("pointerup", 110, 150));
+    expect(sprite.dataset.animation).toBe("waiting");
+    await waitFor(() => expect(api.dragEnd).toHaveBeenCalledOnce());
+    for (const kind of ["pointercancel", "lostpointercapture"]) {
+      fireEvent(handle, pointer("pointerdown", 100));
+      fireEvent(handle, pointer("pointermove", 90));
+      expect(sprite.dataset.animation).toBe("running-left");
+      fireEvent(handle, pointer(kind, 90));
+      expect(sprite.dataset.animation).toBe("waiting");
+      await waitFor(() => expect(api.dragEnd).toHaveBeenCalledTimes(kind === "pointercancel" ? 2 : 3));
+    }
+  });
+
   it("retains the pointer-down origin when a quick drag ends before native startup responds", async () => {
     const api = makeApi({ preferences: { ...DEFAULT_PET_STATE.preferences, enabled: true, selectedPetId: "fox" }, pets: [importedPet] });
     let ready!: () => void;

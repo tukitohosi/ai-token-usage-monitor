@@ -51,7 +51,16 @@ pub(crate) fn read_existing_export_events(
         .map(|index| format!("?{}", index + 3))
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!("SELECT source, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens FROM source_events WHERE (?1 IS NULL OR (occurred_at_ms >= ?1 AND occurred_at_ms < ?2)) AND source IN ({placeholders})");
+    // Older v4 indexes remain readable before their first scan with the new reader.
+    let canonical_filter = if connection
+        .prepare("SELECT workbuddy_suppressed FROM source_events LIMIT 0")
+        .is_ok()
+    {
+        " AND workbuddy_suppressed = 0"
+    } else {
+        ""
+    };
+    let sql = format!("SELECT source, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens FROM source_events WHERE (?1 IS NULL OR (occurred_at_ms >= ?1 AND occurred_at_ms < ?2)) AND source IN ({placeholders}){canonical_filter}");
     let mut parameters = vec![
         range
             .map(|value| rusqlite::types::Value::Integer(value.0))
@@ -90,6 +99,7 @@ const SOURCE_OPENCODE: &str = "opencode";
 const SOURCE_WORKBUDDY: &str = "workbuddy";
 const SOURCE_WORKBUDDY_AI: &str = "workbuddy-ai";
 const SOURCE_CURSOR: &str = "cursor";
+const WORKBUDDY_PARSER_VERSION: &str = "2";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -633,10 +643,20 @@ impl MultiSourceIndex {
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS workbuddy_event_groups (
+              source TEXT NOT NULL,
+              event_key BLOB NOT NULL CHECK(length(event_key) = 32),
+              group_key BLOB NOT NULL CHECK(length(group_key) = 32),
+              is_summary INTEGER NOT NULL CHECK(is_summary IN (0, 1)),
+              PRIMARY KEY(source, event_key)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS workbuddy_event_groups_group ON workbuddy_event_groups(source, group_key);
             ",
         )?;
         ensure_source_event_columns(&connection)?;
         migrate_derived_source_index(&mut connection)?;
+        migrate_workbuddy_parser(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -839,24 +859,60 @@ impl MultiSourceIndex {
         F: FnMut(i64, i64),
     {
         let trace_root = root.join("traces");
-        if !trace_root.is_dir() {
+        let project_root = root.join("projects");
+        if !trace_root.is_dir() && !project_root.is_dir() {
             self.mark_source_absent(id);
             on_progress(0, 0);
-            return SourceState::not_detected(id, label, "未检测到本机 trace 用量目录。");
+            return SourceState::not_detected(id, label, "未检测到本机会话或 trace 用量目录。");
         }
         let labels = read_workbuddy_session_labels(&root.join("workbuddy.db"));
         let credits = read_workbuddy_credit_balance(&root.join("workbuddy.db"));
-        let files = collect_files(&trace_root, is_workbuddy_trace);
+        let mut files = collect_workbuddy_project_files(&project_root);
+        files.extend(collect_files(&trace_root, is_workbuddy_trace));
+        files.sort();
         match self.scan_files(
             id,
             &files,
             |path, contents| parse_workbuddy_trace(path, contents, &labels),
             &mut on_progress,
         ) {
-            Err(()) => SourceState::error(id, label, "本机 trace 用量索引暂不可写入。"),
-            Ok(scan) => SourceState::ready(id, label)
-                .with_credits(credits)
-                .with_scan(scan),
+            Err(()) => SourceState::error(id, label, "本机会话用量索引暂不可写入。"),
+            Ok(scan) => {
+                let mut state = SourceState::ready(id, label)
+                    .with_credits(credits)
+                    .with_scan(scan);
+                let has_usage: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_events WHERE source = ?1 AND workbuddy_suppressed = 0 AND total_tokens > 0)",
+                    [id], |row| row.get(0),
+                ).unwrap_or(false);
+                if !has_usage {
+                    state.message = Some(
+                        "尚无可用 Token 用量记录；进行中的调用需等待用量写入本机会话记录。"
+                            .to_owned(),
+                    );
+                } else {
+                    let differing_coverage: bool = self
+                        .connection
+                        .query_row(
+                            "SELECT EXISTS(
+                           SELECT 1 FROM workbuddy_event_groups g JOIN source_events e
+                             ON e.source = g.source AND e.event_key = g.event_key
+                           WHERE g.source = ?1 GROUP BY g.group_key
+                           HAVING max(CASE WHEN g.is_summary = 1 THEN e.total_tokens ELSE 0 END) > 0
+                              AND sum(CASE WHEN g.is_summary = 0 THEN e.total_tokens ELSE 0 END) > 0
+                              AND max(CASE WHEN g.is_summary = 1 THEN e.total_tokens ELSE 0 END)
+                                != sum(CASE WHEN g.is_summary = 0 THEN e.total_tokens ELSE 0 END)
+                         )",
+                            [id],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(false);
+                    if differing_coverage {
+                        state.message = Some("会话调用与 trace 汇总存在重叠且进度不同，暂按较完整的一组记录统计，未相加。".to_owned());
+                    }
+                }
+                state
+            }
         }
     }
 
@@ -1038,6 +1094,13 @@ impl MultiSourceIndex {
                         scan.new_events += 1;
                     }
                 }
+                for member in parsed.workbuddy_groups {
+                    transaction.execute(
+                        "INSERT INTO workbuddy_event_groups(source, event_key, group_key, is_summary) VALUES(?1, ?2, ?3, ?4)
+                         ON CONFLICT(source, event_key) DO UPDATE SET group_key = excluded.group_key, is_summary = excluded.is_summary",
+                        params![source, source_event_key(source, &member.identity).as_slice(), member.group_key.as_slice(), i64::from(member.is_summary)],
+                    ).map_err(|_| ())?;
+                }
                 // A recognized reply replaces every old UUID snapshot, even
                 // when an old copied source is no longer available to reread.
                 for legacy_key in parsed.legacy_event_keys {
@@ -1046,6 +1109,9 @@ impl MultiSourceIndex {
                 if complete {
                     prune_orphan_events(&transaction, source).map_err(|_| ())?;
                 }
+            }
+            if matches!(source, SOURCE_WORKBUDDY | SOURCE_WORKBUDDY_AI) {
+                reconcile_workbuddy_groups(&transaction, source).map_err(|_| ())?;
             }
             upsert_source_file(
                 &transaction,
@@ -1165,7 +1231,7 @@ impl MultiSourceIndex {
         let mut indexed_events = 0_i64;
         let today_date = Local::now().date_naive();
         let events = self.connection.prepare(
-            "SELECT occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens FROM source_events WHERE source = ?1",
+            "SELECT occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens FROM source_events WHERE source = ?1 AND workbuddy_suppressed = 0",
         );
         if let Ok(mut statement) = events {
             if let Ok(rows) = statement.query_map([state.id], |row| {
@@ -1231,7 +1297,7 @@ impl MultiSourceIndex {
         let mut statement = self.connection.prepare(
             "SELECT source, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, cache_metrics_available, output_tokens, reasoning_output_tokens, total_tokens
              FROM source_events
-             WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+             WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2 AND workbuddy_suppressed = 0
              ORDER BY occurred_at_ms DESC",
         ).map_err(|_| ())?;
         let rows = statement
@@ -1480,6 +1546,14 @@ struct ParsedUsageEvents {
     skipped_records: i64,
     complete: bool,
     legacy_event_keys: Vec<[u8; 32]>,
+    workbuddy_groups: Vec<WorkbuddyGroupMember>,
+}
+
+#[derive(Debug)]
+struct WorkbuddyGroupMember {
+    identity: String,
+    group_key: [u8; 32],
+    is_summary: bool,
 }
 
 impl Default for ParsedUsageEvents {
@@ -1489,6 +1563,7 @@ impl Default for ParsedUsageEvents {
             skipped_records: 0,
             complete: true,
             legacy_event_keys: Vec::new(),
+            workbuddy_groups: Vec::new(),
         }
     }
 }
@@ -1610,55 +1685,115 @@ fn parse_workbuddy_trace(
     contents: &str,
     session_labels: &HashMap<String, String>,
 ) -> ParsedUsageEvents {
-    let value: Value = match serde_json::from_str(contents) {
-        Ok(value) => value,
-        Err(_) => {
-            return ParsedUsageEvents {
-                events: Vec::new(),
-                skipped_records: 1,
-                complete: false,
-                ..ParsedUsageEvents::default()
+    let mut parsed = ParsedUsageEvents::default();
+    let mut calls: HashMap<String, usize> = HashMap::new();
+    let jsonl = extension_is(path, "jsonl");
+    let records: Vec<_> = if jsonl {
+        contents.lines().collect()
+    } else {
+        vec![contents]
+    };
+    for (index, record) in records.into_iter().enumerate() {
+        if record.trim().is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(record) {
+            Ok(value) => value,
+            Err(_) => {
+                parsed.skipped_records += 1;
+                parsed.complete = false;
+                continue;
+            }
+        };
+        let raw = value.pointer("/providerData/rawUsage");
+        let normalized = value.pointer("/providerData/usage");
+        let message_usage = value.pointer("/message/usage");
+        let trace = value.get("trace");
+        let call_usage = raw
+            .and_then(workbuddy_raw_usage)
+            .filter(|usage| usage.total_tokens > 0)
+            .or_else(|| {
+                normalized
+                    .and_then(workbuddy_normalized_usage)
+                    .filter(|usage| usage.total_tokens > 0)
+            })
+            .or_else(|| {
+                message_usage
+                    .and_then(workbuddy_message_usage)
+                    .filter(|usage| usage.total_tokens > 0)
+            });
+        let is_summary = call_usage.is_none();
+        let usage = call_usage.or_else(|| trace.and_then(workbuddy_trace_summary_usage));
+        let Some(usage) = usage.filter(|usage| usage.total_tokens > 0) else {
+            // New trace headers contain a placeholder zero before any actual usage exists.
+            continue;
+        };
+        let file_identity = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("trace");
+        let session = text(value.get("sessionId"))
+            .or_else(|| trace.and_then(|trace| text(trace.get("sessionId"))))
+            .unwrap_or(file_identity);
+        let identity = if is_summary {
+            file_identity.to_owned()
+        } else {
+            let call = text(value.pointer("/providerData/messageId"))
+                .map(|id| format!("message:{}:{id}", id.len()))
+                .or_else(|| {
+                    let request = text(value.pointer("/providerData/conversationRequestId"))?;
+                    let step = number(value.pointer("/providerData/stepSeq"))?;
+                    Some(format!("request:{}:{request}:step:{step}", request.len()))
+                })
+                .or_else(|| {
+                    text(value.pointer("/message/id"))
+                        .map(|id| format!("message:{}:{id}", id.len()))
+                })
+                .or_else(|| text(value.get("id")).map(|id| format!("record:{}:{id}", id.len())))
+                .unwrap_or_else(|| format!("file:{file_identity}:line:{index}"));
+            format!(
+                "workbuddy-call-v2\0session:{}:{session}\0{call}",
+                session.len()
+            )
+        };
+        let trace_id = text(value.pointer("/providerData/traceId"))
+            .or_else(|| trace.and_then(|trace| text(trace.get("traceId"))));
+        if let Some(trace_id) = trace_id {
+            let group_key = hash_bytes(format!("workbuddy-trace-v1\0{trace_id}").as_bytes());
+            parsed.workbuddy_groups.push(WorkbuddyGroupMember {
+                identity: identity.clone(),
+                group_key,
+                is_summary,
+            });
+            // Previous readers used trace_<id> as the event identity. A matching
+            // trace id is evidence of overlap even if the original file is gone.
+            if !is_summary
+                && trace_id.len() == 32
+                && trace_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                parsed.workbuddy_groups.push(WorkbuddyGroupMember {
+                    identity: format!("trace_{trace_id}"),
+                    group_key,
+                    is_summary: true,
+                });
             }
         }
-    };
-    let raw = value.pointer("/providerData/rawUsage");
-    let normalized = value.pointer("/providerData/usage");
-    let message_usage = value.pointer("/message/usage");
-    let trace = value.get("trace");
-    let usage = raw
-        .and_then(workbuddy_raw_usage)
-        .or_else(|| normalized.and_then(workbuddy_normalized_usage))
-        .or_else(|| message_usage.and_then(workbuddy_message_usage))
-        .or_else(|| trace.and_then(workbuddy_trace_summary_usage));
-    let Some(usage) = usage else {
-        return ParsedUsageEvents::default();
-    };
-    let session = trace
-        .and_then(|trace| text(trace.get("sessionId")))
-        .or_else(|| text(value.get("sessionId")))
-        .unwrap_or("unknown");
-    let model = text(value.pointer("/providerData/requestModelName"))
-        .or_else(|| text(value.pointer("/providerData/requestModelId")))
-        .or_else(|| text(value.pointer("/providerData/model")))
-        .or_else(|| trace.and_then(workbuddy_trace_model_label))
-        .unwrap_or("未知模型");
-    let identity = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("trace")
-        .to_owned();
-    ParsedUsageEvents {
-        events: vec![UsageEvent {
-            identity,
-            occurred_at_ms: trace
-                .and_then(|trace| timestamp(trace.get("startedAt")))
-                .or_else(|| timestamp(value.get("timestamp"))),
-            snapshot_ordinal: 0,
+        let model = text(value.pointer("/providerData/requestModelName"))
+            .or_else(|| text(value.pointer("/providerData/requestModelId")))
+            .or_else(|| text(value.pointer("/providerData/model")))
+            .or_else(|| text(value.pointer("/message/model")))
+            .or_else(|| trace.and_then(workbuddy_trace_model_label))
+            .unwrap_or("未知模型");
+        let event = UsageEvent {
+            identity: identity.clone(),
+            occurred_at_ms: timestamp(value.get("timestamp"))
+                .or_else(|| trace.and_then(|trace| timestamp(trace.get("startedAt")))),
+            snapshot_ordinal: i64::try_from(index).unwrap_or(i64::MAX),
             model_label: model.to_owned(),
             project_label: session_labels
                 .get(session)
                 .cloned()
-                .unwrap_or_else(|| "未知项目".to_owned()),
+                .unwrap_or_else(|| project_label(text(value.get("cwd")).unwrap_or(""))),
             usage,
             cache_metrics_available: workbuddy_cache_metrics_available(
                 raw,
@@ -1666,14 +1801,24 @@ fn parse_workbuddy_trace(
                 message_usage,
                 trace,
             ),
-        }],
-        skipped_records: 0,
-        ..ParsedUsageEvents::default()
+        };
+        if let Some(&position) = calls.get(&identity) {
+            let previous = &parsed.events[position];
+            if (event.occurred_at_ms, event.snapshot_ordinal)
+                >= (previous.occurred_at_ms, previous.snapshot_ordinal)
+            {
+                parsed.events[position] = event;
+            }
+        } else {
+            calls.insert(identity, parsed.events.len());
+            parsed.events.push(event);
+        }
     }
+    parsed
 }
 
 fn workbuddy_trace_summary_usage(trace: &Value) -> Option<DeviceTokenUsage> {
-    let total = number(trace.get("totalTokens"))?;
+    let total = number(trace.get("totalTokens")).filter(|total| *total > 0)?;
     let input = number(trace.pointer("/modelInfo/totalInputTokens")).unwrap_or(0);
     let cached = number(trace.pointer("/modelInfo/totalCachedTokens")).unwrap_or(0);
     let output = number(trace.pointer("/modelInfo/totalOutputTokens")).unwrap_or(0);
@@ -1705,22 +1850,27 @@ fn workbuddy_cache_metrics_available(
             || value.get("prompt_cache_hit_tokens").is_some()
             || value.get("cache_creation_input_tokens").is_some()
             || value.get("prompt_cache_write_tokens").is_some()
-    }) || normalized
-        .is_some_and(|value| value.pointer("/inputTokensDetails/cached_tokens").is_some())
-        || message_usage.is_some_and(|value| value.get("cache_read_input_tokens").is_some())
+    }) || normalized.is_some_and(|value| {
+        workbuddy_detail_tokens(value.get("inputTokensDetails"), "cached_tokens").is_some()
+    }) || message_usage.is_some_and(|value| value.get("cache_read_input_tokens").is_some())
         || trace.is_some_and(|value| value.pointer("/modelInfo/totalCachedTokens").is_some())
 }
 
 fn workbuddy_raw_usage(value: &Value) -> Option<DeviceTokenUsage> {
     let prompt = number(value.get("prompt_tokens"))?;
-    let cache_read = number(value.get("cache_read_input_tokens"))
-        .or_else(|| number(value.get("prompt_cache_hit_tokens")))
-        .unwrap_or(0);
-    let cache_write = number(value.get("cache_creation_input_tokens"))
-        .or_else(|| number(value.get("prompt_cache_write_tokens")))
-        .unwrap_or(0);
+    // Some providers supply both aliases, with a placeholder zero in the first.
+    let cache_read =
+        workbuddy_alias_tokens(value, "cache_read_input_tokens", "prompt_cache_hit_tokens")
+            .clamp(0, prompt.max(0));
+    let cache_write = workbuddy_alias_tokens(
+        value,
+        "cache_creation_input_tokens",
+        "prompt_cache_write_tokens",
+    )
+    .clamp(0, (prompt - cache_read).max(0));
     let output = number(value.get("completion_tokens"))?;
     let reasoning = number(value.pointer("/completion_tokens_details/reasoning_tokens"))
+        .filter(|tokens| *tokens > 0)
         .or_else(|| number(value.get("completion_thinking_tokens")))
         .unwrap_or(0);
     Some(DeviceTokenUsage::from_parts(
@@ -1735,9 +1885,12 @@ fn workbuddy_raw_usage(value: &Value) -> Option<DeviceTokenUsage> {
 
 fn workbuddy_normalized_usage(value: &Value) -> Option<DeviceTokenUsage> {
     let input = number(value.get("inputTokens"))?;
-    let cache_read = number(value.pointer("/inputTokensDetails/cached_tokens")).unwrap_or(0);
+    let cache_read = workbuddy_detail_tokens(value.get("inputTokensDetails"), "cached_tokens")
+        .unwrap_or(0)
+        .clamp(0, input.max(0));
     let output = number(value.get("outputTokens"))?;
-    let reasoning = number(value.pointer("/outputTokensDetails/reasoning_tokens")).unwrap_or(0);
+    let reasoning =
+        workbuddy_detail_tokens(value.get("outputTokensDetails"), "reasoning_tokens").unwrap_or(0);
     Some(DeviceTokenUsage::from_parts(
         input - cache_read,
         cache_read,
@@ -1746,6 +1899,24 @@ fn workbuddy_normalized_usage(value: &Value) -> Option<DeviceTokenUsage> {
         reasoning,
         number(value.get("totalTokens")),
     ))
+}
+
+fn workbuddy_alias_tokens(value: &Value, first: &str, second: &str) -> i64 {
+    number(value.get(first))
+        .filter(|tokens| *tokens > 0)
+        .or_else(|| number(value.get(second)))
+        .unwrap_or(0)
+}
+
+fn workbuddy_detail_tokens(value: Option<&Value>, key: &str) -> Option<i64> {
+    match value? {
+        Value::Object(object) => number(object.get(key)),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| workbuddy_detail_tokens(Some(value), key))
+            .reduce(i64::saturating_add),
+        _ => None,
+    }
 }
 
 fn workbuddy_message_usage(value: &Value) -> Option<DeviceTokenUsage> {
@@ -1971,6 +2142,61 @@ fn source_event_key(source: &str, identity: &str) -> [u8; 32] {
     hash_bytes(format!("{source}\0{identity}").as_bytes())
 }
 
+/// Trace summaries and per-call records describe overlapping coverage. Keep both
+/// for recovery, but expose only the more complete side to every numeric reader.
+fn reconcile_workbuddy_groups(connection: &Connection, source: &str) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT g.group_key, g.event_key, g.is_summary, e.total_tokens
+         FROM workbuddy_event_groups g JOIN source_events e
+           ON e.source = g.source AND e.event_key = g.event_key
+         WHERE g.source = ?1 ORDER BY g.group_key, g.event_key",
+    )?;
+    let rows = statement
+        .query_map([source], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut groups: HashMap<Vec<u8>, Vec<(Vec<u8>, bool, i64)>> = HashMap::new();
+    for (group, key, summary, total) in rows {
+        groups.entry(group).or_default().push((key, summary, total));
+    }
+    connection.execute(
+        "UPDATE source_events SET workbuddy_suppressed = 0 WHERE source = ?1",
+        [source],
+    )?;
+    for members in groups.values() {
+        let calls_total = members
+            .iter()
+            .filter(|member| !member.1)
+            .fold(0_i64, |sum, member| sum.saturating_add(member.2));
+        let summary = members
+            .iter()
+            .filter(|member| member.1)
+            .max_by_key(|member| (member.2, &member.0));
+        let use_calls = calls_total > 0 && summary.map_or(true, |summary| calls_total >= summary.2);
+        for (key, is_summary, _) in members {
+            let suppress = if use_calls {
+                *is_summary
+            } else {
+                !*is_summary || summary.is_some_and(|summary| &summary.0 != key)
+            };
+            if suppress {
+                connection.execute(
+                    "UPDATE source_events SET workbuddy_suppressed = 1 WHERE source = ?1 AND event_key = ?2",
+                    params![source, key],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn retire_legacy_event(
     transaction: &rusqlite::Transaction<'_>,
     source: &str,
@@ -2179,6 +2405,10 @@ fn ensure_source_event_columns(connection: &Connection) -> rusqlite::Result<()> 
             "legacy_pending",
             "INTEGER NOT NULL DEFAULT 0 CHECK(legacy_pending IN (0, 1))",
         ),
+        (
+            "workbuddy_suppressed",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(workbuddy_suppressed IN (0, 1))",
+        ),
     ] {
         if !columns.iter().any(|column| column == name) {
             connection.execute_batch(&format!(
@@ -2187,6 +2417,30 @@ fn ensure_source_event_columns(connection: &Connection) -> rusqlite::Result<()> 
         }
     }
     Ok(())
+}
+
+fn migrate_workbuddy_parser(connection: &mut Connection) -> rusqlite::Result<()> {
+    let previous: Option<String> = connection
+        .query_row(
+            "SELECT value FROM source_index_meta WHERE key = 'workbuddy-parser-version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if previous.as_deref() == Some(WORKBUDDY_PARSER_VERSION) {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "UPDATE source_files SET size_bytes = -1, modified_at_ms = NULL WHERE source IN (?1, ?2)",
+        params![SOURCE_WORKBUDDY, SOURCE_WORKBUDDY_AI],
+    )?;
+    transaction.execute(
+        "INSERT INTO source_index_meta(key, value) VALUES('workbuddy-parser-version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [WORKBUDDY_PARSER_VERSION],
+    )?;
+    transaction.commit()
 }
 
 fn collect_files<F>(root: &Path, include: F) -> Vec<PathBuf>
@@ -2221,13 +2475,52 @@ fn is_workbuddy_trace(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    let Some(identity) = name
-        .strip_prefix("trace_")
-        .and_then(|name| name.strip_suffix(".json"))
-    else {
+    let Some(identity) = name.strip_prefix("trace_").and_then(|name| {
+        name.strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".jsonl"))
+    }) else {
         return false;
     };
     identity.len() == 32 && identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Only WorkBuddy's own direct project/session logs, never workspace contents,
+/// nested file history, backups or the similarly named change-state journals.
+fn collect_workbuddy_project_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(projects) = fs::read_dir(root) else {
+        return files;
+    };
+    for project in projects.flatten() {
+        if !project.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(sessions) = fs::read_dir(project.path()) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            if !session.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let path = session.path();
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if extension_is(&path, "jsonl")
+                && stem.len() == 36
+                && stem.bytes().enumerate().all(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        byte == b'-'
+                    } else {
+                        byte.is_ascii_hexdigit()
+                    }
+                })
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 fn file_stamp(path: &Path) -> (i64, Option<i64>) {
@@ -2808,6 +3101,308 @@ mod tests {
         let events = parse_workbuddy_trace(Path::new("trace_one.json"), trace, &HashMap::new());
         assert_eq!(events[0].usage.total_tokens, 130);
         assert_eq!(events[0].usage.input_tokens, 70);
+    }
+
+    fn workbuddy_call(message: &str, trace: &str, output: i64, time: i64) -> String {
+        serde_json::json!({
+            "id": format!("snapshot-{time}"), "type": "function_call",
+            "sessionId": "private-session", "timestamp": time,
+            "cwd": "C:\\Users\\private\\demo",
+            "providerData": {
+                "messageId": message, "traceId": trace,
+                "conversationRequestId": "one-request", "stepSeq": 1,
+                "requestModelId": "workbuddy-model",
+                "rawUsage": {
+                    "prompt_tokens": 100, "cache_read_input_tokens": 0,
+                    "prompt_cache_hit_tokens": 80, "completion_tokens": output,
+                    "completion_thinking_tokens": 3, "total_tokens": 100 + output
+                },
+                "usage": {"inputTokens":100,"outputTokens":output,"totalTokens":100+output,
+                    "inputTokensDetails":[{"cached_tokens":80}],
+                    "outputTokensDetails":[{"reasoning_tokens":3}]}
+            },
+            "message": {"usage":{"input_tokens":100,"output_tokens":output,"total_tokens":100+output}},
+            "arguments": "private content must never enter the index"
+        }).to_string()
+    }
+
+    fn workbuddy_summary(trace: &str, total: i64) -> String {
+        serde_json::json!({"trace":{
+            "traceId":trace, "sessionId":"private-session",
+            "startedAt":"2026-08-28T00:00:00Z", "totalTokens":total,
+            "modelInfo":{"models":["workbuddy-model"],"totalInputTokens":total-10,
+                "totalCachedTokens":20,"totalOutputTokens":10}
+        }})
+        .to_string()
+    }
+
+    #[test]
+    fn workbuddy_call_snapshots_are_per_message_and_array_details_keep_subsets() {
+        let trace = "0123456789abcdef0123456789abcdef";
+        let first = workbuddy_call("message-one", trace, 10, 1_787_875_200_000);
+        let corrected = workbuddy_call("message-one", trace, 7, 1_787_875_200_001);
+        let second = workbuddy_call("message-two", trace, 5, 1_787_875_200_002);
+        let parsed = parse_workbuddy_trace(
+            Path::new("session.jsonl"),
+            &format!("{first}\n{corrected}\n{second}\n{{\"unfinished\":"),
+            &HashMap::new(),
+        );
+        assert!(!parsed.complete);
+        assert_eq!(
+            parsed.len(),
+            2,
+            "snapshots and fallback usage are not additional calls"
+        );
+        assert_eq!(
+            parsed[0].usage.total_tokens, 107,
+            "latest snapshot can correct a counter downwards"
+        );
+        assert_eq!(parsed[0].usage.input_tokens, 20);
+        assert_eq!(
+            parsed[0].usage.cached_input_tokens, 80,
+            "a placeholder zero must not override actual cache hits"
+        );
+        assert_eq!(parsed[0].usage.reasoning_output_tokens, 3);
+
+        let normalized = r#"{"sessionId":"s","providerData":{"messageId":"m","usage":{"inputTokens":100,"outputTokens":11,"totalTokens":111,"inputTokensDetails":[{"cached_tokens":5},{"cached_tokens":7}],"outputTokensDetails":[{"reasoning_tokens":3},{"reasoning_tokens":2}]}}}"#;
+        let parsed = parse_workbuddy_trace(
+            Path::new("session.jsonl"),
+            &format!("{normalized}\n"),
+            &HashMap::new(),
+        );
+        assert_eq!(parsed[0].usage.input_tokens, 88);
+        assert_eq!(parsed[0].usage.cached_input_tokens, 12);
+        assert_eq!(parsed[0].usage.reasoning_output_tokens, 5);
+        assert_eq!(
+            parsed[0].usage.total_tokens, 111,
+            "cached input and reasoning are subsets"
+        );
+        assert!(parsed[0].cache_metrics_available);
+
+        let mut placeholder: Value = serde_json::from_str(normalized).unwrap();
+        placeholder["providerData"]["rawUsage"] =
+            serde_json::json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0});
+        let parsed = parse_workbuddy_trace(
+            Path::new("session.jsonl"),
+            &placeholder.to_string(),
+            &HashMap::new(),
+        );
+        assert!(
+            parsed.complete,
+            "a closed JSON tail is usable even without a line feed"
+        );
+        assert_eq!(
+            parsed[0].usage.total_tokens, 111,
+            "zero raw placeholders must allow the actual fallback usage"
+        );
+    }
+
+    #[test]
+    fn workbuddy_projects_are_live_idempotent_and_ignore_nested_backups() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join(".workbuddy-ai");
+        let project = root.join("projects").join("encoded-project");
+        fs::create_dir_all(project.join("file-history")).unwrap();
+        let session = project.join("01234567-89ab-cdef-0123-456789abcdef.jsonl");
+        let first = workbuddy_call("first", "trace", 10, 1_787_875_200_000);
+        fs::write(&session, format!("{first}\n{{\"unfinished\":")).unwrap();
+        fs::write(project.join("session.backup.jsonl"), format!("{first}\n")).unwrap();
+        fs::write(
+            project
+                .join("file-history")
+                .join("fedcba98-7654-3210-fedc-ba9876543210.jsonl"),
+            format!("{first}\n"),
+        )
+        .unwrap();
+        fs::write(
+            project.join("01234567-89ab-cdef-0123-456789abcdef.ndjson"),
+            format!("{first}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            collect_workbuddy_project_files(&root.join("projects")).len(),
+            1
+        );
+        let database = temporary.path().join("index.sqlite3");
+        {
+            let mut index = MultiSourceIndex::open(&database).unwrap();
+            let status = index.scan_workbuddy(SOURCE_WORKBUDDY_AI, "WorkBuddy AI", &root);
+            assert_eq!(
+                status.status, "ready",
+                "projects work without a traces directory"
+            );
+            index.scan_workbuddy(SOURCE_WORKBUDDY_AI, "WorkBuddy AI", &root);
+            let source = index.aggregate_source(status);
+            assert_eq!(source.indexed_events, 1);
+            assert_eq!(source.total.total_tokens, 110);
+            assert_eq!(source.total.cached_input_tokens, 80);
+        }
+        let second = workbuddy_call("second", "trace", 20, 1_787_875_200_001);
+        fs::write(&session, format!("{first}\n{second}\n")).unwrap();
+        let mut index = MultiSourceIndex::open(&database).unwrap();
+        index.scan_workbuddy(SOURCE_WORKBUDDY_AI, "WorkBuddy AI", &root);
+        let source =
+            index.aggregate_source(SourceState::ready(SOURCE_WORKBUDDY_AI, "WorkBuddy AI"));
+        assert_eq!(source.indexed_events, 2);
+        assert_eq!(source.total.total_tokens, 230);
+        let persisted = fs::read(&database).unwrap();
+        assert!(!String::from_utf8_lossy(&persisted).contains("private content"));
+        assert!(!String::from_utf8_lossy(&persisted).contains("private-session"));
+    }
+
+    #[test]
+    fn workbuddy_linked_summaries_switch_coverage_without_adding_overlap() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join(".workbuddy-ai");
+        let project = root.join("projects").join("project");
+        let traces = root.join("traces");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&traces).unwrap();
+        let trace_id = "0123456789abcdef0123456789abcdef";
+        let trace = traces.join(format!("trace_{trace_id}.json"));
+        let session = project.join("01234567-89ab-cdef-0123-456789abcdef.jsonl");
+        let first = workbuddy_call("first", trace_id, 10, 1_787_875_200_000);
+        let second = workbuddy_call("second", trace_id, 20, 1_787_875_200_001);
+        let third = workbuddy_call("third", trace_id, 30, 1_787_875_200_002);
+        fs::write(&trace, workbuddy_summary(trace_id, 230)).unwrap();
+        fs::write(&session, format!("{first}\n")).unwrap();
+        let database = temporary.path().join("index.sqlite3");
+        let mut index = MultiSourceIndex::open(&database).unwrap();
+        let status = index.scan_workbuddy(SOURCE_WORKBUDDY_AI, "WorkBuddy AI", &root);
+        assert!(status.message.as_deref().unwrap_or("").contains("未相加"));
+        let source = index.aggregate_source(status);
+        assert_eq!(
+            source.total.total_tokens, 230,
+            "the larger summary covers the incomplete calls"
+        );
+        assert_eq!(source.indexed_events, 1);
+
+        fs::write(&session, format!("{first}\n{second}\n")).unwrap();
+        index.scan_workbuddy(SOURCE_WORKBUDDY_AI, "WorkBuddy AI", &root);
+        let source =
+            index.aggregate_source(SourceState::ready(SOURCE_WORKBUDDY_AI, "WorkBuddy AI"));
+        assert_eq!(source.total.total_tokens, 230);
+        assert_eq!(
+            source.indexed_events, 2,
+            "complete per-call coverage replaces its summary"
+        );
+        assert_eq!(source.total.cached_input_tokens, 160);
+
+        fs::write(&session, format!("{first}\n{second}\n{third}\n")).unwrap();
+        index.scan_workbuddy(SOURCE_WORKBUDDY_AI, "WorkBuddy AI", &root);
+        let source =
+            index.aggregate_source(SourceState::ready(SOURCE_WORKBUDDY_AI, "WorkBuddy AI"));
+        assert_eq!(
+            source.total.total_tokens, 360,
+            "new calls extend the old summary instead of adding it"
+        );
+        assert_eq!(
+            source
+                .by_model
+                .iter()
+                .map(|row| row.usage.total_tokens)
+                .sum::<i64>(),
+            360
+        );
+        assert_eq!(
+            source
+                .by_project
+                .iter()
+                .map(|row| row.usage.total_tokens)
+                .sum::<i64>(),
+            360
+        );
+        assert_eq!(
+            index
+                .day_tasks("2026-08-28")
+                .unwrap()
+                .iter()
+                .map(|row| row.usage.total_tokens)
+                .sum::<i64>(),
+            360
+        );
+        assert_eq!(
+            read_existing_export_events(&database, &[SOURCE_WORKBUDDY_AI.to_owned()], None)
+                .unwrap()
+                .iter()
+                .map(|row| row.usage.total_tokens)
+                .sum::<i64>(),
+            360
+        );
+
+        fs::write(&trace, format!("{}\n", workbuddy_summary(trace_id, 500))).unwrap();
+        index.scan_workbuddy(SOURCE_WORKBUDDY_AI, "WorkBuddy AI", &root);
+        assert_eq!(
+            index
+                .aggregate_source(SourceState::ready(SOURCE_WORKBUDDY_AI, "WorkBuddy AI"))
+                .total
+                .total_tokens,
+            500
+        );
+        fs::remove_file(&trace).unwrap();
+        index.scan_workbuddy(SOURCE_WORKBUDDY_AI, "WorkBuddy AI", &root);
+        assert_eq!(
+            index
+                .aggregate_source(SourceState::ready(SOURCE_WORKBUDDY_AI, "WorkBuddy AI"))
+                .total
+                .total_tokens,
+            500,
+            "missing original summaries keep their more complete coverage"
+        );
+        drop(index);
+        let index = MultiSourceIndex::open(&database).unwrap();
+        assert_eq!(
+            read_existing_export_events(&database, &[SOURCE_WORKBUDDY_AI.to_owned()], None)
+                .unwrap()
+                .iter()
+                .map(|row| row.usage.total_tokens)
+                .sum::<i64>(),
+            500
+        );
+        assert_eq!(
+            index
+                .day_tasks("2026-08-28")
+                .unwrap()
+                .iter()
+                .map(|row| row.usage.total_tokens)
+                .sum::<i64>(),
+            500
+        );
+    }
+
+    #[test]
+    fn workbuddy_parser_upgrade_invalidates_only_its_files_and_preserves_unrelated_history() {
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join("index.sqlite3");
+        {
+            let index = MultiSourceIndex::open(&database).unwrap();
+            index
+                .connection
+                .execute(
+                    "DELETE FROM source_index_meta WHERE key = 'workbuddy-parser-version'",
+                    [],
+                )
+                .unwrap();
+            for source in [SOURCE_WORKBUDDY, SOURCE_WORKBUDDY_AI, SOURCE_CLAUDE] {
+                index.connection.execute("INSERT INTO source_files(source,file_key,size_bytes,modified_at_ms,present) VALUES(?1,?2,999,123,1)", params![source, [1_u8;32].as_slice()]).unwrap();
+            }
+        }
+        let index = MultiSourceIndex::open(&database).unwrap();
+        for (source, expected) in [
+            (SOURCE_WORKBUDDY, -1),
+            (SOURCE_WORKBUDDY_AI, -1),
+            (SOURCE_CLAUDE, 999),
+        ] {
+            let size: i64 = index
+                .connection
+                .query_row(
+                    "SELECT size_bytes FROM source_files WHERE source = ?1",
+                    [source],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(size, expected);
+        }
     }
 
     #[test]

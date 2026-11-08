@@ -100,7 +100,7 @@ pub(crate) fn apply(app: &AppHandle, state: &PetState) -> Result<(), String> {
         .position
         .map(|p| PhysicalPosition::new(p.x, p.y))
         .unwrap_or_else(|| default_position(&window));
-    window.set_position(position).map_err(window_error)?;
+    position_on_top(&window.as_ref().window(), Some(position))?;
     clamp_window(&window)?;
     if let Some(runtime) = app.try_state::<PetWindowRuntime>() {
         update_region(
@@ -157,7 +157,7 @@ fn clamp_window(window: &WebviewWindow) -> Result<PetPosition, String> {
         position
     };
     if position != corrected {
-        window.set_position(corrected).map_err(window_error)?;
+        position_on_top(&window.as_ref().window(), Some(corrected))?;
     }
     Ok(PetPosition {
         x: corrected.x,
@@ -167,9 +167,7 @@ fn clamp_window(window: &WebviewWindow) -> Result<PetPosition, String> {
 
 pub(crate) fn reset_position(app: &AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(PET_WINDOW) {
-        window
-            .set_position(default_position(&window))
-            .map_err(window_error)?;
+        position_on_top(&window.as_ref().window(), Some(default_position(&window)))?;
         let position = clamp_window(&window)?;
         if let Some(runtime) = app.try_state::<PetRuntime>() {
             runtime.save_position(position)?;
@@ -263,6 +261,7 @@ pub(crate) fn pet_drag_start(
         position.x as f64 + client_x * scale,
         position.y as f64 + client_y * scale,
     );
+    position_on_top(&window, None)?;
     *runtime.drag.lock().unwrap_or_else(|p| p.into_inner()) = Some(Drag { cursor, position });
     Ok(())
 }
@@ -276,12 +275,13 @@ pub(crate) fn pet_drag_update(
     let drag = *runtime.drag.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(drag) = drag {
         let cursor = app.cursor_position().map_err(window_error)?;
-        window
-            .set_position(PhysicalPosition::new(
+        position_on_top(
+            &window,
+            Some(PhysicalPosition::new(
                 drag.position.x + (cursor.x - drag.cursor.x).round() as i32,
                 drag.position.y + (cursor.y - drag.cursor.y).round() as i32,
-            ))
-            .map_err(window_error)?;
+            )),
+        )?;
     }
     Ok(())
 }
@@ -293,6 +293,7 @@ pub(crate) fn pet_drag_end(
 ) -> Result<(), String> {
     require_pet(&window)?;
     *runtime.drag.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    position_on_top(&window, None)?;
     if let Some(window) = app.get_webview_window(PET_WINDOW) {
         let position = clamp_window(&window)?;
         if let Some(pets) = app.try_state::<PetRuntime>() {
@@ -347,14 +348,18 @@ pub(crate) fn handle_window_event(window: &Window, event: &tauri::WindowEvent) {
 #[cfg(windows)]
 fn configure_native(window: &WebviewWindow) -> Result<(), String> {
     let owned = window.clone();
-    on_ui(window, move || configure_native_on_ui(&owned))
+    on_ui(&window.as_ref().window(), move || {
+        configure_native_on_ui(&owned)
+    })
 }
 #[cfg(windows)]
 fn on_ui(
-    window: &WebviewWindow,
+    window: &Window,
     operation: impl FnOnce() -> Result<(), String> + Send + 'static,
 ) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    // Wry executes run_on_main_thread inline when called on the window thread.
+    // This also allows synchronous drag IPC without waiting on its own queue.
     window
         .run_on_main_thread(move || {
             let _ = tx.send(operation());
@@ -381,7 +386,44 @@ fn configure_native_on_ui(window: &WebviewWindow) -> Result<(), String> {
             return Err("无法设置宠物窗口的非激活交互。".into());
         }
     }
-    Ok(())
+    topmost_on_ui(hwnd, None)
+}
+
+#[cfg(windows)]
+fn position_on_top(window: &Window, position: Option<PhysicalPosition<i32>>) -> Result<(), String> {
+    let owned = window.clone();
+    on_ui(window, move || {
+        topmost_on_ui(owned.hwnd().map_err(window_error)?, position)
+    })
+}
+
+#[cfg(windows)]
+fn topmost_on_ui(
+    hwnd: windows::Win32::Foundation::HWND,
+    position: Option<PhysicalPosition<i32>>,
+) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    };
+    let mut flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSIZE;
+    let position = position.unwrap_or_else(|| {
+        flags |= SWP_NOMOVE;
+        PhysicalPosition::new(0, 0)
+    });
+    // Moving with SWP_NOZORDER would retain a stale order. Reassert the native
+    // topmost group on every drag move, without activating the pet or its owner.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            position.x,
+            position.y,
+            0,
+            0,
+            flags,
+        )
+        .map_err(|_| "无法维持桌面宠物的置顶显示。".to_string())
+    }
 }
 #[cfg(windows)]
 unsafe extern "system" fn no_activate(
@@ -408,7 +450,9 @@ unsafe extern "system" fn no_activate(
 #[cfg(windows)]
 fn update_region(window: &WebviewWindow, layout: PetLayout) -> Result<(), String> {
     let owned = window.clone();
-    on_ui(window, move || update_region_on_ui(&owned, layout))
+    on_ui(&window.as_ref().window(), move || {
+        update_region_on_ui(&owned, layout)
+    })
 }
 #[cfg(windows)]
 fn update_region_on_ui(window: &WebviewWindow, layout: PetLayout) -> Result<(), String> {
@@ -452,6 +496,13 @@ fn configure_native(_: &WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 #[cfg(not(windows))]
+fn position_on_top(window: &Window, position: Option<PhysicalPosition<i32>>) -> Result<(), String> {
+    if let Some(position) = position {
+        window.set_position(position).map_err(window_error)?;
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
 fn update_region(_: &WebviewWindow, _: PetLayout) -> Result<(), String> {
     Ok(())
 }
@@ -468,5 +519,80 @@ mod tests {
         layout = PetLayout::default();
         layout.bar.width = 500.;
         assert!(!valid_layout(layout));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_moves_restore_topmost_without_activating_or_resizing() {
+        use windows::{
+            core::w,
+            Win32::{
+                Foundation::RECT,
+                UI::WindowsAndMessaging::{
+                    CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW,
+                    GetWindowRect, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST, SWP_NOACTIVATE,
+                    SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                    WS_POPUP,
+                },
+            },
+        };
+        unsafe {
+            let foreground = GetForegroundWindow();
+            // A hidden test window exercises Z-order without drawing over the desktop.
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!("AI Token pet window test"),
+                WS_POPUP,
+                50,
+                70,
+                20,
+                30,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            topmost_on_ui(hwnd, Some(PhysicalPosition::new(150, 170))).unwrap();
+            let mut rect = RECT::default();
+            GetWindowRect(hwnd, &mut rect).unwrap();
+            assert_eq!(
+                (
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top
+                ),
+                (150, 170, 20, 30)
+            );
+            assert_ne!(
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as isize,
+                0
+            );
+            SetWindowPos(
+                hwnd,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
+            .unwrap();
+            topmost_on_ui(hwnd, None).unwrap();
+            let mut restored = RECT::default();
+            GetWindowRect(hwnd, &mut restored).unwrap();
+            assert_eq!(
+                (restored.left, restored.top, restored.right, restored.bottom),
+                (rect.left, rect.top, rect.right, rect.bottom)
+            );
+            assert_ne!(
+                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as isize,
+                0
+            );
+            assert_eq!(GetForegroundWindow(), foreground);
+            DestroyWindow(hwnd).unwrap();
+        }
     }
 }

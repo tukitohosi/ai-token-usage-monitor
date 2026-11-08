@@ -11,6 +11,8 @@ body:has(.pet-window) #root { min-width:0; min-height:0; width:100%; height:100%
 .pet-usage-bar__tokens { white-space:nowrap; flex:0 1 auto; }
 .pet-usage-bar__tokens strong { font-weight:500; }
 .pet-usage-bar__cost { color:var(--pet-soft); text-overflow:ellipsis; overflow:hidden; white-space:nowrap; text-align:right; font-size:10px; }
+.pet-usage-bar__refresh { display:block; color:var(--pet-soft); font-size:10px; min-height:13px; }
+.pet-usage-bar__refresh[data-interrupted="true"] { color:var(--pet-amber); }
 .pet-usage-bar__quota { display:grid; grid-template-columns:22px 64px 42px minmax(0,1fr); align-items:center; gap:4px; min-height:14px; color:var(--pet-soft); }
 .pet-usage-bar__quota-label { font-size:10px; }
 .pet-usage-bar__remaining { white-space:nowrap; font-size:10px; }
