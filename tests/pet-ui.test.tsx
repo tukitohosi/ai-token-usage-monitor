@@ -49,6 +49,8 @@ describe("pet usage presentation", () => {
     const view = buildPetUsageView(snapshot, Date.parse("2026-11-07T06:00:00Z"));
     expect(view.quotas[0].remaining).toBe(18);
     expect(view.quotas[0].resetLabel).toBe("等待更新");
+    expect(view.quotas[0].remainingLabel).toBe("待更新");
+    expect(view.quotas[0].expired).toBe(true);
     expect(view.quotaStatus).toContain("旧额度");
     expect(view.details).toContain("旧数据");
   });
@@ -120,6 +122,39 @@ describe("pet window subscription", () => {
     };
     return { adapter, listeners, stops };
   }
+
+  it("uses native edge placement and unsubscribes when the pet closes", async () => {
+    const api = makeApi({ preferences: { ...DEFAULT_PET_STATE.preferences, enabled: true, selectedPetId: "fox" }, pets: [importedPet] });
+    let placementListener!: Parameters<NonNullable<PetApi["subscribeLayout"]>>[0];
+    const stop = vi.fn();
+    api.subscribeLayout = vi.fn(async listener => { placementListener = listener; return stop; });
+    const { adapter } = liveAdapter(liveSnapshot(1));
+    const result = render(<PetWindow api={api} adapter={adapter} />);
+    const sprite = await screen.findByRole("img", { name: "狐仙" });
+    act(() => placementListener({ width: 274, height: 225, sprite: { x: 0, y: 86, width: 128, height: 139 }, bar: { x: 0, y: 0, width: 274, height: 82 } }));
+    expect(sprite.parentElement!.style.left).toBe("0px");
+    expect(sprite.parentElement!.style.top).toBe("86px");
+    expect(screen.getByRole("button", { name: "打开应用额度详情" }).style.top).toBe("0px");
+    result.unmount();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it("recovers fresh quota when a push event was missed", async () => {
+    vi.useFakeTimers();
+    try {
+      const initial = liveSnapshot(4);
+      const fresh = liveSnapshot(5);
+      fresh.deviceUsage!.today.totalTokens = 888;
+      const { adapter } = liveAdapter(initial);
+      vi.mocked(adapter.readCachedSnapshot!).mockResolvedValueOnce(initial).mockResolvedValue(fresh);
+      const result = render(<PetWindow api={makeApi()} adapter={adapter} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(45_000); });
+      expect(screen.getByText("888")).toBeTruthy();
+      expect(adapter.refresh).not.toHaveBeenCalled();
+      result.unmount();
+    } finally { vi.useRealTimers(); }
+  });
 
   it("uses the real schedule and waits for the completed local and account values", async () => {
     const { adapter, listeners, stops } = liveAdapter(liveSnapshot(1));

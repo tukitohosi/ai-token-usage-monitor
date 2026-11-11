@@ -4,7 +4,9 @@
 
 在 Windows 上查看 AI 工具的 Token 用量、模型分布和估算费用，同时查看 Codex 账号剩余额度。支持 Codex、Claude Code、OpenCode、WorkBuddy 和 WorkBuddy AI 的本机记录。
 
-当前发布版本为 **v1.0.0**。[下载安装包](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v1.0.0) · [源码压缩包](https://github.com/tukitohosi/ai-token-usage-monitor/releases/download/v1.0.0/AI-Token-Usage-Monitor-1.0.0-Source.zip) · [使用指南](项目介绍与使用指南.md) · [v1.0.0 升级说明](docs/v1.0.0-升级说明.md)
+当前发布版本为 **v1.0.1**。[下载安装包](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v1.0.1) · [源码压缩包](https://github.com/tukitohosi/ai-token-usage-monitor/releases/download/v1.0.1/AI-Token-Usage-Monitor-1.0.1-Source.zip) · [使用指南](项目介绍与使用指南.md) · [v1.0.1 升级说明](docs/v1.0.1-升级说明.md)
+
+v1.0.1 修复宠物启动白条、贴边回弹和用量条越界，并改进额度到期同步、卡住重试与旧值提示。
 
 ## 主要功能
 
@@ -12,7 +14,7 @@
 - 读取 Codex 普通、Zstandard 压缩与归档日志；已采集的历史不会因源文件移动或消失而自动减少。
 - Claude Code 按回复合并流式用量快照，避免同一回复重复累计；该规则也适用于通过 Claude Code 调用的其他模型。
 - 查看每日趋势和过去 24 小时活动，快速找到用量较高的模型与项目。
-- 本机用量与 Codex 账号数据并行刷新；等两边都返回本轮结果后再结束刷新提示。账号未登录或同步失败时，本机统计仍可用。
+- 本机统计与账号额度分别刷新；账号响应慢或失败时，本机统计仍可更新。
 - 自行填写模型价格，分别设置新输入、缓存读入、缓存写入和输出单价；为选定模型设置高峰时段、倍率、时区和特殊日期。
 - 在模型定价页导出或导入 JSON。导出包含已保存的模型价格和高峰规则；导入按忽略大小写的 modelId 合并到草稿，确认后再保存并重算。
 - 模型定价按所有来源的累计 Token 用量从高到低排列；刷新和重新打开应用时自动核对。输入价格时保持行位置，离开输入框后更新顺序，未保存内容不会被刷新清空。
@@ -27,7 +29,9 @@
 
 ## 安装与使用
 
-1. 在 [v1.0.0 发布页](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v1.0.0) 下载 AI-Token-Usage-Monitor-1.0.0-Setup.exe 并安装。
+正式 Setup.exe 安装包包含 WebView2 完整离线安装器；电脑缺少运行环境时自动补齐，无需自行安装 Node.js、Rust 或 Python。本机用量依赖对应 AI 软件生成的日志；Codex 账号额度仍需本机安装并登录 Codex、联网同步。
+
+1. 在 [v1.0.1 发布页](https://github.com/tukitohosi/ai-token-usage-monitor/releases/tag/v1.0.1) 下载 AI-Token-Usage-Monitor-1.0.1-Setup.exe 并安装。
 2. 首次启动等待本机记录扫描完成；历史较多时可能需要几十秒。
 3. 在“本机活动”查看用量，在“模型定价”填写或导入价格，在“费用”查看估算结果。
 4. 在“桌面宠物”设置中开启内置狐仙地灵，或导入本机自定义宠物。宠物窗口外围的透明区域可点击穿过，拖动时窗口保持置顶且不抢占其他窗口焦点。

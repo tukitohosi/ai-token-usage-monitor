@@ -77,6 +77,7 @@ pub(crate) struct UsageRuntime {
     latest_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
     account_cache: Arc<Mutex<crate::account_sync::AccountCache>>,
     account_task: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    account_attempt_at_ms: Arc<AtomicU64>,
     local_only: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     event_refresh_in_flight: Arc<AtomicBool>,
@@ -111,6 +112,7 @@ impl UsageRuntime {
             latest_snapshot: Arc::new(Mutex::new(None)),
             account_cache: Arc::new(Mutex::new(account_cache)),
             account_task: Arc::new(Mutex::new(None)),
+            account_attempt_at_ms: Arc::new(AtomicU64::new(0)),
             local_only: Arc::new(AtomicBool::new(local_only)),
             app_data_directory: app_data_directory.clone(),
             codex_database_path: app_data_directory.join("usage-index-v1.sqlite3"),
@@ -151,8 +153,12 @@ impl UsageRuntime {
     ) {
         self.publish_local_progress(
             progress,
-            |snapshot| { let _ = app.emit(SNAPSHOT_EVENT, snapshot); },
-            |progress| { let _ = app.emit(PROGRESS_EVENT, progress); },
+            |snapshot| {
+                let _ = app.emit(SNAPSHOT_EVENT, snapshot);
+            },
+            |progress| {
+                let _ = app.emit(PROGRESS_EVENT, progress);
+            },
         );
     }
 
@@ -340,7 +346,7 @@ impl UsageRuntime {
         let fingerprint = credential_fingerprint(&self.codex_home);
         let status = (account.sync.status == "syncing"
             || (fingerprint.is_none() && account.credential_fingerprint.is_none()))
-            .then(|| account.sync.status.clone());
+        .then(|| account.sync.status.clone());
         account.invalidate_credentials(fingerprint);
         if let Some(status) = status {
             account.mark_stale(&status);
@@ -348,8 +354,12 @@ impl UsageRuntime {
     }
 
     pub(crate) fn read_cached_dashboard_snapshot(&self) -> Option<serde_json::Value> {
-        let bytes = fs::read(&self.snapshot_cache_path).ok()?;
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let live = self.latest_snapshot.try_lock().ok().and_then(|latest| latest.clone());
+        let mut value: serde_json::Value = if let Some(snapshot) = &live {
+            serde_json::to_value(snapshot).ok()?
+        } else {
+            serde_json::from_slice(&fs::read(&self.snapshot_cache_path).ok()?).ok()?
+        };
         let object = value.as_object_mut()?;
         // Legacy cache account data has no verifiable ownership/freshness.
         let mut account = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -366,7 +376,14 @@ impl UsageRuntime {
         ] {
             object.insert(key.to_owned(), fields[key].clone());
         }
-        object.insert("revision".into(), 0.into());
+        // Disk revisions belong to the previous process; live revisions preserve event ordering.
+        if live.is_none() {
+            object.insert("revision".into(), 0.into());
+        }
+        object.insert(
+            "refreshSchedule".into(),
+            serde_json::to_value(self.refresh_schedule()).ok()?,
+        );
         Some(value)
     }
 
@@ -890,16 +907,39 @@ impl UsageRuntime {
         }
     }
 
+    fn begin_account_refresh(&self, now: u64) -> Option<Arc<AtomicBool>> {
+        let mut task = self.account_task.lock().unwrap_or_else(|p| p.into_inner());
+        if task.is_some()
+            && now.saturating_sub(self.account_attempt_at_ms.load(Ordering::Acquire)) < 90_000
+        {
+            return None;
+        }
+        if let Some(previous) = task.take() {
+            previous.store(true, Ordering::Release);
+        }
+        self.account_attempt_at_ms.store(now, Ordering::Release);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *task = Some(cancelled.clone());
+        Some(cancelled)
+    }
+
+    fn account_refresh_due(&self, now: u64) -> bool {
+        !self.local_only.load(Ordering::Acquire)
+            && now.saturating_sub(self.account_attempt_at_ms.load(Ordering::Acquire)) >= 15_000
+            && self
+                .account_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .quota_refresh_due(now)
+    }
+
     pub(crate) fn request_account_refresh<R: Runtime>(&self, app: AppHandle<R>) {
         if self.local_only.load(Ordering::Acquire) || self.shutdown.load(Ordering::Acquire) {
             return;
         }
-        let mut task = self.account_task.lock().unwrap_or_else(|p| p.into_inner());
-        if task.is_some() {
+        let Some(cancelled) = self.begin_account_refresh(epoch_milliseconds()) else {
             return;
-        }
-        let cancelled = Arc::new(AtomicBool::new(false));
-        *task = Some(cancelled.clone());
+        };
         let fingerprint = credential_fingerprint(&self.codex_home);
         {
             let mut cache = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -955,6 +995,11 @@ impl UsageRuntime {
         thread::spawn(move || loop {
             if runtime.wait_or_shutdown(Duration::from_secs(1)) {
                 return;
+            }
+            let now = epoch_milliseconds();
+            // Account freshness must not wait for a long local scan or its completion timer.
+            if runtime.account_refresh_due(now) {
+                runtime.request_account_refresh(app.clone());
             }
             let next_refresh_at_ms = runtime.next_refresh_at_ms.load(Ordering::Acquire);
             if next_refresh_at_ms > 0 && epoch_milliseconds() >= next_refresh_at_ms {
@@ -1292,6 +1337,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stuck_account_sync_can_be_replaced_without_waiting_for_local_scan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        runtime
+            .event_refresh_in_flight
+            .store(true, Ordering::Release);
+        let first = runtime.begin_account_refresh(1_000).unwrap();
+        assert!(runtime.begin_account_refresh(2_000).is_none());
+        assert!(!runtime.account_refresh_due(10_000));
+        assert!(runtime.account_refresh_due(16_000));
+        let replacement = runtime.begin_account_refresh(91_000).unwrap();
+        assert!(first.load(Ordering::Acquire));
+        assert!(!replacement.load(Ordering::Acquire));
+        assert!(!Arc::ptr_eq(&first, &replacement));
+    }
+
+    #[test]
+    fn recovery_cache_reads_keep_live_revision_and_current_account_data() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runtime = UsageRuntime::new(
+            temporary.path().join("data"),
+            temporary.path().join("codex"),
+            temporary.path().join("home"),
+        );
+        let mut snapshot = runtime.collect();
+        snapshot.revision = 42;
+        *runtime.latest_snapshot.lock().unwrap() = Some(snapshot);
+        let recovered = runtime.read_cached_dashboard_snapshot().unwrap();
+        assert_eq!(recovered["revision"], 42);
+        assert!(recovered["refreshSchedule"]["nextRefreshAtMs"]
+            .as_u64()
+            .is_some());
+    }
+
+    #[test]
     fn complete_progress_observes_the_committed_snapshot_without_account_or_snapshot_locks() {
         let temporary = tempfile::tempdir().unwrap();
         let runtime = UsageRuntime::new(
@@ -1307,13 +1391,20 @@ mod tests {
             if progress.phase != "complete" {
                 return;
             }
-            let latest = runtime.latest_snapshot.try_lock().expect("snapshot lock released");
+            let latest = runtime
+                .latest_snapshot
+                .try_lock()
+                .expect("snapshot lock released");
             let latest = latest.as_ref().expect("latest snapshot committed");
-            assert!(runtime.account_cache.try_lock().is_ok(), "account lock released");
+            assert!(
+                runtime.account_cache.try_lock().is_ok(),
+                "account lock released"
+            );
             assert_eq!(runtime.local_generation.load(Ordering::Acquire), 1);
             let cached: serde_json::Value = serde_json::from_slice(
                 &fs::read(&runtime.snapshot_cache_path).expect("snapshot persisted"),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(cached["revision"], latest.revision);
             assert_eq!(cached["refreshProgress"]["phase"], "complete");
             let cached = runtime.read_cached_dashboard_snapshot().unwrap();
@@ -1360,7 +1451,9 @@ mod tests {
                             }
                         })
                     }));
-                    receive_attempt.recv_timeout(Duration::from_secs(5)).unwrap();
+                    receive_attempt
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
                 },
                 |progress| {
                     assert_eq!(progress.phase, "complete");
@@ -1443,13 +1536,19 @@ mod tests {
         let schedule = runtime.reset_refresh_schedule();
         let account = runtime.cache_account_snapshot().unwrap();
         assert_eq!(account.revision, local.revision + 1);
-        let account_deadline = account.refresh_schedule.unwrap().next_refresh_at_ms.unwrap();
+        let account_deadline = account
+            .refresh_schedule
+            .unwrap()
+            .next_refresh_at_ms
+            .unwrap();
         assert_eq!(Some(account_deadline), schedule.next_refresh_at_ms);
         assert!(account_deadline >= before_account + 60_000);
-        let cached: serde_json::Value = serde_json::from_slice(
-            &fs::read(&runtime.snapshot_cache_path).unwrap(),
-        ).unwrap();
-        assert_eq!(cached["refreshSchedule"]["nextRefreshAtMs"], account_deadline);
+        let cached: serde_json::Value =
+            serde_json::from_slice(&fs::read(&runtime.snapshot_cache_path).unwrap()).unwrap();
+        assert_eq!(
+            cached["refreshSchedule"]["nextRefreshAtMs"],
+            account_deadline
+        );
     }
 
     #[test]

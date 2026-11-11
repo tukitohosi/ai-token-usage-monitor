@@ -18,15 +18,17 @@ export function buildPetUsageView(snapshot: DashboardSnapshot | null, now: numbe
   const costLabel = !cost ? "费用 —" : costs.length ? costs.join(" · ") : "未定价";
   const unpriced = cost?.unpricedTokens ?? 0;
   const quotaTime = snapshot?.accountSync?.quota.lastSuccessfulAt ?? snapshot?.fetchedAt ?? null;
-  const stale = !!snapshot?.accountSync?.quota.stale || isSnapshotStale(quotaTime, now);
+  let stale = !!snapshot?.accountSync?.quota.stale || isSnapshotStale(quotaTime, now);
   const quotas = selectOverviewQuotas(snapshot?.quotaWindows ?? []).map(({ quota, title }) => {
     const presentation = getQuotaPresentation(quota);
     const resetMs = toEpochMilliseconds(quota.resetsAt);
+    const expired = resetMs !== null && resetMs <= now;
+    stale ||= expired;
     return {
       key: quota.key, title,
       label: title === "Codex 5 小时" ? "5h" : title === "Codex 7 天" ? "7天" : "储备",
       remaining: presentation.remainingPercent,
-      remainingLabel: formatPercent(presentation.remainingPercent), tone: presentation.tone,
+      remainingLabel: expired ? "待更新" : formatPercent(presentation.remainingPercent), tone: expired ? "normal" : presentation.tone, expired,
       resetLabel: resetMs !== null && resetMs <= now ? "等待更新" : formatCountdown(quota.resetsAt, now),
       resetDate: formatDateTime(quota.resetsAt),
     };

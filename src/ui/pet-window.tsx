@@ -28,7 +28,20 @@ export function PetWindow({ api = petApi, adapter = dashboardAdapter }: { api?: 
   const spriteRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLButtonElement>(null);
   const lastLayout = useRef("");
+  const [placement, setPlacement] = useState<PetLayout | null>(null);
+  const placementRevision = useRef(0);
   const drag = useRef<{ pointer: number; ready: Promise<void>; frame: number | null; finishing: boolean; screenX: number; screenY: number } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
+    void api.subscribeLayout?.(next => {
+      if (!cancelled) { placementRevision.current += 1; setPlacement(next); }
+    }).then(stop => { if (cancelled) stop(); else unsubscribe = stop; }).catch(reason => {
+      if (!cancelled) setError(String(reason instanceof Error ? reason.message : reason));
+    });
+    return () => { cancelled = true; unsubscribe?.(); };
+  }, [api]);
 
   useEffect(() => {
     document.documentElement.classList.add("pet-window-document");
@@ -61,9 +74,11 @@ export function PetWindow({ api = petApi, adapter = dashboardAdapter }: { api?: 
   useEffect(() => {
     let cancelled = false;
     const stops: Array<() => void> = [];
+    let lastSnapshotAt = Date.now();
     const retain = (stop: () => void) => { if (cancelled) stop(); else stops.push(stop); };
     const applySnapshot = (next: DashboardSnapshot, cached = false) => {
       if (cancelled) return;
+      lastSnapshotAt = Date.now();
       setUsageState(current => {
         if (current.snapshot && (cached || newestPetSnapshot(current.snapshot, next) !== next)) return current;
         const active = !!next.refreshProgress && !["idle", "complete"].includes(next.refreshProgress.phase);
@@ -72,6 +87,7 @@ export function PetWindow({ api = petApi, adapter = dashboardAdapter }: { api?: 
         return {
           ...current,
           snapshot: next,
+          channelFailed: cached ? current.channelFailed : false,
           schedule: cached ? current.schedule ?? next.refreshSchedule ?? null : next.refreshSchedule ?? null,
           localRefreshing: cached ? current.localRefreshing || active : localChanged ? active : current.localRefreshing,
         };
@@ -104,7 +120,15 @@ export function PetWindow({ api = petApi, adapter = dashboardAdapter }: { api?: 
         if (cached) applySnapshot(cached, true);
       } catch (reason) { if (!cancelled) setError(String(reason instanceof Error ? reason.message : reason)); }
     })();
-    return () => { cancelled = true; stops.forEach(stop => stop()); };
+    let checking = false;
+    const recovery = window.setInterval(() => {
+      if (cancelled || checking || !adapter.readCachedSnapshot || Date.now() - lastSnapshotAt < 45_000) return;
+      checking = true;
+      void adapter.readCachedSnapshot().then(next => { if (next) applySnapshot(next); })
+        .catch(() => { if (!cancelled) setUsageState(current => ({ ...current, channelFailed: true, localRefreshing: false })); })
+        .finally(() => { checking = false; });
+    }, 15_000);
+    return () => { cancelled = true; clearInterval(recovery); stops.forEach(stop => stop()); };
   }, [adapter]);
 
   const snapshot = usageState.snapshot;
@@ -124,16 +148,28 @@ export function PetWindow({ api = petApi, adapter = dashboardAdapter }: { api?: 
       const bar = barRef.current?.getBoundingClientRect();
       if (!root || !sprite || !bar || !root.width || !root.height) return;
       const rect = (box: DOMRect) => ({ x: box.x - root.x, y: box.y - root.y, width: box.width, height: box.height });
-      const layout: PetLayout = { width: root.width, height: root.height, sprite: rect(sprite), bar: rect(bar) };
-      const key = JSON.stringify(layout);
+      const spriteRect = rect(sprite);
+      const barRect = rect(bar);
+      const layout: PetLayout = {
+        width: Math.max(root.width, spriteRect.x + spriteRect.width, barRect.x + barRect.width),
+        height: Math.max(root.height, spriteRect.y + spriteRect.height, barRect.y + barRect.height),
+        sprite: spriteRect, bar: barRect,
+      };
+      // Position comes from native layout events; only content dimensions need remeasurement.
+      const key = JSON.stringify([sprite.width, sprite.height, bar.width, bar.height]);
       if (lastLayout.current === key) return;
       lastLayout.current = key;
-      void api.setLayout(layout).catch(reason => { setError(String(reason instanceof Error ? reason.message : reason)); });
+      const revision = placementRevision.current;
+      void api.setLayout(layout).then(next => {
+        if (next && revision === placementRevision.current) { placementRevision.current += 1; setPlacement(next); }
+      }).catch(reason => { lastLayout.current = ""; setError(String(reason instanceof Error ? reason.message : reason)); });
     };
     measure();
     if (!window.ResizeObserver || !rootRef.current) return;
     const observer = new ResizeObserver(measure);
     observer.observe(rootRef.current);
+    if (spriteRef.current) observer.observe(spriteRef.current);
+    if (barRef.current) observer.observe(barRef.current);
     return () => observer.disconnect();
   }, [api, state.preferences.size, selectedPet?.id, view.quotas.length, view.quotaStatus, error]);
 
@@ -184,15 +220,15 @@ export function PetWindow({ api = petApi, adapter = dashboardAdapter }: { api?: 
     void current.ready.then(() => api.dragUpdate()).then(() => api.dragEnd()).catch(failDrag).finally(() => { if (drag.current === current) drag.current = null; });
   };
 
-  return <main ref={rootRef} className="pet-window" data-pet-theme={theme} aria-label="AI Token 桌面宠物">
-    <div ref={spriteRef} className="pet-window__sprite-handle" title="拖动宠物可移动宠物和用量条" onPointerDown={startDrag} onPointerMove={updateDrag} onPointerUp={endDrag} onPointerCancel={endDrag} onLostPointerCapture={endDrag} onPointerEnter={() => setHover(true)} onPointerLeave={() => setHover(false)}>
+  return <main ref={rootRef} className="pet-window" style={placement ? { width: placement.width, height: placement.height } : undefined} data-pet-theme={theme} aria-label="AI Token 桌面宠物">
+    <div ref={spriteRef} className="pet-window__sprite-handle" style={placement ? { position: "absolute", left: placement.sprite.x, top: placement.sprite.y } : undefined} title="拖动宠物可移动宠物和用量条" onPointerDown={startDrag} onPointerMove={updateDrag} onPointerUp={endDrag} onPointerCancel={endDrag} onLostPointerCapture={endDrag} onPointerEnter={() => setHover(true)} onPointerLeave={() => setHover(false)}>
       {selectedPet ? <PetSprite url={petAssetUrl(selectedPet.spritesheetPath)} version={selectedPet.spriteVersionNumber} size={state.preferences.size} animation={animation} name={selectedPet.displayName} /> : <div className="pet-window__loading-sprite" style={{ width: state.preferences.size, height: state.preferences.size * 208 / 192 }} />}
     </div>
-    <button ref={barRef} type="button" className="pet-usage-bar" aria-label="打开应用额度详情" title={`${view.details}\n${refreshLabel}`} onClick={() => void api.showDashboard().catch(failDrag)}>
+    <button ref={barRef} type="button" className="pet-usage-bar" style={placement ? { position: "absolute", left: placement.bar.x, top: placement.bar.y } : undefined} aria-label="打开应用额度详情" title={`${view.details}\n${refreshLabel}`} onClick={() => void api.showDashboard().catch(failDrag)}>
       <span className="pet-usage-bar__totals"><span className="pet-usage-bar__tokens">今日 <strong>{view.tokensLabel}</strong> Token</span><span className="pet-usage-bar__cost">{view.unpriced && view.costLabel !== "未定价" ? "≥ " : ""}{view.costLabel}</span></span>
       <span className="pet-usage-bar__refresh" aria-label="自动更新状态" data-interrupted={usageState.channelFailed || undefined}>{refreshLabel}</span>
       {view.quotas.map(quota => <span className="pet-usage-bar__quota" key={quota.key} data-tone={quota.tone} aria-label={`${quota.title} 剩余 ${quota.remainingLabel}，${quota.resetLabel}`}>
-        <span className="pet-usage-bar__quota-label">{quota.label}</span><span className="pet-usage-bar__remaining">剩余 {quota.remainingLabel}</span><span className="pet-usage-bar__track"><span style={{ width: `${quota.remaining}%` }} /></span><span className="pet-usage-bar__reset">{quota.resetLabel}</span>
+        <span className="pet-usage-bar__quota-label">{quota.label}</span><span className="pet-usage-bar__remaining">剩余 {quota.remainingLabel}</span><span className="pet-usage-bar__track"><span style={{ width: `${quota.expired ? 0 : quota.remaining}%` }} /></span><span className="pet-usage-bar__reset">{quota.resetLabel}</span>
       </span>)}
       {(error || view.quotaStatus) && <span className="pet-usage-bar__status" data-stale={view.stale || undefined}>{error || view.quotaStatus}</span>}
     </button>

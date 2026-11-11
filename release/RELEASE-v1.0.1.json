@@ -1,0 +1,19 @@
+{
+  "version": "1.0.1",
+  "installer": "AI-Token-Usage-Monitor-1.0.1-Setup.exe",
+  "installerBytes": 224210570,
+  "sha256": "a6035f776fe39ea291d79f8edb2dee8dcf3a0c6c11260211ccba8c9038b6c00a",
+  "architecture": "Windows x64 application; NSIS bootstrapper",
+  "webviewInstallMode": "offlineInstaller",
+  "webviewInstallerBytes": 214927568,
+  "webviewInstallerSha256": "2688308af55753c62fda4e8140024e230c1ffc16b7c091b25889572f38dff6e8",
+  "webviewPublisher": "Microsoft Corporation",
+  "webviewAuthenticode": "Valid",
+  "requiresDeveloperTools": false,
+  "requiresCodexSignInForAccountLimits": true,
+  "frontendTests": 198,
+  "rustTests": 131,
+  "liveAccountRead": "passed",
+  "cleanWindowsInstallTested": false,
+  "createdAt": "2026-11-11T05:20:05.508Z"
+}

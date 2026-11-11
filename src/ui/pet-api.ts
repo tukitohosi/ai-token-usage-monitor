@@ -18,7 +18,8 @@ export interface PetApi {
   resetPosition(): Promise<PetState>;
   readAppTheme(): Promise<ThemePreference>;
   subscribeAppTheme(listener: (theme: ThemePreference) => void): Promise<Unsubscribe>;
-  setLayout(layout: PetLayout): Promise<void>;
+  subscribeLayout?(listener: (layout: PetLayout) => void): Promise<Unsubscribe>;
+  setLayout(layout: PetLayout): Promise<PetLayout | void>;
   dragStart(clientX: number, clientY: number): Promise<void>;
   dragUpdate(): Promise<void>;
   dragEnd(): Promise<void>;
@@ -47,7 +48,8 @@ export const petApi: PetApi = {
     return value.themePreference;
   },
   async subscribeAppTheme(listener) { return isTauri() ? listen<ThemePreference>("pet://app-theme", event => listener(event.payload)) : () => {}; },
-  async setLayout(layout) { if (isTauri()) await invoke("set_pet_layout", { layout }); },
+  async subscribeLayout(listener) { return isTauri() ? listen<PetLayout>("pet://layout", event => listener(event.payload)) : () => {}; },
+  async setLayout(layout) { if (isTauri()) return invoke<PetLayout>("set_pet_layout", { layout }); },
   async dragStart(clientX, clientY) { if (isTauri()) await invoke("pet_drag_start", { clientX, clientY }); },
   async dragUpdate() { if (isTauri()) await invoke("pet_drag_update"); },
   async dragEnd() { if (isTauri()) await invoke("pet_drag_end"); },

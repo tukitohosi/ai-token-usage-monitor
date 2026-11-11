@@ -22,3 +22,7 @@ coverage/
 *.key
 auth.json
 credentials.json
+
+# Local Codex project settings and generated source archives.
+.codex/
+/release/*.zip

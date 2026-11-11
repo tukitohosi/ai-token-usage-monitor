@@ -1,6 +1,6 @@
 html.pet-window-document, html:has(.pet-window), body:has(.pet-window) { min-width:0; min-height:0; width:100%; height:100%; overflow:hidden; background:transparent!important; }
 body:has(.pet-window) #root { min-width:0; min-height:0; width:100%; height:100%; background:transparent; }
-.pet-window { width:274px; display:flex; flex-direction:column; align-items:center; gap:4px; padding:0; margin:0; user-select:none; -webkit-user-select:none; font-family:"Segoe UI","Microsoft YaHei",sans-serif; --pet-bg:#18221e; --pet-border:#53665b; --pet-text:#d8ece2; --pet-soft:#b0c5bd; --pet-track:#35423c; --pet-progress:#a4dfbe; --pet-amber:#ecc487; --pet-red:#ef9a9f; }
+.pet-window { position:relative; width:274px; display:flex; flex-direction:column; align-items:center; gap:4px; padding:0; margin:0; user-select:none; -webkit-user-select:none; font-family:"Segoe UI","Microsoft YaHei",sans-serif; --pet-bg:#18221e; --pet-border:#53665b; --pet-text:#d8ece2; --pet-soft:#b0c5bd; --pet-track:#35423c; --pet-progress:#a4dfbe; --pet-amber:#ecc487; --pet-red:#ef9a9f; }
 .pet-window[data-pet-theme="light"] { --pet-bg:#f3f8f3; --pet-border:#a2b7a8; --pet-text:#233e33; --pet-soft:#49665a; --pet-track:#d7e4da; --pet-progress:#478b66; --pet-amber:#a86b23; --pet-red:#b34f57; }
 .pet-window__sprite-handle { flex:none; touch-action:none; cursor:grab; }
 .pet-window__sprite-handle:active { cursor:grabbing; }

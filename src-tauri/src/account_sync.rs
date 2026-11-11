@@ -101,8 +101,29 @@ impl AccountCache {
         }
     }
 
+    pub(crate) fn quota_refresh_due(&self, now_ms: u64) -> bool {
+        let last = self
+            .sync
+            .quota
+            .last_successful_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp_millis().max(0) as u64);
+        self.sync.quota.stale
+            || last.map_or(true, |last| now_ms.saturating_sub(last) >= 60_000)
+            || self
+                .quota_windows
+                .iter()
+                .any(|quota| quota_expired(quota, now_ms))
+    }
+
     pub(crate) fn apply(&self, snapshot: &mut DashboardSnapshot) {
-        snapshot.account_sync = Some(self.sync.clone());
+        let mut sync = self.sync.clone();
+        sync.quota.stale |= self
+            .quota_windows
+            .iter()
+            .any(|quota| quota_expired(quota, chrono::Utc::now().timestamp_millis().max(0) as u64));
+        snapshot.account_sync = Some(sync);
         snapshot.quota_windows = self.quota_windows.clone();
         snapshot.reset_credits = self.reset_credits.clone();
         snapshot.account_usage = self.account_usage.clone();
@@ -113,6 +134,15 @@ impl AccountCache {
                 self.diagnostics.as_ref().map_or(0, |d| d.duration_ms);
         }
     }
+}
+
+fn quota_expired(quota: &NormalizedQuotaWindow, now_ms: u64) -> bool {
+    let reset_ms = if quota.resets_at < 1_000_000_000_000. {
+        quota.resets_at * 1_000.
+    } else {
+        quota.resets_at
+    };
+    reset_ms.is_finite() && reset_ms > 0. && reset_ms <= now_ms as f64
 }
 
 #[cfg(test)]
@@ -130,6 +160,37 @@ mod tests {
         });
         snapshot
     }
+    #[test]
+    fn expired_quota_is_stale_until_a_new_server_window_arrives() {
+        let now = chrono::Utc::now();
+        let now_ms = now.timestamp_millis().max(0) as u64;
+        let mut snapshot = successful();
+        snapshot.fetched_at = Some(now.to_rfc3339());
+        snapshot.quota_windows = vec![serde_json::from_value(serde_json::json!({
+            "usedPercent": 95, "remainingPercent": 5, "windowDurationMins": 300,
+            "resetsAt": now.timestamp() - 1, "key": "codex:primary", "limitId": "codex",
+            "limitName": null, "normalModelSlug": null, "lane": "primary", "label": "5 小时",
+            "credits": null, "planType": "plus", "reachedType": null
+        }))
+        .unwrap()];
+        let mut cache = AccountCache::default();
+        cache.merge(&snapshot);
+        assert!(cache.quota_refresh_due(now_ms));
+        let mut displayed = successful();
+        cache.apply(&mut displayed);
+        assert!(displayed.account_sync.as_ref().unwrap().quota.stale);
+        assert_eq!(displayed.quota_windows[0].remaining_percent, 5.);
+        snapshot.quota_windows[0].used_percent = 0.;
+        snapshot.quota_windows[0].remaining_percent = 100.;
+        snapshot.quota_windows[0].resets_at = (now.timestamp() + 10_800) as f64;
+        cache.merge(&snapshot);
+        cache.apply(&mut displayed);
+        assert!(!cache.quota_refresh_due(now_ms));
+        assert!(!displayed.account_sync.as_ref().unwrap().quota.stale);
+        assert_eq!(displayed.quota_windows[0].remaining_percent, 100.);
+        assert!(cache.quota_refresh_due(now_ms + 60_001));
+    }
+
     #[test]
     fn account_completion_cannot_replace_newer_local_data() {
         let mut cache = AccountCache::default();

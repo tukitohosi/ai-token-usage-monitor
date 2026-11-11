@@ -1,20 +1,23 @@
 use crate::pets::{PetPosition, PetRuntime, PetState};
-use serde::Deserialize;
-use std::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use tauri::{
-    AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, Window,
 };
 
 pub(crate) const PET_WINDOW: &str = "pet";
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct Rect {
     pub x: f64,
     pub y: f64,
     pub width: f64,
     pub height: f64,
 }
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct PetLayout {
     pub width: f64,
     pub height: f64,
@@ -44,12 +47,13 @@ impl Default for PetLayout {
 #[derive(Clone, Copy)]
 struct Drag {
     cursor: PhysicalPosition<f64>,
-    position: PhysicalPosition<i32>,
+    sprite_position: PhysicalPosition<f64>,
 }
 #[derive(Default)]
 pub(crate) struct PetWindowRuntime {
     layout: Mutex<PetLayout>,
     drag: Mutex<Option<Drag>>,
+    ready: AtomicBool,
 }
 
 fn require_pet(window: &Window) -> Result<(), String> {
@@ -95,22 +99,19 @@ pub(crate) fn apply(app: &AppHandle, state: &PetState) -> Result<(), String> {
         .build()
         .map_err(window_error)?,
     };
-    let position = state
-        .preferences
-        .position
-        .map(|p| PhysicalPosition::new(p.x, p.y))
-        .unwrap_or_else(|| default_position(&window));
-    position_on_top(&window.as_ref().window(), Some(position))?;
-    clamp_window(&window)?;
-    if let Some(runtime) = app.try_state::<PetWindowRuntime>() {
-        update_region(
-            &window,
-            *runtime.layout.lock().unwrap_or_else(|p| p.into_inner()),
-        )?;
+    let runtime = app.state::<PetWindowRuntime>();
+    if !runtime.ready.load(Ordering::Acquire) {
+        let position = state
+            .preferences
+            .position
+            .map(|p| PhysicalPosition::new(p.x, p.y))
+            .unwrap_or_else(|| default_position(&window));
+        position_on_top(&window.as_ref().window(), Some(position))?;
+        return configure_native(&window);
     }
+    let layout = *runtime.layout.lock().unwrap_or_else(|p| p.into_inner());
+    arrange_window(&window, &runtime, layout, None)?;
     window.show().map_err(window_error)?;
-    // Tao may rewrite extended styles when showing a window. Apply the final
-    // tool-window/no-activation styles after every show (initial or restored).
     configure_native(&window)
 }
 
@@ -129,49 +130,130 @@ fn default_position(window: &WebviewWindow) -> PhysicalPosition<i32> {
     }
 }
 
-fn clamp_window(window: &WebviewWindow) -> Result<PetPosition, String> {
+// Clamp the sprite and the attached bar independently, so the bar never pushes the pet inward.
+fn arrange_layout(
+    sprite_position: PhysicalPosition<f64>,
+    measured: PetLayout,
+    area: Rect,
+    scale: f64,
+) -> (PetLayout, PhysicalPosition<i32>) {
+    let sw = measured.sprite.width * scale;
+    let sh = measured.sprite.height * scale;
+    let bw = measured.bar.width * scale;
+    let bh = measured.bar.height * scale;
+    let clamp = |value: f64, origin: f64, extent: f64, size: f64| {
+        value.clamp(origin, origin + (extent - size).max(0.))
+    };
+    let sx = clamp(sprite_position.x, area.x, area.width, sw);
+    let sy = clamp(sprite_position.y, area.y, area.height, sh);
+    let bx = clamp(sx + (sw - bw) / 2., area.x, area.width, bw);
+    let below = sy + sh + 4. * scale;
+    let above = sy - bh - 4. * scale;
+    let by = if below + bh > area.y + area.height && above >= area.y {
+        above
+    } else {
+        clamp(below, area.y, area.height, bh)
+    };
+    let position = PhysicalPosition::new(sx.min(bx).floor() as i32, sy.min(by).floor() as i32);
+    let rect = |x: f64, y: f64, width: f64, height: f64| Rect {
+        x: (x - position.x as f64) / scale,
+        y: (y - position.y as f64) / scale,
+        width: width / scale,
+        height: height / scale,
+    };
+    (
+        PetLayout {
+            width: ((sx + sw).max(bx + bw) - position.x as f64) / scale,
+            height: ((sy + sh).max(by + bh) - position.y as f64) / scale,
+            sprite: rect(sx, sy, sw, sh),
+            bar: rect(bx, by, bw, bh),
+        },
+        position,
+    )
+}
+
+fn arrange_window(
+    window: &WebviewWindow,
+    runtime: &PetWindowRuntime,
+    measured: PetLayout,
+    sprite_position: Option<PhysicalPosition<f64>>,
+) -> Result<PetLayout, String> {
+    let previous = *runtime.layout.lock().unwrap_or_else(|p| p.into_inner());
     let position = window.outer_position().map_err(window_error)?;
-    let size = window.outer_size().map_err(window_error)?;
+    let scale = window.scale_factor().map_err(window_error)?;
+    let anchor = sprite_position.unwrap_or_else(|| {
+        PhysicalPosition::new(
+            position.x as f64 + previous.sprite.x * scale,
+            position.y as f64 + previous.sprite.y * scale,
+        )
+    });
     let center = (
-        position.x as f64 + size.width as f64 / 2.,
-        position.y as f64 + size.height as f64 / 2.,
+        anchor.x + measured.sprite.width * scale / 2.,
+        anchor.y + measured.sprite.height * scale / 2.,
     );
     let monitor = window
         .monitor_from_point(center.0, center.1)
         .ok()
         .flatten()
+        .or_else(|| window.current_monitor().ok().flatten())
         .or_else(|| window.primary_monitor().ok().flatten());
-    let corrected = if let Some(m) = monitor {
-        let a = m.work_area();
-        PhysicalPosition::new(
-            position.x.clamp(
-                a.position.x,
-                a.position.x + (a.size.width.saturating_sub(size.width)) as i32,
-            ),
-            position.y.clamp(
-                a.position.y,
-                a.position.y + (a.size.height.saturating_sub(size.height)) as i32,
-            ),
+    let (layout, position) = if let Some(monitor) = monitor {
+        let area = monitor.work_area();
+        arrange_layout(
+            anchor,
+            measured,
+            Rect {
+                x: area.position.x as f64,
+                y: area.position.y as f64,
+                width: area.size.width as f64,
+                height: area.size.height as f64,
+            },
+            scale,
         )
     } else {
-        position
+        (measured, position)
     };
-    if position != corrected {
-        position_on_top(&window.as_ref().window(), Some(corrected))?;
+    *runtime.layout.lock().unwrap_or_else(|p| p.into_inner()) = layout;
+    if previous != layout || !runtime.ready.load(Ordering::Acquire) {
+        window
+            .set_size(PhysicalSize::new(
+                (layout.width * scale).ceil() as u32,
+                (layout.height * scale).ceil() as u32,
+            ))
+            .map_err(window_error)?;
+        configure_native(window)?;
+        update_region(window, layout)?;
+        window.emit("pet://layout", layout).map_err(window_error)?;
     }
-    Ok(PetPosition {
-        x: corrected.x,
-        y: corrected.y,
-    })
+    position_on_top(&window.as_ref().window(), Some(position))?;
+    Ok(layout)
+}
+
+fn save_window_position(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
+    let position = window.outer_position().map_err(window_error)?;
+    let scale = window.scale_factor().map_err(window_error)?;
+    let layout = *app
+        .state::<PetWindowRuntime>()
+        .layout
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let initial = PetLayout::default();
+    if let Some(pets) = app.try_state::<PetRuntime>() {
+        pets.save_position(PetPosition {
+            x: (position.x as f64 + (layout.sprite.x - initial.sprite.x) * scale).round() as i32,
+            y: (position.y as f64 + (layout.sprite.y - initial.sprite.y) * scale).round() as i32,
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn reset_position(app: &AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(PET_WINDOW) {
         position_on_top(&window.as_ref().window(), Some(default_position(&window)))?;
-        let position = clamp_window(&window)?;
-        if let Some(runtime) = app.try_state::<PetRuntime>() {
-            runtime.save_position(position)?;
-        }
+        let runtime = app.state::<PetWindowRuntime>();
+        let layout = *runtime.layout.lock().unwrap_or_else(|p| p.into_inner());
+        arrange_window(&window, &runtime, layout, None)?;
+        save_window_position(app, &window)?;
     }
     Ok(())
 }
@@ -208,29 +290,30 @@ pub(crate) async fn set_pet_layout(
     window: Window,
     layout: PetLayout,
     runtime: tauri::State<'_, PetWindowRuntime>,
-) -> Result<(), String> {
+) -> Result<PetLayout, String> {
     require_pet(&window)?;
     if !valid_layout(layout) {
         return Err("宠物窗口布局无效。".into());
     }
-    *runtime.layout.lock().unwrap_or_else(|p| p.into_inner()) = layout;
     let window = app
         .get_webview_window(PET_WINDOW)
         .ok_or("宠物窗口尚未准备好。")?;
-    let scale = window.scale_factor().map_err(window_error)?;
-    window
-        .set_size(PhysicalSize::new(
-            (layout.width * scale).ceil() as u32,
-            (layout.height * scale).ceil() as u32,
-        ))
-        .map_err(window_error)?;
-    update_region(&window, layout)?;
-    configure_native(&window)?;
-    let position = clamp_window(&window)?;
-    if let Some(pets) = app.try_state::<PetRuntime>() {
-        pets.save_position(position)?;
+    let layout = arrange_window(&window, &runtime, layout, None)?;
+    runtime.ready.store(true, Ordering::Release);
+    if app.state::<PetRuntime>().state().preferences.enabled {
+        window.show().map_err(window_error)?;
+        configure_native(&window)?;
+        update_region(&window, layout)?;
     }
-    Ok(())
+    if runtime
+        .drag
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_none()
+    {
+        save_window_position(&app, &window)?;
+    }
+    Ok(layout)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -262,7 +345,13 @@ pub(crate) fn pet_drag_start(
         position.y as f64 + client_y * scale,
     );
     position_on_top(&window, None)?;
-    *runtime.drag.lock().unwrap_or_else(|p| p.into_inner()) = Some(Drag { cursor, position });
+    *runtime.drag.lock().unwrap_or_else(|p| p.into_inner()) = Some(Drag {
+        cursor,
+        sprite_position: PhysicalPosition::new(
+            position.x as f64 + sprite.x * scale,
+            position.y as f64 + sprite.y * scale,
+        ),
+    });
     Ok(())
 }
 #[tauri::command]
@@ -275,11 +364,17 @@ pub(crate) fn pet_drag_update(
     let drag = *runtime.drag.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(drag) = drag {
         let cursor = app.cursor_position().map_err(window_error)?;
-        position_on_top(
+        let window = app
+            .get_webview_window(PET_WINDOW)
+            .ok_or("宠物窗口尚未准备好。")?;
+        let layout = *runtime.layout.lock().unwrap_or_else(|p| p.into_inner());
+        arrange_window(
             &window,
+            &runtime,
+            layout,
             Some(PhysicalPosition::new(
-                drag.position.x + (cursor.x - drag.cursor.x).round() as i32,
-                drag.position.y + (cursor.y - drag.cursor.y).round() as i32,
+                drag.sprite_position.x + cursor.x - drag.cursor.x,
+                drag.sprite_position.y + cursor.y - drag.cursor.y,
             )),
         )?;
     }
@@ -295,9 +390,8 @@ pub(crate) fn pet_drag_end(
     *runtime.drag.lock().unwrap_or_else(|p| p.into_inner()) = None;
     position_on_top(&window, None)?;
     if let Some(window) = app.get_webview_window(PET_WINDOW) {
-        let position = clamp_window(&window)?;
+        save_window_position(&app, &window)?;
         if let Some(pets) = app.try_state::<PetRuntime>() {
-            pets.save_position(position)?;
             pets.publish(&app);
         }
     }
@@ -329,15 +423,10 @@ pub(crate) fn handle_window_event(window: &Window, event: &tauri::WindowEvent) {
                     handle.try_state::<PetWindowRuntime>(),
                 ) {
                     let layout = *runtime.layout.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Ok(scale) = window.scale_factor() {
-                        let _ = window.set_size(PhysicalSize::new(
-                            (layout.width * scale).ceil() as u32,
-                            (layout.height * scale).ceil() as u32,
-                        ));
+                    if let Ok(layout) = arrange_window(&window, &runtime, layout, None) {
+                        let _ = configure_native(&window);
+                        let _ = update_region(&window, layout);
                     }
-                    let _ = update_region(&window, layout);
-                    let _ = configure_native(&window);
-                    let _ = clamp_window(&window);
                 }
             });
         }
@@ -371,22 +460,48 @@ fn on_ui(
 #[cfg(windows)]
 fn configure_native_on_ui(window: &WebviewWindow) -> Result<(), String> {
     use windows::Win32::UI::Shell::SetWindowSubclass;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    };
     let hwnd = window.hwnd().map_err(window_error)?;
+    remove_native_frame(hwnd)?;
     unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(
-            hwnd,
-            GWL_EXSTYLE,
-            style | WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize,
-        );
         if !SetWindowSubclass(hwnd, Some(no_activate), 0x41545045, 0).as_bool() {
             return Err("无法设置宠物窗口的非激活交互。".into());
         }
     }
     topmost_on_ui(hwnd, None)
+}
+
+#[cfg(windows)]
+fn remove_native_frame(hwnd: windows::Win32::Foundation::HWND) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION,
+        WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_WINDOWEDGE, WS_THICKFRAME,
+    };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let extended = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        // Tao keeps WS_CAPTION on undecorated top-level windows; tool-window changes can repaint it.
+        let borderless = style & !((WS_CAPTION | WS_THICKFRAME).0 as isize);
+        let tool = (extended
+            & !((WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME).0 as isize))
+            | (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0 as isize;
+        if style != borderless || extended != tool {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, borderless);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, tool);
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .map_err(|_| "无法移除宠物窗口标题栏。".to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -521,6 +636,62 @@ mod tests {
         assert!(!valid_layout(layout));
     }
 
+    #[test]
+    fn placement_keeps_sprite_at_all_edges_and_bar_inside_work_area() {
+        let measured = PetLayout::default();
+        let area = Rect {
+            x: -1920.,
+            y: -200.,
+            width: 1920.,
+            height: 1080.,
+        };
+        for scale in [1., 1.25, 1.5, 2.] {
+            let sw = measured.sprite.width * scale;
+            let sh = measured.sprite.height * scale;
+            for x in [area.x, area.x + 600., area.x + area.width - sw] {
+                for y in [area.y, area.y + 250., area.y + area.height - sh] {
+                    let (layout, position) =
+                        arrange_layout(PhysicalPosition::new(x, y), measured, area, scale);
+                    assert!((position.x as f64 + layout.sprite.x * scale - x).abs() < 0.001);
+                    assert!((position.y as f64 + layout.sprite.y * scale - y).abs() < 0.001);
+                    assert!(valid_layout(layout));
+                    for rect in [layout.sprite, layout.bar] {
+                        let left = position.x as f64 + rect.x * scale;
+                        let top = position.y as f64 + rect.y * scale;
+                        assert!(left >= area.x && top >= area.y);
+                        assert!(left + rect.width * scale <= area.x + area.width + 0.001);
+                        assert!(top + rect.height * scale <= area.y + area.height + 0.001);
+                    }
+                    if y == area.y + area.height - sh {
+                        assert!(layout.bar.y < layout.sprite.y);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn placement_recovers_a_pet_from_a_disconnected_monitor() {
+        let area = Rect {
+            x: 0.,
+            y: 0.,
+            width: 1920.,
+            height: 1040.,
+        };
+        let (layout, position) = arrange_layout(
+            PhysicalPosition::new(-4000., 3000.),
+            PetLayout::default(),
+            area,
+            1.,
+        );
+        assert_eq!(position.x as f64 + layout.sprite.x, 0.);
+        assert_eq!(
+            position.y as f64 + layout.sprite.y + layout.sprite.height,
+            1040.
+        );
+        assert!(layout.bar.y < layout.sprite.y);
+    }
+
     #[cfg(windows)]
     #[test]
     fn native_moves_restore_topmost_without_activating_or_resizing() {
@@ -529,10 +700,10 @@ mod tests {
             Win32::{
                 Foundation::RECT,
                 UI::WindowsAndMessaging::{
-                    CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW,
-                    GetWindowRect, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST, SWP_NOACTIVATE,
-                    SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                    WS_POPUP,
+                    CreateWindowExW, DestroyWindow, GetClientRect, GetForegroundWindow,
+                    GetWindowLongPtrW, GetWindowRect, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+                    HWND_NOTOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_CAPTION,
+                    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
                 },
             },
         };
@@ -543,7 +714,7 @@ mod tests {
                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                 w!("STATIC"),
                 w!("AI Token pet window test"),
-                WS_POPUP,
+                WS_POPUP | WS_CAPTION | WS_THICKFRAME,
                 50,
                 70,
                 20,
@@ -554,6 +725,17 @@ mod tests {
                 None,
             )
             .unwrap();
+            remove_native_frame(hwnd).unwrap();
+            assert_eq!(
+                GetWindowLongPtrW(hwnd, GWL_STYLE) & (WS_CAPTION | WS_THICKFRAME).0 as isize,
+                0
+            );
+            let mut client = RECT::default();
+            GetClientRect(hwnd, &mut client).unwrap();
+            assert_eq!(
+                (client.right - client.left, client.bottom - client.top),
+                (20, 30)
+            );
             topmost_on_ui(hwnd, Some(PhysicalPosition::new(150, 170))).unwrap();
             let mut rect = RECT::default();
             GetWindowRect(hwnd, &mut rect).unwrap();

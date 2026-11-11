@@ -525,9 +525,11 @@ function QuotaSummaryCard({
   now: number;
 }) {
   const value = getQuotaPresentation(quota);
+  const resetMs = toEpochMilliseconds(quota.resetsAt);
+  const expired = resetMs !== null && resetMs <= now;
   return (
     <article
-      className={`metric-card overview-grid__quota quota-summary quota-summary--${value.tone}`}
+      className={`metric-card overview-grid__quota quota-summary quota-summary--${expired ? "normal" : value.tone}`}
     >
       <header>
         <span>
@@ -537,9 +539,9 @@ function QuotaSummaryCard({
         <small>{quota.label || "额度窗口"}</small>
       </header>
       <div className="metric-card__value">
-        <strong>{formatPercent(value.remainingPercent)}</strong>
+        <strong>{expired ? "待更新" : formatPercent(value.remainingPercent)}</strong>
         <span>剩余</span>
-        {value.remainingPercent <= 0 && (quota.windowDurationMins === 300 || quota.windowDurationMins === 10_080) && (
+        {!expired && value.remainingPercent <= 0 && (quota.windowDurationMins === 300 || quota.windowDurationMins === 10_080) && (
           <small className="quota-limit-alert">已达 {formatWindowDuration(quota.windowDurationMins)}上限</small>
         )}
       </div>
@@ -549,13 +551,14 @@ function QuotaSummaryCard({
         aria-label={`${title}额度剩余`}
         aria-valuemin={0}
         aria-valuemax={100}
-        aria-valuenow={value.remainingPercent}
+        aria-valuenow={expired ? undefined : value.remainingPercent}
+        aria-valuetext={expired ? "旧额度已过期，等待同步" : undefined}
       >
-        <span style={{ width: `${value.remainingPercent}%` }} />
+        <span style={{ width: `${expired ? 0 : value.remainingPercent}%` }} />
       </div>
       <footer>
-        <span>已使用 {formatPercent(value.usedPercent)}</span>
-        <span>{formatCountdown(quota.resetsAt, now)}重置</span>
+        <span>{expired ? "旧额度已过期" : `已使用 ${formatPercent(value.usedPercent)}`}</span>
+        <span>{expired ? "等待服务端更新" : `${formatCountdown(quota.resetsAt, now)}重置`}</span>
       </footer>
     </article>
   );
