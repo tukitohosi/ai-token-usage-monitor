@@ -14,7 +14,7 @@ v1.0.1 fixes the pet's startup title bar, edge bounce and off-screen usage bar, 
 - Read plain, Zstandard-compressed and archived Codex logs. Keep recorded history when source files move or disappear.
 - Merge Claude Code streaming usage snapshots by reply, including other models used through Claude Code, so each reply is counted once.
 - See daily trends and the past 24 hours of activity.
-- Refresh local usage and Codex account data in parallel. The refresh indicator ends after both return this cycle's result; local statistics remain available when account sync fails or the account is signed out.
+- Refresh local statistics and account quotas independently. Local statistics can still update when account requests are slow or fail.
 - Enter input, cache-read, cache-write and output prices for each model, with optional peak-pricing windows, multipliers, time zones and special dates.
 - Export saved model pricing and peak rules as JSON, or import pricing by case-insensitive modelId into an editable draft before saving and recalculating.
 - Model Pricing lists models by all-time local token usage across all sources, highest first. It checks the order after each refresh and when the app opens. Rows stay in place while you type, then reorder when focus leaves the field; refreshes preserve unsaved edits.
