@@ -285,6 +285,18 @@ fn process_token_event(
         let logical_key = logical_event_key(rollout_key_hash, ordinal, source_line);
         let payload_hash = event_payload_hash(&logical_key, &state.current, usage, source);
         effects.event = Some(PendingUsageEvent {
+            // A cumulative delta / segment start may span multiple requests.
+            // Verify it against the separately reported latest call before tiering.
+            request_input_tokens: last
+                .filter(|call| {
+                    call.complete_request
+                        && cache_metrics_available
+                        && call.usage.input_tokens == usage.input_tokens
+                        && call.usage.cached_input_tokens == usage.cached_input_tokens
+                        && call.usage.output_tokens == usage.output_tokens
+                        && call.usage.total_tokens == usage.total_tokens
+                })
+                .map(|call| call.usage.input_tokens),
             logical_key,
             source_ordinal: ordinal,
             source_line,
@@ -333,6 +345,7 @@ fn parse_attribution(payload: &Map<String, Value>, fallback: &Attribution) -> At
 #[derive(Clone, Copy)]
 struct IndexedUsage {
     usage: TokenUsage,
+    complete_request: bool,
     cache_metrics_available: bool,
 }
 
@@ -352,6 +365,15 @@ fn read_usage(value: Option<&Value>) -> Option<IndexedUsage> {
         return None;
     }
     Some(IndexedUsage {
+        complete_request: input
+            .zip(cached)
+            .zip(output)
+            .is_some_and(|((input, cached), output)| {
+                cached <= input
+                    && input
+                        .checked_add(output)
+                        .is_some_and(|sum| supplied_total.map_or(true, |total| sum == total))
+            }),
         usage: TokenUsage {
             input_tokens: input.unwrap_or(0),
             cached_input_tokens: cached.unwrap_or(0),

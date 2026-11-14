@@ -60,6 +60,22 @@ fn all_time(index: &IncrementalIndex) -> super::LocalUsageSummary {
         .expect("aggregate index")
 }
 
+// These migration fixtures start from the current database and remove the
+// structures that did not exist in the legacy schema being exercised.
+fn remove_v4_tables(index: &IncrementalIndex) {
+    index
+        .connection()
+        .execute_batch(
+            "DROP VIEW indexed_usage;
+         ALTER TABLE usage_events DROP COLUMN request_input_tokens;
+         DELETE FROM schema_migrations WHERE version=5;
+         DROP TABLE work_deltas; DROP TABLE work_counters;
+         DROP TABLE desktop_usage_events; DROP TABLE desktop_log_files;
+         DROP INDEX rollout_files_thread_hash;",
+        )
+        .unwrap();
+}
+
 #[test]
 fn creates_current_schema_and_wal_database() {
     let temp = tempdir().expect("temp dir");
@@ -220,11 +236,11 @@ fn local_events_expose_an_opaque_task_key_without_raw_rollout_identity() {
         &[
             record(
                 "session_meta",
-                json!({ "cwd": "C:\\Users\\稚青\\private-project" }),
+                json!({ "cwd": "C:\\Users\\测试用户\\private-project" }),
             ),
             record(
                 "turn_context",
-                json!({ "model": "gpt-5.6", "cwd": "C:\\Users\\稚青\\private-project" }),
+                json!({ "model": "gpt-5.6", "cwd": "C:\\Users\\测试用户\\private-project" }),
             ),
             token(12),
         ],
@@ -237,7 +253,7 @@ fn local_events_expose_an_opaque_task_key_without_raw_rollout_identity() {
     assert_eq!(events[0].task_key.len(), 64);
     let serialized = serde_json::to_string(&events).expect("serialize events");
     assert!(!serialized.contains("00000000-0000-0000-0000-000000000777"));
-    assert!(!serialized.contains("C:\\Users\\稚青"));
+    assert!(!serialized.contains("C:\\Users\\测试用户"));
     assert_eq!(events[0].project_label, "private-project");
 }
 
@@ -839,6 +855,92 @@ fn a_new_session_without_history_still_skips_bad_complete_records() {
 }
 
 #[test]
+fn context_tier_requires_a_matching_single_call_and_preserves_old_totals() {
+    let temp = tempdir().unwrap();
+    let db = temp.path().join("usage.sqlite3");
+    let rollout = temp.path().join("rollout-context.jsonl");
+    let token_record = |total: i64, last: Option<Value>| {
+        record(
+            "event_msg",
+            json!({"type":"token_count", "info":{
+                "total_token_usage":usage(total), "last_token_usage":last
+            }}),
+        )
+    };
+    let mut no_cache = usage(100);
+    no_cache
+        .as_object_mut()
+        .unwrap()
+        .remove("cached_input_tokens");
+    write_lines(
+        &rollout,
+        &[
+            record("session_meta", json!({})),
+            token_record(100, Some(usage(100))), // first segment verified
+            token_record(200, Some(usage(30))),  // several requests in the delta
+            token_record(300, Some(no_cache)),   // latest call lacks a breakdown
+            token_record(400, Some(usage(100))), // verified delta
+            token_record(150, None),             // reset without a last call
+        ],
+        true,
+    );
+    let mut index = IncrementalIndex::open(&db).unwrap();
+    index.scan_file(&rollout).unwrap();
+    let expected = vec![Some(100), None, None, Some(100), None];
+    let inputs = |index: &IncrementalIndex| {
+        index
+            .local_events()
+            .unwrap()
+            .iter()
+            .map(|e| e.request_input_tokens)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(inputs(&index), expected);
+    // Emulate a previous schema with a view lacking the new column. The read-only
+    // export must continue to report counters before anyone opens it for migration.
+    index
+        .connection()
+        .execute_batch(
+            "DROP VIEW indexed_usage;
+        ALTER TABLE usage_events DROP COLUMN request_input_tokens;
+        DELETE FROM schema_migrations WHERE version = 5;
+        PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    let old_view = format!(
+        "CREATE VIEW indexed_usage AS {} {}",
+        super::store::CANONICAL_CTE,
+        super::store::rollout_rows("NULL")
+    );
+    index.connection().execute_batch(&old_view).unwrap();
+    drop(index);
+    let before = IncrementalIndex::read_existing_events(&db, None).unwrap();
+    assert_eq!(
+        before.iter().map(|e| e.usage.total_tokens).sum::<i64>(),
+        550
+    );
+    assert!(before.iter().all(|e| e.request_input_tokens.is_none()));
+    let mut index = IncrementalIndex::open(&db).unwrap();
+    assert!(inputs(&index).iter().all(Option::is_none));
+    let original = fs::read_to_string(&rollout).unwrap();
+    write_lines(
+        &rollout,
+        &[
+            record("session_meta", json!({})),
+            token_record(100, Some(usage(100))),
+        ],
+        true,
+    );
+    assert_eq!(index.scan_file(&rollout).unwrap().indexed_events_added, 0);
+    assert_eq!(inputs(&index), vec![Some(100), None, None, None, None]);
+    assert_eq!(index.aggregate().unwrap().total.total_tokens, 550);
+    fs::write(&rollout, original).unwrap();
+    index.scan_file(rollout).unwrap();
+    assert_eq!(inputs(&index), expected);
+    assert_eq!(index.aggregate().unwrap().total.total_tokens, 550);
+}
+
+#[test]
 fn legacy_schema_migration_backs_up_wal_and_keeps_usage_without_source_logs() {
     let temp = tempdir().unwrap();
     let database = temp.path().join("usage.sqlite3");
@@ -851,6 +953,14 @@ fn legacy_schema_migration_backs_up_wal_and_keeps_usage_without_source_logs() {
     {
         let mut index = IncrementalIndex::open(&database).unwrap();
         index.scan_file(&rollout).unwrap();
+        remove_v4_tables(&index);
+        index
+            .connection()
+            .pragma_update(None, "user_version", 3)
+            .unwrap();
+        let before_migration = IncrementalIndex::read_existing_events(&database, None).unwrap();
+        assert_eq!(before_migration[0].usage.total_tokens, 83);
+        assert!(!before_migration[0].day_only);
         index
             .connection()
             .execute_batch(
@@ -925,6 +1035,7 @@ fn v2_migration_preserves_legacy_event_union_until_a_complete_reread() {
         let mut index = IncrementalIndex::open(&database).unwrap();
         index.scan_file(&first).unwrap();
         index.scan_file(&second).unwrap();
+        remove_v4_tables(&index);
         index
             .connection()
             .execute_batch(
@@ -947,4 +1058,153 @@ fn v2_migration_preserves_legacy_event_union_until_a_complete_reread() {
     index.scan_file(&second).unwrap();
     assert_eq!(all_time(&index).total.total_tokens, 8);
     assert_eq!(all_time(&index).indexed_events, 1);
+}
+
+#[test]
+fn work_observations_survive_restart_upgrade_partial_counts_and_separate_accounts() {
+    use super::{TokenUsage, WorkUsageObservation};
+    use chrono::{Local, TimeZone};
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("usage.sqlite3");
+    let ts = Local
+        .with_ymd_and_hms(2026, 11, 11, 12, 0, 0)
+        .single()
+        .unwrap()
+        .timestamp_millis();
+    let mut obs = WorkUsageObservation {
+        thread_id: "work-private-thread".into(),
+        model: "model-a".into(),
+        cwd: Some(r"C:\sensitive\Project".into()),
+        created_at_ms: ts,
+        updated_at_ms: ts + 1000,
+        usage: TokenUsage {
+            total_tokens: 120,
+            ..TokenUsage::default()
+        },
+        cache_metrics_available: false,
+    };
+    let mut db = IncrementalIndex::open(&path).unwrap();
+    let merge =
+        |db: &mut IncrementalIndex, account: &str, obs: &WorkUsageObservation, time: i64| {
+            db.merge_work_usage(account, time, std::slice::from_ref(obs))
+                .unwrap()
+        };
+    assert_eq!(merge(&mut db, "account-a", &obs, ts + 2000), 1);
+    assert_eq!(merge(&mut db, "account-a", &obs, ts + 2000), 0);
+    drop(db);
+    let mut db = IncrementalIndex::open(&path).unwrap();
+    let dated = db.local_events_for_date("2026-11-11").unwrap();
+    assert_eq!(dated.len(), 1);
+    assert!(dated[0].day_only && !dated[0].cache_metrics_available);
+    assert_eq!(dated[0].usage.total_tokens, 120);
+    assert_eq!(dated[0].project_label, "Project");
+    obs.cache_metrics_available = true;
+    obs.usage = TokenUsage {
+        input_tokens: 95,
+        cached_input_tokens: 70,
+        output_tokens: 15,
+        reasoning_output_tokens: 0,
+        total_tokens: 110,
+    };
+    merge(&mut db, "account-a", &obs, ts + 3000);
+    assert_eq!(all_time(&db).total.total_tokens, 120);
+    assert_eq!(
+        db.local_events()
+            .unwrap()
+            .iter()
+            .find(|e| !e.cache_metrics_available)
+            .unwrap()
+            .usage
+            .total_tokens,
+        10
+    );
+    obs.usage.input_tokens += 20;
+    obs.usage.total_tokens += 20;
+    merge(&mut db, "account-a", &obs, ts + 4000);
+    assert_eq!(all_time(&db).total, obs.usage);
+    assert!(db
+        .local_events()
+        .unwrap()
+        .iter()
+        .all(|event| event.cache_metrics_available));
+    assert_eq!(
+        IncrementalIndex::read_existing_events(&path, None).unwrap(),
+        db.local_events().unwrap()
+    );
+    db.merge_work_usage("account-b", ts + 4000, &[]).unwrap();
+    assert!(db.local_events().unwrap().is_empty());
+    assert!(db.active_work_account_matches("account-b").unwrap());
+    assert!(db.clear_active_work_account().unwrap());
+    assert!(!db.clear_active_work_account().unwrap());
+    db.merge_work_usage("account-a", ts + 5000, &[]).unwrap();
+    assert_eq!(all_time(&db).total.total_tokens, 130);
+}
+
+#[test]
+fn multiday_work_usage_keeps_unlocated_totals_and_yields_to_a_local_rollout() {
+    use super::{TokenUsage, WorkUsageObservation};
+    use chrono::{Local, TimeZone};
+    let temp = tempdir().unwrap();
+    let mut index = IncrementalIndex::open_in_memory().unwrap();
+    let day = |date, h| {
+        Local
+            .with_ymd_and_hms(2026, 11, date, h, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    };
+    let id = "00000000-0000-0000-0000-000000000120";
+    let mut item = WorkUsageObservation {
+        thread_id: id.to_owned(),
+        model: "model".into(),
+        cwd: None,
+        created_at_ms: day(9, 10),
+        updated_at_ms: day(10, 10),
+        usage: TokenUsage {
+            input_tokens: 40,
+            total_tokens: 40,
+            ..TokenUsage::default()
+        },
+        cache_metrics_available: true,
+    };
+    index
+        .merge_work_usage("account", day(10, 12), std::slice::from_ref(&item))
+        .unwrap();
+    assert_eq!(index.local_events().unwrap()[0].occurred_at_ms, None);
+    item.usage.input_tokens += 5;
+    item.usage.total_tokens += 5;
+    item.updated_at_ms = day(11, 9);
+    index
+        .merge_work_usage("account", day(11, 10), std::slice::from_ref(&item))
+        .unwrap();
+    assert!(index
+        .local_events_for_date("2026-11-11")
+        .unwrap()
+        .is_empty());
+    item.usage.input_tokens += 8;
+    item.usage.total_tokens += 8;
+    item.updated_at_ms = day(11, 12);
+    index
+        .merge_work_usage("account", day(11, 13), std::slice::from_ref(&item))
+        .unwrap();
+    assert_eq!(
+        index.local_events_for_date("2026-11-11").unwrap()[0]
+            .usage
+            .total_tokens,
+        8
+    );
+    assert_eq!(all_time(&index).total.total_tokens, 53);
+    let rollout = temp.path().join(format!("rollout-local-{id}.jsonl"));
+    write_lines(
+        &rollout,
+        &[record("session_meta", json!({})), token(55)],
+        true,
+    );
+    index.scan_file(rollout).unwrap();
+    assert_eq!(all_time(&index).total.total_tokens, 55);
+    assert!(index
+        .local_events()
+        .unwrap()
+        .iter()
+        .all(|event| !event.day_only));
 }

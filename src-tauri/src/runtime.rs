@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::{
+    hosted_usage::{HostedUsageBatch, HostedUsageCoverage, HostedUsagePoller},
     index::{
         IncrementalIndex, LocalUsageEvent, LocalUsageSummary, APPLICATION_ID,
         PARSER_SEMANTICS_VERSION, SCHEMA_VERSION,
@@ -77,6 +78,9 @@ pub(crate) struct UsageRuntime {
     latest_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
     account_cache: Arc<Mutex<crate::account_sync::AccountCache>>,
     account_task: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    hosted_poller: Arc<Mutex<HostedUsagePoller>>,
+    hosted_warning: Arc<Mutex<Option<String>>>,
+    hosted_coverage: Arc<Mutex<Option<HostedUsageCoverage>>>,
     account_attempt_at_ms: Arc<AtomicU64>,
     local_only: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -112,6 +116,9 @@ impl UsageRuntime {
             latest_snapshot: Arc::new(Mutex::new(None)),
             account_cache: Arc::new(Mutex::new(account_cache)),
             account_task: Arc::new(Mutex::new(None)),
+            hosted_poller: Default::default(),
+            hosted_warning: Default::default(),
+            hosted_coverage: Default::default(),
             account_attempt_at_ms: Arc::new(AtomicU64::new(0)),
             local_only: Arc::new(AtomicBool::new(local_only)),
             app_data_directory: app_data_directory.clone(),
@@ -317,6 +324,7 @@ impl UsageRuntime {
             ],
         });
         snapshot.refresh_progress = Some(complete.clone());
+        snapshot.hosted_usage_coverage = self.current_hosted_coverage();
         let mut latest = self
             .latest_snapshot
             .lock()
@@ -353,8 +361,26 @@ impl UsageRuntime {
         }
     }
 
+    fn current_hosted_coverage(&self) -> Option<HostedUsageCoverage> {
+        if !self.local_only.load(Ordering::Acquire) {
+            let today = chrono::Local::now().date_naive().to_string();
+            let checked = self
+                .hosted_coverage
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(coverage) = checked.as_ref().filter(|c| c.updated_for_date == today) {
+                return Some(coverage.clone());
+            }
+        }
+        crate::hosted_usage::catalog_only_coverage(&self.codex_home)
+    }
+
     pub(crate) fn read_cached_dashboard_snapshot(&self) -> Option<serde_json::Value> {
-        let live = self.latest_snapshot.try_lock().ok().and_then(|latest| latest.clone());
+        let live = self
+            .latest_snapshot
+            .try_lock()
+            .ok()
+            .and_then(|latest| latest.clone());
         let mut value: serde_json::Value = if let Some(snapshot) = &live {
             serde_json::to_value(snapshot).ok()?
         } else {
@@ -379,6 +405,7 @@ impl UsageRuntime {
         // Disk revisions belong to the previous process; live revisions preserve event ordering.
         if live.is_none() {
             object.insert("revision".into(), 0.into());
+            object.remove("hostedUsageCoverage");
         }
         object.insert(
             "refreshSchedule".into(),
@@ -889,6 +916,7 @@ impl UsageRuntime {
         let account = self.account_cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(snapshot) = latest.as_mut() {
             account.apply(snapshot);
+            snapshot.hosted_usage_coverage = self.current_hosted_coverage();
             snapshot.refresh_schedule = Some(self.refresh_schedule());
             snapshot.revision += 1;
             self.store_cached_snapshot(snapshot);
@@ -949,34 +977,81 @@ impl UsageRuntime {
         self.publish_account(&app);
         let runtime = self.clone();
         thread::spawn(move || {
-            let result = snapshot::read_dashboard_snapshot(cancelled.clone());
-            let mut task = runtime
-                .account_task
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if !task
-                .as_ref()
-                .is_some_and(|active| Arc::ptr_eq(active, &cancelled))
-            {
-                return;
-            }
-            if !cancelled.load(Ordering::Acquire)
-                && !runtime.local_only.load(Ordering::Acquire)
-                && !runtime.shutdown.load(Ordering::Acquire)
-            {
-                {
-                    let mut cache = runtime
-                        .account_cache
+            let (result, mut client) = snapshot::read_dashboard_snapshot(cancelled.clone());
+            let current = || {
+                !cancelled.load(Ordering::Acquire)
+                    && !runtime.local_only.load(Ordering::Acquire)
+                    && !runtime.shutdown.load(Ordering::Acquire)
+                    && credential_fingerprint(&runtime.codex_home) == fingerprint
+            };
+            if current() {
+                runtime
+                    .account_cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .merge(&result);
+                runtime.publish_account(&app);
+                // Keep account polling independent of the next local scan deadline.
+                let mut poller = runtime
+                    .hosted_poller
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let batch = match (&mut client, result.account_identity.as_deref()) {
+                    (Some(client), Some(key)) if current() => {
+                        Some(poller.poll(&runtime.codex_home, key, client, &cancelled))
+                    }
+                    _ => None,
+                };
+                let _guard = runtime
+                    .refresh_gate
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if current() {
+                    *runtime
+                        .hosted_coverage
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) =
+                        batch.as_ref().map(|batch| batch.coverage.clone());
+                    let mut warning = batch.as_ref().and_then(|batch| batch.warning.clone());
+                    let mut changed = false;
+                    if batch.is_some() || result.status == "unauthenticated" {
+                        match runtime
+                            .commit_hosted_usage(result.account_identity.as_deref(), batch.as_ref())
+                        {
+                            Ok(updated) => {
+                                changed = updated;
+                                if let Some(batch) = &batch {
+                                    poller.acknowledge(batch);
+                                }
+                            }
+                            Err(_) => {
+                                warning =
+                                    Some("Codex Work 用量未能写入本机索引，下次同步会重试。".into())
+                            }
+                        }
+                    } else if result.status != "ready" {
+                        warning =
+                            Some("Codex Work 会话用量暂未同步，当前显示已采集的记录。".into());
+                    }
+                    let mut previous = runtime
+                        .hosted_warning
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
-                    if credential_fingerprint(&runtime.codex_home) == fingerprint {
-                        cache.merge(&result);
-                    } else {
-                        cache.invalidate_credentials(credential_fingerprint(&runtime.codex_home));
+                    changed |= *previous != warning;
+                    *previous = warning;
+                    drop(previous);
+                    drop(poller);
+                    if changed {
+                        let snapshot =
+                            runtime.collect_locked(&mut |p| runtime.emit_local_progress(&app, p));
+                        update_tray_tooltip(&app, &snapshot);
+                    } else if batch.is_some() {
+                        // Coverage may advance as the background queue is read, even when the
+                        // service hasn't published any new token counters to index yet.
+                        runtime.publish_account(&app);
                     }
                 }
-                runtime.reset_refresh_schedule();
-                runtime.publish_account(&app);
+                drop(_guard);
                 let latest = runtime
                     .latest_snapshot
                     .lock()
@@ -986,8 +1061,33 @@ impl UsageRuntime {
                     runtime.maybe_notify(&app, &snapshot);
                 }
             }
-            *task = None;
+            let mut task = runtime
+                .account_task
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if task
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &cancelled))
+            {
+                *task = None;
+            }
         });
+    }
+
+    fn commit_hosted_usage(
+        &self,
+        account: Option<&str>,
+        batch: Option<&HostedUsageBatch>,
+    ) -> crate::index::IndexResult<bool> {
+        let mut index = IncrementalIndex::open(&self.codex_database_path)?;
+        if let (Some(key), Some(batch)) = (account, batch) {
+            let switched = !index.active_work_account_matches(key)?;
+            let added =
+                index.merge_work_usage(key, Utc::now().timestamp_millis(), &batch.observations)?;
+            Ok(switched || added > 0)
+        } else {
+            index.clear_active_work_account()
+        }
     }
 
     pub(crate) fn start_scheduler<R: Runtime>(&self, app: AppHandle<R>) {
@@ -1022,8 +1122,15 @@ impl UsageRuntime {
     {
         let mut index = IncrementalIndex::open(&self.codex_database_path).map_err(|_| ())?;
         let scan = index.scan_codex_home_with_progress(&self.codex_home, on_progress);
+        let local_app_data = desktop_data_dir(
+            &self.user_home,
+            &self.codex_home,
+            std::env::var_os("USERPROFILE").as_deref().map(Path::new),
+            std::env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+        );
+        let desktop = index.scan_codex_desktop_data(&local_app_data);
         let mut summary = index.aggregate().map_err(|_| ())?;
-        let new_events = match scan {
+        let mut new_events = match scan {
             Ok(scan) => Some(scan.indexed_events_added),
             Err(_) => {
                 summary.warnings.push(
@@ -1032,6 +1139,25 @@ impl UsageRuntime {
                 None
             }
         };
+        match desktop {
+            Ok(report) => {
+                summary.source_files = summary
+                    .source_files
+                    .saturating_add(report.discovered_files as i64);
+                new_events = new_events.map(|count| count + report.indexed_events_added);
+            }
+            Err(_) => summary
+                .warnings
+                .push("Codex 桌面日志仅完成部分采集，下次扫描会重试。".into()),
+        }
+        if let Some(warning) = self
+            .hosted_warning
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            summary.warnings.push(warning.clone());
+        }
         let events = index.local_events().map_err(|_| ())?;
         Ok((summary, events, new_events))
     }
@@ -1079,6 +1205,25 @@ impl UsageRuntime {
         }
         self.shutdown.load(Ordering::Acquire)
     }
+}
+
+fn desktop_data_dir(
+    user_home: &Path,
+    codex_home: &Path,
+    profile: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> PathBuf {
+    // A launched process can have a different Windows profile from the explicitly selected Codex user.
+    let selected = profile.filter(|p| {
+        !p.as_os_str().is_empty() && (*p == user_home || p.join(".codex") == codex_home)
+    });
+    if let (Some(_), Some(local)) = (
+        selected,
+        local_app_data.filter(|p| !p.as_os_str().is_empty()),
+    ) {
+        return local.to_path_buf();
+    }
+    selected.unwrap_or(user_home).join("AppData").join("Local")
 }
 
 fn credential_fingerprint(codex_home: &Path) -> Option<String> {
@@ -1335,6 +1480,40 @@ pub(crate) fn update_tray_tooltip<R: Runtime>(app: &AppHandle<R>, snapshot: &Das
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_logs_follow_the_selected_codex_profile_without_importing_an_unrelated_home() {
+        let known_folder = Path::new("restricted-user");
+        let profile = Path::new("working-user");
+        let local = Path::new("redirected-local-appdata");
+        let selected = profile.join(".codex");
+        assert_eq!(
+            desktop_data_dir(known_folder, &selected, Some(profile), Some(local)),
+            local
+        );
+        assert_eq!(
+            desktop_data_dir(known_folder, &selected, Some(profile), None),
+            profile.join("AppData").join("Local")
+        );
+        assert_eq!(
+            desktop_data_dir(
+                known_folder,
+                &known_folder.join(".codex"),
+                Some(profile),
+                Some(local)
+            ),
+            known_folder.join("AppData").join("Local")
+        );
+        assert_eq!(
+            desktop_data_dir(
+                profile,
+                Path::new("custom-codex-home"),
+                Some(profile),
+                Some(local)
+            ),
+            local
+        );
+    }
 
     #[test]
     fn stuck_account_sync_can_be_replaced_without_waiting_for_local_scan() {

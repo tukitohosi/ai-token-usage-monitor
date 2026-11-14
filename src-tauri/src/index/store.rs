@@ -18,7 +18,7 @@ use super::schema::{configure, migrate, PARSER_SEMANTICS_VERSION};
 const HASH_WINDOW_BYTES: usize = 4 * 1024;
 
 pub struct IncrementalIndex {
-    connection: Connection,
+    pub(super) connection: Connection,
 }
 
 #[derive(Debug)]
@@ -62,11 +62,11 @@ impl IncrementalIndex {
             return Err(IndexError::ForeignDatabase(application_id));
         }
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != super::schema::SCHEMA_VERSION {
+        if !(3..=super::schema::SCHEMA_VERSION).contains(&version) {
             return Err(IndexError::UnsupportedSchema(version));
         }
         super::schema::verify_parser_version(&connection)?;
-        query_local_events(&connection, range)
+        query_local_events(&connection, range, version)
     }
 
     pub fn open(database_path: impl AsRef<Path>) -> IndexResult<Self> {
@@ -281,6 +281,55 @@ impl IncrementalIndex {
                 "replacement source is incomplete or malformed",
             ));
         }
+        let backfill = file_row.parser_version == super::schema::REQUEST_EVIDENCE_BACKFILL;
+        if backfill && has_known_history {
+            let mut evidence: std::collections::HashSet<&[u8]> = read
+                .events
+                .iter()
+                .map(|event| event.payload_hash.as_slice())
+                .collect();
+            let covers_history = {
+                let mut old = transaction
+                    .prepare("SELECT payload_hash FROM usage_events WHERE file_id=?1")?;
+                let rows = old.query_map([file_row.id], |row| row.get::<_, Vec<u8>>(0))?;
+                let mut complete = true;
+                for row in rows {
+                    if !evidence.remove(row?.as_slice()) {
+                        complete = false;
+                        break;
+                    }
+                }
+                complete
+            };
+            if !covers_history {
+                // Rotation can leave a valid prefix. Enrich only exact matches;
+                // keep all counters, offsets and retry state from the older index.
+                let mut update = transaction.prepare(
+                    "UPDATE usage_events SET request_input_tokens=?1
+                    WHERE logical_event_key=?2 AND file_id=?3 AND payload_hash=?4",
+                )?;
+                for event in &read.events {
+                    if let Some(input) = event.request_input_tokens {
+                        update.execute(params![
+                            input,
+                            event.logical_key,
+                            file_row.id,
+                            event.payload_hash
+                        ])?;
+                    }
+                }
+                drop(update);
+                transaction.commit()?;
+                return Ok(FileScanReport {
+                    file_id: file_row.id,
+                    complete_lines_added: 0,
+                    indexed_events_added: 0,
+                    committed_offset: file_row.committed_offset,
+                    incomplete_tail: file_row.incomplete_tail,
+                    reset: false,
+                });
+            }
+        }
         if reset {
             transaction.execute("DELETE FROM usage_events WHERE file_id = ?1", [file_row.id])?;
             transaction.execute(
@@ -366,7 +415,7 @@ impl IncrementalIndex {
                 i64::from(reset && file_row.committed_lines > 0
                     && source_changed && file_row.parser_version == PARSER_SEMANTICS_VERSION),
                 i64::from(start_offset == 0 && !incomplete_tail),
-                i64::from(file_row.committed_lines > 0)],
+                i64::from(file_row.committed_lines > 0 && !backfill)],
         )?;
         transaction.commit()?;
 
@@ -426,14 +475,13 @@ impl IncrementalIndex {
             [],
             |row| row.get(0),
         )?;
-        let raw_events: i64 =
-            self.connection
-                .query_row("SELECT count(*) FROM usage_events", [], |row| row.get(0))?;
-        let indexed_events: i64 = self.connection.query_row(
-            &format!("{CANONICAL_CTE} SELECT count(*) FROM canonical"),
-            [],
-            |row| row.get(0),
+        let duplicate_events: i64 = self.connection.query_row(
+            &format!("{CANONICAL_CTE} SELECT (SELECT count(*) FROM usage_events) - count(*) FROM canonical"),
+            [], |row| row.get(0)
         )?;
+        let indexed_events: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM indexed_usage", [], |row| row.get(0))?;
         let (stored_skipped, filtered_parent_events): (i64, i64) = self.connection.query_row(
             "SELECT coalesce(sum(s.skipped_events), 0),
                     coalesce(sum(s.filtered_parent_events), 0)
@@ -450,7 +498,6 @@ impl IncrementalIndex {
             [],
             |row| row.get(0),
         )?;
-        let duplicate_events = raw_events - indexed_events;
         let warnings = query_warnings(&self.connection, incomplete_files, filtered_parent_events)?;
 
         Ok(LocalUsageSummary {
@@ -470,7 +517,7 @@ impl IncrementalIndex {
     /// Returns canonical, privacy-safe local events for all indexed days.
     /// Callers that show a task must still use their own neutral task label.
     pub fn local_events(&self) -> IndexResult<Vec<LocalUsageEvent>> {
-        query_local_events(&self.connection, None)
+        query_local_events(&self.connection, None, super::schema::SCHEMA_VERSION)
     }
 
     pub fn local_events_for_date(&self, date: &str) -> IndexResult<Vec<LocalUsageEvent>> {
@@ -497,6 +544,7 @@ impl IncrementalIndex {
         query_local_events(
             &self.connection,
             Some((start.timestamp_millis(), end.timestamp_millis())),
+            super::schema::SCHEMA_VERSION,
         )
     }
 
@@ -768,7 +816,7 @@ fn save_state(transaction: &Transaction<'_>, file_id: i64, state: &ParserState) 
     Ok(())
 }
 
-fn ensure_model(connection: &Connection, attribution: &Attribution) -> IndexResult<i64> {
+pub(super) fn ensure_model(connection: &Connection, attribution: &Attribution) -> IndexResult<i64> {
     connection.execute(
         "INSERT INTO models(key, label) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET label = excluded.label",
@@ -781,7 +829,10 @@ fn ensure_model(connection: &Connection, attribution: &Attribution) -> IndexResu
     )?)
 }
 
-fn ensure_project(connection: &Connection, attribution: &Attribution) -> IndexResult<i64> {
+pub(super) fn ensure_project(
+    connection: &Connection,
+    attribution: &Attribution,
+) -> IndexResult<i64> {
     connection.execute(
         "INSERT INTO projects(key, label) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET label = excluded.label",
@@ -806,10 +857,10 @@ fn insert_event(
            file_id, logical_event_key, source_ordinal, source_line, end_offset,
            occurred_at_ms, source_kind, model_id, project_id,
            input_tokens, cached_input_tokens, output_tokens,
-           reasoning_output_tokens, total_tokens, cache_metrics_available, payload_hash
+           reasoning_output_tokens, total_tokens, cache_metrics_available, payload_hash, request_input_tokens
          ) VALUES (
            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-           ?10, ?11, ?12, ?13, ?14, ?15, ?16
+           ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
          )",
         params![
             file_id,
@@ -828,6 +879,7 @@ fn insert_event(
             event.usage.total_tokens,
             i64::from(event.cache_metrics_available),
             event.payload_hash,
+            event.request_input_tokens,
         ],
     )?;
     Ok(i64::try_from(changed).unwrap_or(i64::MAX))
@@ -1061,9 +1113,9 @@ fn discover_rollouts(directory: &Path, files: &mut Vec<PathBuf>) -> IndexResult<
 
 fn query_usage(connection: &Connection, range: Option<(i64, i64)>) -> IndexResult<TokenUsage> {
     let query = if range.is_some() {
-        format!("{CANONICAL_CTE}\n{USAGE_SELECT} WHERE e.occurred_at_ms >= ?1 AND e.occurred_at_ms < ?2")
+        format!("{USAGE_SELECT} WHERE e.occurred_at_ms >= ?1 AND e.occurred_at_ms < ?2")
     } else {
-        format!("{CANONICAL_CTE}\n{USAGE_SELECT}")
+        USAGE_SELECT.to_owned()
     };
     let read = |row: &rusqlite::Row<'_>| {
         Ok(TokenUsage {
@@ -1083,14 +1135,27 @@ fn query_usage(connection: &Connection, range: Option<(i64, i64)>) -> IndexResul
 fn query_local_events(
     connection: &Connection,
     range: Option<(i64, i64)>,
+    schema_version: i64,
 ) -> IndexResult<Vec<LocalUsageEvent>> {
+    let prefix = if schema_version == 3 {
+        format!(
+            "{CANONICAL_CTE}, indexed_usage AS ({})",
+            rollout_rows("NULL")
+        )
+    } else {
+        String::new()
+    };
+    let request_input = if schema_version >= 5 {
+        "e.request_input_tokens"
+    } else {
+        "NULL"
+    };
     let mut query = format!(
-        r#"{CANONICAL_CTE}
+        r#"{prefix}
 SELECT e.logical_event_key, e.occurred_at_ms, m.label, p.label,
        e.input_tokens, e.cached_input_tokens, e.output_tokens,
-       e.reasoning_output_tokens, e.total_tokens, e.cache_metrics_available
-FROM usage_events e
-JOIN canonical c ON c.id = e.id
+       e.reasoning_output_tokens, e.total_tokens, e.cache_metrics_available, e.day_only, {request_input}
+FROM indexed_usage e
 JOIN models m ON m.id = e.model_id
 JOIN projects p ON p.id = e.project_id"#
     );
@@ -1114,6 +1179,8 @@ JOIN projects p ON p.id = e.project_id"#
                 total_tokens: row.get(8)?,
             },
             cache_metrics_available: row.get::<_, i64>(9)? != 0,
+            day_only: row.get(10)?,
+            request_input_tokens: row.get(11)?,
         })
     };
     let rows = match range {
@@ -1123,7 +1190,7 @@ JOIN projects p ON p.id = e.project_id"#
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-const CANONICAL_CTE: &str = r#"
+pub(super) const CANONICAL_CTE: &str = r#"
 WITH canonical AS (
   SELECT min(e.id) AS id
   FROM usage_events e
@@ -1134,24 +1201,32 @@ WITH canonical AS (
 )
 "#;
 
+pub(super) fn rollout_rows(request_input: &str) -> String {
+    format!(
+        r#"
+SELECT e.id, e.logical_event_key, e.occurred_at_ms, e.model_id, e.project_id,
+       e.input_tokens, e.cached_input_tokens, e.output_tokens, e.reasoning_output_tokens,
+       e.total_tokens, e.cache_metrics_available, 0 AS day_only, {request_input} AS request_input_tokens
+FROM usage_events e JOIN canonical c ON c.id = e.id
+"#
+    )
+}
+
 const USAGE_SELECT: &str = r#"
 SELECT sum(e.input_tokens), sum(e.cached_input_tokens), sum(e.output_tokens),
        sum(e.reasoning_output_tokens), sum(e.total_tokens)
-FROM usage_events e JOIN canonical c ON c.id = e.id
+FROM indexed_usage e
 "#;
 
 fn query_model_dimensions(connection: &Connection) -> IndexResult<Vec<UsageDimension>> {
-    let query = format!(
-        r#"{CANONICAL_CTE}
+    let query = r#"
 SELECT m.key, m.label, sum(e.input_tokens), sum(e.cached_input_tokens),
        sum(e.output_tokens), sum(e.reasoning_output_tokens), sum(e.total_tokens)
-FROM usage_events e
-JOIN canonical c ON c.id = e.id
+FROM indexed_usage e
 JOIN models m ON m.id = e.model_id
 GROUP BY m.id, m.key, m.label
-ORDER BY sum(e.total_tokens) DESC, m.label ASC"#
-    );
-    let mut statement = connection.prepare(&query)?;
+ORDER BY sum(e.total_tokens) DESC, m.label ASC"#;
+    let mut statement = connection.prepare(query)?;
     let rows = statement.query_map([], |row| {
         Ok(UsageDimension {
             key: row.get(0)?,
@@ -1169,17 +1244,14 @@ ORDER BY sum(e.total_tokens) DESC, m.label ASC"#
 }
 
 fn query_project_dimensions(connection: &Connection) -> IndexResult<Vec<UsageDimension>> {
-    let query = format!(
-        r#"{CANONICAL_CTE}
+    let query = r#"
 SELECT p.key, p.label, sum(e.input_tokens), sum(e.cached_input_tokens),
        sum(e.output_tokens), sum(e.reasoning_output_tokens), sum(e.total_tokens)
-FROM usage_events e
-JOIN canonical c ON c.id = e.id
+FROM indexed_usage e
 JOIN projects p ON p.id = e.project_id
 GROUP BY p.id, p.key, p.label
-ORDER BY sum(e.total_tokens) DESC, p.label ASC"#
-    );
-    let mut statement = connection.prepare(&query)?;
+ORDER BY sum(e.total_tokens) DESC, p.label ASC"#;
+    let mut statement = connection.prepare(query)?;
     let rows = statement.query_map([], |row| {
         let key: Vec<u8> = row.get(0)?;
         Ok(UsageDimension {

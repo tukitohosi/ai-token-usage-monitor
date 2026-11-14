@@ -33,7 +33,7 @@ describe("usage export files", () => {
     const csv = serializeUsageExport(fixture(), "models", "csv");
     expect(csv.startsWith("\uFEFFsourceId,sourceLabel,model,")).toBe(true);
     expect(csv).toContain('"模型, ""A""\n第二行"');
-    expect(csv).toContain(",120,60,20,12,8,0,70,30,270,0.00123,0,20\r\n");
+    expect(csv).toContain(",120,60,20,12,8,0,70,30,270,0.00123,0,20,");
     expect(csv.endsWith("\r\n")).toBe(true);
     expect(csv).not.toContain("万");
   });
@@ -67,6 +67,18 @@ describe("usage export files", () => {
     expect(serializeUsageExport(report, "models", "csv").split("\r\n")).toHaveLength(2);
     const withSecrets = { ...fixture(), apiKey: "not-for-export", rawPath: "C:/private/user", summary: { ...metrics, transcript: "not-for-export" }, models: [{ ...fixture().models[0]!, taskId: "not-for-export" }] };
     expect(serializeUsageExport(withSecrets, "full", "json")).not.toMatch(/not-for-export|private\/user|taskId|apiKey/);
+  });
+
+  it("preserves uncertain long-context tiers alongside the base estimate", () => {
+    const report = fixture();
+    report.summary.cost.longContextUnconfirmedEvents = 7;
+    report.models[0]!.cost.longContextUnconfirmedEvents = 7;
+    const json = JSON.parse(serializeUsageExport(report, "models", "json"));
+    expect(json.summary.cost.longContextUnconfirmedEvents).toBe(7);
+    expect(json.rows[0].cost).toEqual(report.models[0]!.cost);
+    const csv = serializeUsageExport(report, "models", "csv");
+    expect(csv).toContain("unpricedTokens,longContextUnconfirmedEvents\r\n");
+    expect(csv).toContain(",20,7\r\n");
   });
 
   it("rejects unsafe token precision or a malformed backend report", () => {

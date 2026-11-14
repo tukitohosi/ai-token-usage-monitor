@@ -4,11 +4,13 @@
 //! prompts, responses, tool output, account identifiers, and absolute paths
 //! are never written to SQLite.
 
+mod desktop_log;
 mod error;
 mod model;
 mod parser;
 mod schema;
 mod store;
+mod work;
 
 pub use error::{IndexError, IndexResult};
 pub use model::{
@@ -16,6 +18,7 @@ pub use model::{
 };
 pub(crate) use schema::{APPLICATION_ID, PARSER_SEMANTICS_VERSION, SCHEMA_VERSION};
 pub use store::IncrementalIndex;
+pub(crate) use work::WorkUsageObservation;
 
 #[cfg(test)]
 mod tests;

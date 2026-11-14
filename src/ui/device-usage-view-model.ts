@@ -295,11 +295,7 @@ export function buildProjectDimensionRows(
         bySource: new Map<UsageSourceSummary["id"], number>(),
       };
       current.usage = addUsage(current.usage, dimension.usage);
-      current.cost = {
-        usd: current.cost.usd + dimension.cost.usd,
-        cny: current.cost.cny + dimension.cost.cny,
-        unpricedTokens: current.cost.unpricedTokens + dimension.cost.unpricedTokens,
-      };
+      current.cost = addCost(current.cost, dimension.cost);
       current.bySource.set(source.id, (current.bySource.get(source.id) ?? 0) + dimension.usage.totalTokens);
       grouped.set(rule.id, current);
     }
@@ -408,31 +404,19 @@ export function aggregateSelectedSources(
   for (const source of active) {
     const range = sourceRange(source, period);
     usage = addUsage(usage, range.usage);
-    cost = {
-      usd: cost.usd + range.cost.usd,
-      cny: cost.cny + range.cost.cny,
-      unpricedTokens: cost.unpricedTokens + range.cost.unpricedTokens,
-    };
+    cost = addCost(cost, range.cost);
     for (const bucket of range.dailyUsage) {
       const current = daily.get(bucket.date) ?? { usage: { ...EMPTY_USAGE }, cost: { usd: 0, cny: 0, unpricedTokens: 0 } };
       daily.set(bucket.date, {
         usage: addUsage(current.usage, bucket.usage),
-        cost: {
-          usd: current.cost.usd + bucket.cost.usd,
-          cny: current.cost.cny + bucket.cost.cny,
-          unpricedTokens: current.cost.unpricedTokens + bucket.cost.unpricedTokens,
-        },
+        cost: addCost(current.cost, bucket.cost),
       });
     }
     for (const bucket of range.hourlyUsage ?? []) {
       const current = hourly.get(bucket.hourStartMs) ?? { usage: { ...EMPTY_USAGE }, cost: { usd: 0, cny: 0, unpricedTokens: 0 } };
       hourly.set(bucket.hourStartMs, {
         usage: addUsage(current.usage, bucket.usage),
-        cost: {
-          usd: current.cost.usd + bucket.cost.usd,
-          cny: current.cost.cny + bucket.cost.cny,
-          unpricedTokens: current.cost.unpricedTokens + bucket.cost.unpricedTokens,
-        },
+        cost: addCost(current.cost, bucket.cost),
       });
     }
   }
@@ -477,20 +461,12 @@ export function attachCustomRanges(
         cost: { usd: 0, cny: 0, unpricedTokens: 0 },
       };
       current.usage = addUsage(current.usage, taskUsage);
-      current.cost = {
-        usd: current.cost.usd + taskCost.usd,
-        cny: current.cost.cny + taskCost.cny,
-        unpricedTokens: current.cost.unpricedTokens + taskCost.unpricedTokens,
-      };
+      current.cost = addCost(current.cost, taskCost);
       values.set(key, current);
     };
     for (const { date, task } of tasks) {
       usage = addUsage(usage, task.usage);
-      cost = {
-        usd: cost.usd + task.cost.usd,
-        cny: cost.cny + task.cost.cny,
-        unpricedTokens: cost.unpricedTokens + task.cost.unpricedTokens,
-      };
+      cost = addCost(cost, task.cost);
       addDimension(byModel, task.modelLabel, task.usage, task.cost);
       addDimension(byProject, task.projectLabel, task.usage, task.cost);
       const current = daily.get(date) ?? {
@@ -499,11 +475,7 @@ export function attachCustomRanges(
       };
       daily.set(date, {
         usage: addUsage(current.usage, task.usage),
-        cost: {
-          usd: current.cost.usd + task.cost.usd,
-          cny: current.cost.cny + task.cost.cny,
-          unpricedTokens: current.cost.unpricedTokens + task.cost.unpricedTokens,
-        },
+        cost: addCost(current.cost, task.cost),
       });
     }
     const custom: DeviceUsageRangeSummary = {
@@ -531,12 +503,18 @@ export function costDetailRows(
   }));
 }
 
+function addCost(left: TokenCost, right: TokenCost): TokenCost {
+  const unconfirmed = (left.longContextUnconfirmedEvents ?? 0) + (right.longContextUnconfirmedEvents ?? 0);
+  return {
+    usd: left.usd + right.usd,
+    cny: left.cny + right.cny,
+    unpricedTokens: left.unpricedTokens + right.unpricedTokens,
+    ...(unconfirmed > 0 ? { longContextUnconfirmedEvents: unconfirmed } : {}),
+  };
+}
+
 export function aggregateCostRows(rows: CostDetailRow[]): TokenCost {
-  return rows.reduce((total, row) => ({
-    usd: total.usd + row.cost.usd,
-    cny: total.cny + row.cost.cny,
-    unpricedTokens: total.unpricedTokens + row.cost.unpricedTokens,
-  }), { usd: 0, cny: 0, unpricedTokens: 0 });
+  return rows.reduce((total, row) => addCost(total, row.cost), { usd: 0, cny: 0, unpricedTokens: 0 });
 }
 
 export function buildUsageInsights(summary: DeviceUsageRangeSummary): UsageInsightSummary {

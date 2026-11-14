@@ -233,16 +233,11 @@ pub(crate) fn read_report(
         events.extend(codex.into_iter().map(|event| IndexedExportEvent {
             source_id: "codex".to_owned(),
             occurred_at_ms: event.occurred_at_ms,
+            day_only: event.day_only,
+            request_input_tokens: event.request_input_tokens,
             model_label: event.model_label,
             project_label: event.project_label,
-            usage: DeviceTokenUsage::from_parts(
-                event.usage.input_tokens - event.usage.cached_input_tokens,
-                event.usage.cached_input_tokens,
-                0,
-                event.usage.output_tokens,
-                event.usage.reasoning_output_tokens,
-                Some(event.usage.total_tokens),
-            ),
+            usage: DeviceTokenUsage::from_codex(event.usage),
         }));
     }
     let other_sources: Vec<_> = query
@@ -300,7 +295,8 @@ fn build_report(
         let cost = multisource::cost_for(
             &event.model_label,
             event.usage,
-            event.occurred_at_ms,
+            event.request_input_tokens,
+            event.occurred_at_ms.filter(|_| !event.day_only),
             pricing,
         );
         summary.add(event.usage, &cost);
@@ -611,6 +607,8 @@ mod tests {
     ) -> IndexedExportEvent {
         IndexedExportEvent {
             source_id: source.to_owned(),
+            day_only: false,
+            request_input_tokens: Some(tokens),
             model_label: model.to_owned(),
             project_label: project.to_owned(),
             occurred_at_ms: date.map(|date| {
@@ -796,6 +794,7 @@ mod tests {
                 cache_write_per_million: None,
                 output_per_million: None,
                 peak_enabled: true,
+                long_context: None,
             });
         }
         let mut before = event("codex", "provider-a/model", "project", None, 1_000_000);
@@ -812,25 +811,28 @@ mod tests {
         );
         let mut cny = event("codex", "provider-b/model", "project", None, 1_000_000);
         cny.occurred_at_ms = before.occurred_at_ms;
+        let mut work = event("codex", "provider-a/model", "project", None, 1_000_000);
+        work.day_only = true;
+        work.occurred_at_ms = peak.occurred_at_ms;
         let report = build_report(
             query(ExportRange::All),
-            vec![before, peak, cny],
+            vec![before, peak, cny, work],
             &pricing,
             &[],
             None,
         )
         .unwrap();
         assert_eq!(report.models.len(), 2);
-        assert_eq!(report.summary.cost.usd, 6.0);
+        assert_eq!(report.summary.cost.usd, 8.0);
         assert_eq!(report.summary.cost.cny, 3.0);
-        assert_eq!(report.summary.usage.total_tokens, 3_000_000);
+        assert_eq!(report.summary.usage.total_tokens, 4_000_000);
         assert_eq!(
             report
                 .daily
                 .iter()
                 .map(|row| row.metrics.cost.usd)
                 .sum::<f64>(),
-            6.0
+            8.0
         );
         assert_eq!(
             report

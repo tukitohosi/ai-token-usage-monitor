@@ -1,5 +1,7 @@
 mod account_sync;
 mod app_server;
+mod cli_pricing;
+mod hosted_usage;
 pub mod index;
 mod multisource;
 mod pricing;
@@ -448,6 +450,7 @@ pub fn run() {
             set_project_merge_rules,
             read_pricing_settings,
             set_pricing_settings,
+            cli_pricing::read_claude_long_context_rules,
             pricing_transfer::import_pricing_file,
             pricing_transfer::export_pricing_file,
             pets::read_pet_state,

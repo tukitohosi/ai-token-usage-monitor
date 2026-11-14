@@ -4,11 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../src/App";
 import { MockDashboardAdapter } from "../src/ui/dashboard-adapter";
 import type { PricingTransferDocumentV1 } from "../src/core/pricing-transfer";
-import { exportSavedPricing, openPricingImport } from "../src/ui/pricing-transfer-api";
+import { exportSavedPricing, openPricingImport, readCliLongContextRules } from "../src/ui/pricing-transfer-api";
 
 vi.mock("../src/ui/pricing-transfer-api", async (original) => ({
   ...await original<typeof import("../src/ui/pricing-transfer-api")>(),
   openPricingImport: vi.fn(),
+  readCliLongContextRules: vi.fn(),
   exportSavedPricing: vi.fn(),
 }));
 
@@ -34,6 +35,52 @@ async function setup() {
 }
 
 describe("pricing transfer inside application", () => {
+  it("previews only CLI rules and keeps draft rates, currency and peak settings", async () => {
+    const { adapter, saved } = await setup();
+    const save = vi.spyOn(adapter, "setPricingSettings");
+    const model = saved.models[0]!;
+    const rule = { threshold: 272000, inputMultiplier: 2, outputMultiplier: 1.5 };
+    vi.mocked(readCliLongContextRules).mockResolvedValue([
+      { modelId: model.modelId.toUpperCase(), longContext: rule }, { modelId: "new-model", longContext: rule },
+    ]);
+    fireEvent.change(screen.getByLabelText("GPT-5.6 Sol 新输入"), { target: { value: "23." } });
+    fireEvent.change(screen.getByLabelText("GPT-5.6 Sol 币种"), { target: { value: "CNY" } });
+    fireEvent.click(screen.getByRole("button", { name: "从本机 Claude Code 导入长上下文规则" }));
+    await screen.findByRole("dialog", { name: "导入长上下文规则" });
+    expect(screen.getByText("新增模型和规则")).toBeTruthy();
+    expect(screen.getByText("新增规则")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "导入到编辑页" }));
+    expect((screen.getByLabelText("GPT-5.6 Sol 新输入") as HTMLInputElement).value).toBe("23.");
+    expect((screen.getByLabelText("new-model 新输入") as HTMLInputElement).value).toBe("");
+    expect(save).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "保存价格并重算" }));
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    const applied = save.mock.calls[0]![0];
+    expect(applied.models.find(m => m.modelId === model.modelId)).toMatchObject({ ...model, longContext: rule, inputPerMillion: 23, currency: "CNY" });
+    expect(applied.models.find(m => m.modelId === "new-model")).toMatchObject({ longContext: rule, inputPerMillion: null, peakEnabled: false });
+    expect(applied.peak).toEqual(saved.peak);
+  });
+
+  it("validates and saves manually enabled rules without a CLI installation", async () => {
+    const { adapter } = await setup();
+    const save = vi.spyOn(adapter, "setPricingSettings");
+    const toggle = screen.getByRole("checkbox", { name: "GPT-5.6 Sol 长上下文加价" });
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(toggle);
+    const submit = screen.getByRole("button", { name: "保存价格并重算" });
+    fireEvent.change(screen.getByLabelText("GPT-5.6 Sol 输入门槛（Token）"), { target: { value: "1.25" } });
+    fireEvent.click(submit);
+    await screen.findByText(/输入门槛必须是大于零的安全整数/);
+    expect(save).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("GPT-5.6 Sol 输入门槛（Token）"), { target: { value: "272000" } });
+    fireEvent.change(screen.getByLabelText("GPT-5.6 Sol 输入倍率"), { target: { value: "2" } });
+    fireEvent.change(screen.getByLabelText("GPT-5.6 Sol 输出倍率"), { target: { value: "1.5" } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(save.mock.calls[0]![0].models[0]!.longContext).toEqual({ threshold: 272000, inputMultiplier: 2, outputMultiplier: 1.5 });
+    expect(readCliLongContextRules).not.toHaveBeenCalled();
+  });
+
   it("imports into the latest draft without saving, then applies through existing local recalculation", async () => {
     const { adapter, transfer } = await setup();
     const save = vi.spyOn(adapter, "setPricingSettings");

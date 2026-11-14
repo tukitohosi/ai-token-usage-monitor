@@ -47,7 +47,7 @@ export interface SaveUsageExportRequest { format: UsageExportFormat; suggestedFi
 export interface SaveUsageExportResult { status: "saved" | "cancelled"; path: string | null }
 
 const usageKeys = ["inputTokens", "cachedInputTokens", "cacheWriteTokens", "cacheWrite5mTokens", "cacheWrite1hTokens", "cacheWriteUnknownTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"] as const;
-const costKeys = ["usd", "cny", "unpricedTokens"] as const;
+const costKeys = ["usd", "cny", "unpricedTokens", "longContextUnconfirmedEvents"] as const;
 const sourceIds = new Set<string>(EXPORT_SOURCES.map(source => source.id));
 
 export function exportDateKey(date: Date): string {
@@ -106,7 +106,10 @@ function readMetrics(value: Record<string, unknown>): ExportMetrics {
   const cost = record(value.cost);
   return {
     usage: Object.fromEntries(usageKeys.map(key => [key, finiteNumber(usage[key], true)])) as unknown as DeviceTokenUsage,
-    cost: { usd: finiteNumber(cost.usd), cny: finiteNumber(cost.cny), unpricedTokens: finiteNumber(cost.unpricedTokens, true) },
+    cost: {
+      usd: finiteNumber(cost.usd), cny: finiteNumber(cost.cny), unpricedTokens: finiteNumber(cost.unpricedTokens, true),
+      ...(cost.longContextUnconfirmedEvents === undefined ? {} : { longContextUnconfirmedEvents: finiteNumber(cost.longContextUnconfirmedEvents, true) }),
+    },
   };
 }
 function readModel(value: unknown): ExportModelRow {
@@ -162,7 +165,7 @@ const accountingNotes = [
   "报表统计本机已索引的用量，不代表账号额度或账号在其他设备上的全部消耗。",
   "日期按生成报表时的系统本地时区统计，utcOffsetMinutes 记录生成时的 UTC 时差。",
   "totalTokens 已包含记录中的缓存和输出用量；reasoningOutputTokens 是 outputTokens 的子集，缓存写入时长分类是 cacheWriteTokens 的子项，不要再次累加这些子项。",
-  "费用按已保存的模型价格及高峰规则估算，不是实际账单。",
+  "费用按已保存的模型价格、逐请求长上下文档位及高峰规则估算。longContextUnconfirmedEvents 记录无法确认档位而按基础档估算的条数。",
   "usd 与 cny 分别记录美元和人民币金额，未作汇率换算，不可直接相加。",
   "unpricedTokens 表示尚未定价的用量，不代表免费。",
   "指定日期范围会排除日期未知的记录；全部历史包含日期未知的记录，并以 date=null 表示。",

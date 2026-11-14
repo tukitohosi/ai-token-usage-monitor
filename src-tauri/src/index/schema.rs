@@ -4,8 +4,10 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::error::{IndexError, IndexResult};
 
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 pub(crate) const PARSER_SEMANTICS_VERSION: i64 = 2;
+// Distinguish a price-evidence reread from an intentional index rebuild.
+pub(super) const REQUEST_EVIDENCE_BACKFILL: i64 = -1;
 // ASCII "CUXI" (Codex Usage indeX Index).
 pub(crate) const APPLICATION_ID: i64 = 0x4355_5849;
 
@@ -85,8 +87,61 @@ pub(crate) fn migrate(connection: &mut Connection) -> IndexResult<()> {
              VALUES (3, 'permanent session history and compressed sources', 'v3', unixepoch('subsec') * 1000)",
             [],
         )?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
+    if current_version <= 3 {
+        transaction.execute_batch(super::desktop_log::DESKTOP_SCHEMA)?;
+        transaction.execute_batch(
+            "CREATE TABLE work_counters (
+               id INTEGER PRIMARY KEY,
+               account_hash TEXT NOT NULL,
+               thread_hash BLOB NOT NULL,
+               model_id INTEGER NOT NULL REFERENCES models(id),
+               observed_at_ms INTEGER NOT NULL,
+               activity_at_ms INTEGER NOT NULL,
+               input_tokens INTEGER NOT NULL,
+               cached_input_tokens INTEGER NOT NULL,
+               output_tokens INTEGER NOT NULL,
+               reasoning_output_tokens INTEGER NOT NULL,
+               total_tokens INTEGER NOT NULL,
+               UNIQUE(account_hash, thread_hash, model_id)
+             );
+             CREATE TABLE work_deltas (
+               id INTEGER PRIMARY KEY,
+               counter_id INTEGER NOT NULL REFERENCES work_counters(id),
+               logical_event_key BLOB NOT NULL UNIQUE,
+               project_id INTEGER NOT NULL REFERENCES projects(id),
+               occurred_at_ms INTEGER,
+               input_tokens INTEGER NOT NULL,
+               cached_input_tokens INTEGER NOT NULL,
+               output_tokens INTEGER NOT NULL,
+               reasoning_output_tokens INTEGER NOT NULL,
+               total_tokens INTEGER NOT NULL,
+               cache_metrics_available INTEGER NOT NULL
+             );
+             CREATE INDEX work_deltas_counter ON work_deltas(counter_id);
+             CREATE INDEX rollout_files_thread_hash ON rollout_files(rollout_key_hash);
+             INSERT INTO schema_migrations(version, name, checksum, applied_at_ms)
+               VALUES (4, 'account-scoped Work thread counters', 'v4', unixepoch('subsec') * 1000);",
+        )?;
+    }
+    if current_version <= 4 {
+        // The evidence is nullable. Refresh existing rollout files when present;
+        // archived usage and ambiguous counter deltas remain in the index.
+        transaction.execute_batch(
+            "DROP VIEW IF EXISTS indexed_usage;
+             ALTER TABLE usage_events ADD COLUMN request_input_tokens INTEGER CHECK(request_input_tokens >= 0);
+             UPDATE rollout_files SET parser_version = -1;
+             INSERT INTO schema_migrations(version, name, checksum, applied_at_ms)
+               VALUES (5, 'per-request input evidence for context pricing', 'v5', unixepoch('subsec') * 1000);"
+        )?;
+        transaction.execute_batch(&format!(
+            "CREATE VIEW indexed_usage AS {} {} {}",
+            super::store::CANONICAL_CTE,
+            super::store::rollout_rows("e.request_input_tokens"),
+            ADDITIONAL_USAGE_ROWS
+        ))?;
+    }
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     verify_parser_version(connection)
 }
@@ -111,6 +166,30 @@ pub(crate) fn verify_parser_version(connection: &Connection) -> IndexResult<()> 
 }
 
 use rusqlite::OptionalExtension;
+
+// A rollout with owned positive events is the authoritative event-level
+// source even when it arrives after a Work cumulative snapshot.
+const ADDITIONAL_USAGE_ROWS: &str = r#"
+UNION ALL
+SELECT d.id, d.logical_event_key, d.occurred_at_ms, c.model_id, d.project_id,
+       d.input_tokens, d.cached_input_tokens, d.output_tokens,
+       d.reasoning_output_tokens, d.total_tokens, d.cache_metrics_available, 1, NULL
+FROM work_deltas d JOIN work_counters c ON c.id = d.counter_id
+WHERE c.account_hash = (SELECT value FROM app_meta WHERE key = 'active_work_account')
+  AND NOT EXISTS (
+    SELECT 1 FROM rollout_files f
+    JOIN session_snapshots s ON s.rollout_key_hash = f.rollout_key_hash
+    JOIN usage_events e ON e.file_id = f.id
+    WHERE f.rollout_key_hash = c.thread_hash
+      AND (s.file_id IS NULL OR s.file_id = f.id)
+      AND e.total_tokens > 0
+  )
+UNION ALL
+SELECT id, logical_event_key, occurred_at_ms, model_id, project_id,
+       input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens,
+       total_tokens, cache_metrics_available, 0, input_tokens
+FROM desktop_usage_events
+"#;
 
 const V1_SCHEMA: &str = r#"
 CREATE TABLE schema_migrations (

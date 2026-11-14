@@ -1,18 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import type { DeviceUsageSummary, ModelPricingRule, PricingSettings } from "../core/types";
-
-const rateFields = ["inputPerMillion", "cachedInputPerMillion", "cacheWritePerMillion", "outputPerMillion"] as const;
-type RateField = typeof rateFields[number];
-export type PricingDraft = Omit<PricingSettings, "models" | "peak"> & {
-  pendingSpecialDate: string;
-  models: Array<Omit<ModelPricingRule, RateField> & Record<RateField, string>>;
-  peak: Omit<PricingSettings["peak"], "multiplier"> & { multiplier: string };
-};
+import type { DeviceUsageSummary, PricingSettings } from "../core/types";
+import { draftPricingModel, validateLongContextRule, type LongContextDraft, type PricingDraft } from "../core/pricing-transfer";
+export type { PricingDraft } from "../core/pricing-transfer";
 
 export function createPricingDraft(settings: PricingSettings): PricingDraft {
-  return { ...settings, pendingSpecialDate: "", peak: { ...settings.peak, multiplier: String(settings.peak.multiplier) }, models: settings.models.map(model => ({
-    ...model, inputPerMillion: model.inputPerMillion === null ? "" : String(model.inputPerMillion), cachedInputPerMillion: model.cachedInputPerMillion === null ? "" : String(model.cachedInputPerMillion), cacheWritePerMillion: model.cacheWritePerMillion === null ? "" : String(model.cacheWritePerMillion), outputPerMillion: model.outputPerMillion === null ? "" : String(model.outputPerMillion),
-  })) };
+  return { ...settings, pendingSpecialDate: "", peak: { ...settings.peak, multiplier: String(settings.peak.multiplier) }, models: settings.models.map(draftPricingModel) };
 }
 
 function decimal(value: string, optional: boolean): number | null {
@@ -20,6 +12,16 @@ function decimal(value: string, optional: boolean): number | null {
   if (optional && text === "") return null;
   if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(text) || !Number.isFinite(Number(text))) throw new Error("单价请输入有效的非负数字；留空表示未定价。");
   return Number(text);
+}
+
+function parseLongContext(rule: LongContextDraft | null | undefined, modelId: string) {
+  if (!rule) return null;
+  const multiplier = (value: string) => /^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim()) ? Number(value) : NaN;
+  return validateLongContextRule({
+    threshold: /^\d+$/.test(rule.threshold.trim()) ? Number(rule.threshold) : NaN,
+    inputMultiplier: multiplier(rule.inputMultiplier),
+    outputMultiplier: multiplier(rule.outputMultiplier),
+  }, modelId);
 }
 
 export function parsePricingDraft(draft: PricingDraft): PricingSettings {
@@ -48,7 +50,7 @@ export function parsePricingDraft(draft: PricingDraft): PricingSettings {
   }
   const { pendingSpecialDate: _, ...settings } = draft;
   return { ...settings, peak: { ...draft.peak, multiplier }, models: draft.models.map(model => ({
-    ...model, inputPerMillion: decimal(model.inputPerMillion, true), cachedInputPerMillion: decimal(model.cachedInputPerMillion, true), cacheWritePerMillion: decimal(model.cacheWritePerMillion, true), outputPerMillion: decimal(model.outputPerMillion, true),
+    ...model, longContext: parseLongContext(model.longContext, model.modelId), inputPerMillion: decimal(model.inputPerMillion, true), cachedInputPerMillion: decimal(model.cachedInputPerMillion, true), cacheWritePerMillion: decimal(model.cacheWritePerMillion, true), outputPerMillion: decimal(model.outputPerMillion, true),
   })) };
 }
 
@@ -60,7 +62,7 @@ export function appendUsedModels(draft: PricingDraft, usage: DeviceUsageSummary 
   }
   const ids = new Set(draft.models.map(model => model.modelId.trim().toLowerCase()));
   const added = [...totals].filter(([key]) => !ids.has(key)).sort((a, b) => b[1].tokens - a[1].tokens).map(([, { label }]) => ({
-    modelId: label, displayName: label, currency: "USD" as const, peakEnabled: false,
+    modelId: label, displayName: label, currency: "USD" as const, peakEnabled: false, longContext: null,
     inputPerMillion: "", cachedInputPerMillion: "", cacheWritePerMillion: "", outputPerMillion: "",
   }));
   return added.length ? { ...draft, models: [...draft.models, ...added] } : draft;

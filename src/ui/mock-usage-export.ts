@@ -11,7 +11,7 @@ function empty(): ExportMetrics {
 
 function add(target: ExportMetrics, value: ExportMetrics) {
   for (const key of Object.keys(target.usage) as Array<keyof ExportMetrics["usage"]>) target.usage[key] += value.usage[key];
-  for (const key of Object.keys(target.cost) as Array<keyof ExportMetrics["cost"]>) target.cost[key] += value.cost[key];
+  for (const key of ["usd", "cny", "unpricedTokens"] as const) target.cost[key] += value.cost[key];
 }
 
 /** Synthetic, internally reconcilable data used only by the browser demo adapter. */

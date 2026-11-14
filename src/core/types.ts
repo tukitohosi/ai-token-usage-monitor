@@ -99,6 +99,8 @@ export interface TokenCost {
   usd: number;
   cny: number;
   unpricedTokens: number;
+  /** Absent in snapshots saved before request-level long-context pricing. */
+  longContextUnconfirmedEvents?: number;
 }
 
 export interface DeviceUsageDimension {
@@ -213,6 +215,7 @@ export interface PriceCatalogEntry {
   currency: "USD" | "CNY";
   sourceLabel: string;
   tiers: PriceCatalogTier[];
+  longContext?: LongContextRule | null;
 }
 
 export type PricingCurrency = "USD" | "CNY";
@@ -233,6 +236,12 @@ export interface PeakPricingWindow {
   endTime: string;
 }
 
+export interface LongContextRule {
+  threshold: number;
+  inputMultiplier: number;
+  outputMultiplier: number;
+}
+
 export interface ModelPricingRule {
   /** Case-insensitive model label used by locally indexed events. */
   modelId: string;
@@ -243,6 +252,7 @@ export interface ModelPricingRule {
   cacheWritePerMillion: number | null;
   outputPerMillion: number | null;
   peakEnabled: boolean;
+  longContext?: LongContextRule | null;
 }
 
 export interface PricingSettings {
@@ -372,6 +382,12 @@ export interface DashboardSnapshot {
   planRenewalSource: "official" | "manual" | null;
   resetCredits: RateLimitResetCredits | null;
   accountUsage: AccountUsageReadResult | null;
+  hostedUsageCoverage?: {
+    todayCandidates: number;
+    todayWithThreadUsage: number;
+    updatedForDate?: string | null;
+    scope?: string | null;
+  } | null;
   /** Legacy phase-one data; the desktop app now uses deviceUsage. */
   localUsage?: LocalUsageSummary | null;
   deviceUsage?: DeviceUsageSummary | null;

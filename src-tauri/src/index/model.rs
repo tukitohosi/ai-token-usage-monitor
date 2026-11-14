@@ -62,6 +62,10 @@ pub struct LocalUsageSummary {
 pub struct LocalUsageEvent {
     pub task_key: String,
     pub occurred_at_ms: Option<i64>,
+    /// A Work counter can be located within a day, but has no per-call timestamp.
+    pub day_only: bool,
+    #[serde(skip)]
+    pub request_input_tokens: Option<i64>,
     pub model_label: String,
     pub project_label: String,
     pub usage: TokenUsage,
@@ -172,6 +176,7 @@ pub(crate) struct PendingUsageEvent {
     pub attribution: Attribution,
     pub usage: TokenUsage,
     pub cache_metrics_available: bool,
+    pub request_input_tokens: Option<i64>,
     pub payload_hash: Vec<u8>,
 }
 

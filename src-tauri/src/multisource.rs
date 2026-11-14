@@ -21,12 +21,14 @@ use crate::{
     pricing::{self, CostSummary, PriceUsage},
 };
 
-pub(crate) const MULTI_SOURCE_SCHEMA_VERSION: i64 = 4;
+pub(crate) const MULTI_SOURCE_SCHEMA_VERSION: i64 = 5;
 
 /// An internal numeric row, never sent directly to the webview or export file.
 pub(crate) struct IndexedExportEvent {
     pub(crate) source_id: String,
     pub(crate) occurred_at_ms: Option<i64>,
+    pub(crate) day_only: bool,
+    pub(crate) request_input_tokens: Option<i64>,
     pub(crate) model_label: String,
     pub(crate) project_label: String,
     pub(crate) usage: DeviceTokenUsage,
@@ -44,7 +46,10 @@ pub(crate) fn read_existing_export_events(
         [],
         |row| row.get(0),
     )?;
-    if version.parse::<i64>().ok() != Some(MULTI_SOURCE_SCHEMA_VERSION) {
+    let version = version
+        .parse::<i64>()
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    if !(4..=MULTI_SOURCE_SCHEMA_VERSION).contains(&version) {
         return Err(rusqlite::Error::InvalidQuery);
     }
     let placeholders = (0..source_ids.len())
@@ -60,7 +65,12 @@ pub(crate) fn read_existing_export_events(
     } else {
         ""
     };
-    let sql = format!("SELECT source, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens FROM source_events WHERE (?1 IS NULL OR (occurred_at_ms >= ?1 AND occurred_at_ms < ?2)) AND source IN ({placeholders}){canonical_filter}");
+    let request_input = if version >= 5 {
+        "request_input_tokens"
+    } else {
+        "NULL"
+    };
+    let sql = format!("SELECT source, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens, {request_input} FROM source_events WHERE (?1 IS NULL OR (occurred_at_ms >= ?1 AND occurred_at_ms < ?2)) AND source IN ({placeholders}){canonical_filter}");
     let mut parameters = vec![
         range
             .map(|value| rusqlite::types::Value::Integer(value.0))
@@ -75,6 +85,8 @@ pub(crate) fn read_existing_export_events(
         Ok(IndexedExportEvent {
             source_id: row.get(0)?,
             occurred_at_ms: row.get(1)?,
+            day_only: false,
+            request_input_tokens: row.get(13)?,
             model_label: row.get(2)?,
             project_label: row.get(3)?,
             usage: DeviceTokenUsage {
@@ -134,6 +146,17 @@ impl CacheWrites {
 }
 
 impl DeviceTokenUsage {
+    pub(crate) fn from_codex(usage: crate::index::TokenUsage) -> Self {
+        Self::from_parts(
+            usage.input_tokens - usage.cached_input_tokens,
+            usage.cached_input_tokens,
+            0,
+            usage.output_tokens,
+            usage.reasoning_output_tokens,
+            Some(usage.total_tokens),
+        )
+    }
+
     pub(crate) fn add_assign(&mut self, other: Self) {
         self.input_tokens += other.input_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
@@ -296,6 +319,7 @@ struct UsageEvent {
     identity: String,
     occurred_at_ms: Option<i64>,
     snapshot_ordinal: i64,
+    request_input_tokens: Option<i64>,
     model_label: String,
     project_label: String,
     usage: DeviceTokenUsage,
@@ -465,11 +489,14 @@ impl RangesAccumulator {
         usage: DeviceTokenUsage,
         cost: &CostSummary,
         occurred_at_ms: Option<i64>,
+        day_only: bool,
         today: NaiveDate,
     ) {
         let date = occurred_at_ms.and_then(local_date_from_ms);
         let now_ms = Utc::now().timestamp_millis();
-        let hour_start_ms = occurred_at_ms.and_then(|value| recent_hour_start(value, now_ms));
+        let hour_start_ms = occurred_at_ms
+            .filter(|_| !day_only)
+            .and_then(|value| recent_hour_start(value, now_ms));
         self.total
             .add_event(model, project, usage, cost, date, hour_start_ms);
         if hour_start_ms.is_some() {
@@ -1231,7 +1258,7 @@ impl MultiSourceIndex {
         let mut indexed_events = 0_i64;
         let today_date = Local::now().date_naive();
         let events = self.connection.prepare(
-            "SELECT occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens FROM source_events WHERE source = ?1 AND workbuddy_suppressed = 0",
+            "SELECT occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, output_tokens, reasoning_output_tokens, total_tokens, request_input_tokens FROM source_events WHERE source = ?1 AND workbuddy_suppressed = 0",
         );
         if let Ok(mut statement) = events {
             if let Ok(rows) = statement.query_map([state.id], |row| {
@@ -1250,12 +1277,13 @@ impl MultiSourceIndex {
                         reasoning_output_tokens: row.get(10)?,
                         total_tokens: row.get(11)?,
                     },
+                    row.get::<_, Option<i64>>(12)?,
                 ))
             }) {
                 for row in rows.flatten() {
                     indexed_events += 1;
-                    let event_cost = cost_for(&row.1, row.3, row.0, pricing_settings);
-                    ranges.add_event(&row.1, &row.2, row.3, &event_cost, row.0, today_date);
+                    let event_cost = cost_for(&row.1, row.3, row.4, row.0, pricing_settings);
+                    ranges.add_event(&row.1, &row.2, row.3, &event_cost, row.0, false, today_date);
                 }
             }
         }
@@ -1295,7 +1323,7 @@ impl MultiSourceIndex {
             return Err(());
         };
         let mut statement = self.connection.prepare(
-            "SELECT source, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, cache_metrics_available, output_tokens, reasoning_output_tokens, total_tokens
+            "SELECT source, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, cache_metrics_available, output_tokens, reasoning_output_tokens, total_tokens, request_input_tokens
              FROM source_events
              WHERE occurred_at_ms >= ?1 AND occurred_at_ms < ?2 AND workbuddy_suppressed = 0
              ORDER BY occurred_at_ms DESC",
@@ -1324,6 +1352,7 @@ impl MultiSourceIndex {
                     model_label,
                     project_label,
                     usage,
+                    row.get(14)?,
                     cache_metrics_available,
                     pricing_settings,
                 ))
@@ -1354,23 +1383,20 @@ pub(crate) fn codex_day_tasks_with_pricing(
     events
         .into_iter()
         .map(|event| {
-            let usage = DeviceTokenUsage::from_parts(
-                event.usage.input_tokens - event.usage.cached_input_tokens,
-                event.usage.cached_input_tokens,
-                0,
-                event.usage.output_tokens,
-                event.usage.reasoning_output_tokens,
-                Some(event.usage.total_tokens),
-            );
-            task_detail_with_pricing(
-                event.occurred_at_ms,
+            let mut detail = task_detail_with_pricing(
+                event.occurred_at_ms.filter(|_| !event.day_only),
                 SOURCE_CODEX.to_owned(),
                 event.model_label,
                 event.project_label,
-                usage,
+                DeviceTokenUsage::from_codex(event.usage),
+                event.request_input_tokens,
                 event.cache_metrics_available,
                 pricing_settings,
-            )
+            );
+            if event.day_only {
+                detail.task_label = "Work 会话用量汇总".to_owned();
+            }
+            detail
         })
         .collect()
 }
@@ -1390,6 +1416,7 @@ fn task_detail(
         model_label,
         project_label,
         usage,
+        None,
         cache_metrics_available,
         &pricing::PricingSettings::default(),
     )
@@ -1401,6 +1428,7 @@ fn task_detail_with_pricing(
     model_label: String,
     project_label: String,
     usage: DeviceTokenUsage,
+    request_input_tokens: Option<i64>,
     cache_metrics_available: bool,
     pricing_settings: &pricing::PricingSettings,
 ) -> TaskUsageDetail {
@@ -1414,7 +1442,13 @@ fn task_detail_with_pricing(
         .and_then(|time| Local.timestamp_millis_opt(time).single())
         .map(|time| format!("本机任务 · {}", time.format("%H:%M")))
         .unwrap_or_else(|| "本机任务".to_owned());
-    let cost = cost_for(&model_label, usage, occurred_at_ms, pricing_settings);
+    let cost = cost_for(
+        &model_label,
+        usage,
+        request_input_tokens,
+        occurred_at_ms,
+        pricing_settings,
+    );
     TaskUsageDetail {
         occurred_at_ms,
         source: source_label(&source).to_owned(),
@@ -1456,24 +1490,17 @@ fn codex_summary_with_pricing(
     new_events: Option<i64>,
     pricing_settings: &pricing::PricingSettings,
 ) -> UsageSourceSummary {
-    let convert = |usage: crate::index::TokenUsage| {
-        DeviceTokenUsage::from_parts(
-            usage.input_tokens - usage.cached_input_tokens,
-            usage.cached_input_tokens,
-            0,
-            usage.output_tokens,
-            usage.reasoning_output_tokens,
-            Some(usage.total_tokens),
-        )
-    };
     let mut ranges = RangesAccumulator::default();
     let today_date = Local::now().date_naive();
+    let mut has_work_usage = false;
     for event in events {
-        let usage = convert(event.usage);
+        has_work_usage |= event.day_only;
+        let usage = DeviceTokenUsage::from_codex(event.usage);
         let cost = cost_for(
             &event.model_label,
             usage,
-            event.occurred_at_ms,
+            event.request_input_tokens,
+            event.occurred_at_ms.filter(|_| !event.day_only),
             pricing_settings,
         );
         ranges.add_event(
@@ -1482,12 +1509,16 @@ fn codex_summary_with_pricing(
             usage,
             &cost,
             event.occurred_at_ms,
+            event.day_only,
             today_date,
         );
     }
     let ranges = ranges.finish();
     let refresh_succeeded = new_events.is_some();
     let mut messages = summary.warnings;
+    if has_work_usage {
+        messages.push("Work 会话提供汇总用量。可确认日期的记录计入每日统计，跨日且无法分日的记录只计入累计。汇总费用按基础单价估算，小时图仅包含有具体时间的记录。".to_owned());
+    }
     if !refresh_succeeded {
         messages.insert(
             0,
@@ -1622,6 +1653,20 @@ fn parse_claude_file(path: &Path, contents: &str) -> ParsedUsageEvents {
         } else {
             number(usage.get("cache_creation_input_tokens")).unwrap_or(0)
         };
+        // Anthropic input_tokens excludes both cache reads and writes. An absent
+        // component cannot establish the size of the request.
+        let reported_writes = number(usage.get("cache_creation_input_tokens"));
+        let complete_writes = match (cache_write_5m, cache_write_1h, reported_writes) {
+            (None, None, reported) => reported,
+            (Some(short), Some(long), reported) => short
+                .checked_add(long)
+                .filter(|total| reported.map_or(true, |value| *total == value)),
+            (short, long, Some(reported)) if short.or(long) == Some(reported) => Some(reported),
+            _ => None,
+        };
+        let request_input_tokens = number(usage.get("cache_read_input_tokens"))
+            .zip(complete_writes)
+            .and_then(|(read, writes)| input.checked_add(read)?.checked_add(writes));
         let cache_metrics_available = usage.get("cache_read_input_tokens").is_some()
             || usage.get("cache_creation_input_tokens").is_some()
             || cache_write_5m.is_some()
@@ -1649,6 +1694,7 @@ fn parse_claude_file(path: &Path, contents: &str) -> ParsedUsageEvents {
             identity: identity.clone(),
             occurred_at_ms: timestamp(value.get("timestamp")),
             snapshot_ordinal: i64::try_from(index).unwrap_or(i64::MAX),
+            request_input_tokens,
             model_label: text(message.get("model")).unwrap_or("未知模型").to_owned(),
             project_label: project_label(text(value.get("cwd")).unwrap_or("")),
             usage: DeviceTokenUsage::from_cache_parts(
@@ -1709,19 +1755,23 @@ fn parse_workbuddy_trace(
         let normalized = value.pointer("/providerData/usage");
         let message_usage = value.pointer("/message/usage");
         let trace = value.get("trace");
-        let call_usage = raw
-            .and_then(workbuddy_raw_usage)
-            .filter(|usage| usage.total_tokens > 0)
+        let call = raw
+            .and_then(|v| Some((workbuddy_raw_usage(v)?, number(v.get("prompt_tokens"))?)))
+            .filter(|(usage, _)| usage.total_tokens > 0)
             .or_else(|| {
-                normalized
-                    .and_then(workbuddy_normalized_usage)
-                    .filter(|usage| usage.total_tokens > 0)
+                let v = normalized?;
+                Some((
+                    workbuddy_normalized_usage(v)?,
+                    number(v.get("inputTokens"))?,
+                ))
+                .filter(|(usage, _)| usage.total_tokens > 0)
             })
             .or_else(|| {
-                message_usage
-                    .and_then(workbuddy_message_usage)
-                    .filter(|usage| usage.total_tokens > 0)
+                let v = message_usage?;
+                Some((workbuddy_message_usage(v)?, number(v.get("input_tokens"))?))
+                    .filter(|(usage, _)| usage.total_tokens > 0)
             });
+        let call_usage = call.map(|(usage, _)| usage);
         let is_summary = call_usage.is_none();
         let usage = call_usage.or_else(|| trace.and_then(workbuddy_trace_summary_usage));
         let Some(usage) = usage.filter(|usage| usage.total_tokens > 0) else {
@@ -1789,6 +1839,11 @@ fn parse_workbuddy_trace(
             occurred_at_ms: timestamp(value.get("timestamp"))
                 .or_else(|| trace.and_then(|trace| timestamp(trace.get("startedAt")))),
             snapshot_ordinal: i64::try_from(index).unwrap_or(i64::MAX),
+            // Each selected call parser requires a reported, inclusive input
+            // count. A trace summary can contain arbitrarily many calls.
+            request_input_tokens: call.and_then(|(usage, prompt)| {
+                (prompt.checked_add(usage.output_tokens)? == usage.total_tokens).then_some(prompt)
+            }),
             model_label: model.to_owned(),
             project_label: session_labels
                 .get(session)
@@ -1942,11 +1997,26 @@ fn read_opencode_events(path: &Path) -> Result<ParsedUsageEvents, ()> {
     connection
         .busy_timeout(std::time::Duration::from_secs(3))
         .map_err(|_| ())?;
-    let mut statement = connection.prepare(
-        "SELECT part.id, part.time_updated, part.data, session.directory, session.model
-         FROM part LEFT JOIN session ON session.id = part.session_id
-         WHERE json_extract(part.data, '$.type') = 'step-finish' AND json_type(part.data, '$.tokens') IS NOT NULL",
+    // A session's selected model can change. A step belongs to the specific
+    // assistant message it finished. Older databases lack this join.
+    let message_schema: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('part') WHERE name='message_id')
+          AND (SELECT count(*) FROM pragma_table_info('message') WHERE name IN ('id','session_id','data'))=3",
+        [], |row| row.get(0),
     ).map_err(|_| ())?;
+    let (join, model) = if message_schema {
+        ("LEFT JOIN message ON message.id=part.message_id AND message.session_id=part.session_id",
+         "CASE WHEN json_valid(message.data) THEN CASE WHEN json_extract(message.data,'$.role')='assistant'
+            AND json_type(message.data,'$.modelID')='text' THEN nullif(trim(json_extract(message.data,'$.modelID')),'') END END")
+    } else {
+        ("", "NULL")
+    };
+    let sql = format!(
+        "SELECT part.id, part.time_updated, part.data, session.directory, session.model, {model}
+         FROM part LEFT JOIN session ON session.id = part.session_id {join}
+         WHERE json_extract(part.data, '$.type') = 'step-finish' AND json_type(part.data, '$.tokens') IS NOT NULL"
+    );
+    let mut statement = connection.prepare(&sql).map_err(|_| ())?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -1955,6 +2025,7 @@ fn read_opencode_events(path: &Path) -> Result<ParsedUsageEvents, ()> {
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(|_| ())?;
@@ -1990,7 +2061,13 @@ fn read_opencode_events(path: &Path) -> Result<ParsedUsageEvents, ()> {
             identity: row.0,
             occurred_at_ms: Some(row.1),
             snapshot_ordinal: 0,
-            model_label: opencode_model_label(row.4.as_deref()),
+            request_input_tokens: number(tokens.get("input"))
+                .zip(number(tokens.pointer("/cache/read")))
+                .zip(number(tokens.pointer("/cache/write")))
+                .and_then(|((input, read), write)| input.checked_add(read)?.checked_add(write)),
+            model_label: row
+                .5
+                .unwrap_or_else(|| opencode_model_label(row.4.as_deref())),
             project_label: project_label(row.3.as_deref().unwrap_or("")),
             usage: DeviceTokenUsage::from_parts(
                 input,
@@ -2109,8 +2186,8 @@ fn insert_event(
         |row| row.get::<_, bool>(0),
     )?;
     transaction.execute(
-        "INSERT INTO source_events(event_key, source, source_file_key, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, cache_metrics_available, output_tokens, reasoning_output_tokens, total_tokens, snapshot_ordinal, legacy_pending)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0)
+        "INSERT INTO source_events(event_key, source, source_file_key, occurred_at_ms, model_label, project_label, input_tokens, cached_input_tokens, cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_write_unknown_tokens, cache_metrics_available, output_tokens, reasoning_output_tokens, total_tokens, snapshot_ordinal, request_input_tokens, legacy_pending)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0)
          ON CONFLICT(event_key) DO UPDATE SET
            source_file_key = excluded.source_file_key,
            occurred_at_ms = excluded.occurred_at_ms,
@@ -2122,14 +2199,14 @@ fn insert_event(
            cache_write_unknown_tokens = excluded.cache_write_unknown_tokens,
            cache_metrics_available = excluded.cache_metrics_available,
            output_tokens = excluded.output_tokens, reasoning_output_tokens = excluded.reasoning_output_tokens,
-           total_tokens = excluded.total_tokens, snapshot_ordinal = excluded.snapshot_ordinal, legacy_pending = 0
+           total_tokens = excluded.total_tokens, snapshot_ordinal = excluded.snapshot_ordinal, request_input_tokens = excluded.request_input_tokens, request_backfill_pending = 0, legacy_pending = 0
          WHERE source_events.legacy_pending = 1
             OR coalesce(excluded.occurred_at_ms, -9223372036854775808) > coalesce(source_events.occurred_at_ms, -9223372036854775808)
             OR (excluded.occurred_at_ms IS source_events.occurred_at_ms
                 AND (excluded.snapshot_ordinal > source_events.snapshot_ordinal
                      OR (excluded.snapshot_ordinal = source_events.snapshot_ordinal
                          AND excluded.source_file_key >= source_events.source_file_key)))",
-        params![event_key.as_slice(), source, file_key.as_slice(), event.occurred_at_ms, event.model_label, event.project_label, event.usage.input_tokens, event.usage.cached_input_tokens, event.usage.cache_write_tokens, event.usage.cache_write_5m_tokens, event.usage.cache_write_1h_tokens, event.usage.cache_write_unknown_tokens, i64::from(event.cache_metrics_available), event.usage.output_tokens, event.usage.reasoning_output_tokens, event.usage.total_tokens, event.snapshot_ordinal],
+        params![event_key.as_slice(), source, file_key.as_slice(), event.occurred_at_ms, event.model_label, event.project_label, event.usage.input_tokens, event.usage.cached_input_tokens, event.usage.cache_write_tokens, event.usage.cache_write_5m_tokens, event.usage.cache_write_1h_tokens, event.usage.cache_write_unknown_tokens, i64::from(event.cache_metrics_available), event.usage.output_tokens, event.usage.reasoning_output_tokens, event.usage.total_tokens, event.snapshot_ordinal, event.request_input_tokens],
     )?;
     transaction.execute(
         "INSERT OR IGNORE INTO source_event_files(source, source_file_key, event_key) VALUES(?1, ?2, ?3)",
@@ -2220,7 +2297,7 @@ fn prune_orphan_events(
 ) -> rusqlite::Result<()> {
     transaction.execute(
         "DELETE FROM source_events AS event
-         WHERE event.source = ?1
+         WHERE event.source = ?1 AND event.request_backfill_pending = 0
            AND NOT EXISTS (
              SELECT 1 FROM source_event_files AS mapping
              WHERE mapping.source = event.source AND mapping.event_key = event.event_key
@@ -2259,8 +2336,9 @@ fn dimensions_from_map(values: HashMap<String, DimensionAccumulator>) -> Vec<Dev
     dimensions
 }
 
-fn price_usage(usage: DeviceTokenUsage) -> PriceUsage {
+fn price_usage(usage: DeviceTokenUsage, request_input_tokens: Option<i64>) -> PriceUsage {
     PriceUsage {
+        request_input_tokens,
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         cache_write_5m_tokens: usage.cache_write_5m_tokens,
@@ -2274,12 +2352,13 @@ fn price_usage(usage: DeviceTokenUsage) -> PriceUsage {
 pub(crate) fn cost_for(
     model_label: &str,
     usage: DeviceTokenUsage,
+    request_input_tokens: Option<i64>,
     occurred_at_ms: Option<i64>,
     pricing_settings: &pricing::PricingSettings,
 ) -> CostSummary {
     pricing::estimate(
         model_label,
-        price_usage(usage),
+        price_usage(usage, request_input_tokens),
         occurred_at_ms,
         pricing_settings,
     )
@@ -2317,7 +2396,9 @@ fn backup_before_source_migration(connection: &Connection, path: &Path) -> rusql
         .file_name()
         .ok_or(rusqlite::Error::InvalidQuery)?
         .to_string_lossy();
-    let backup = path.with_file_name(format!("{name}.before-v4-{suffix}.sqlite3"));
+    let backup = path.with_file_name(format!(
+        "{name}.before-v{MULTI_SOURCE_SCHEMA_VERSION}-{suffix}.sqlite3"
+    ));
     if backup.exists() {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -2354,10 +2435,15 @@ fn migrate_derived_source_index(connection: &mut Connection) -> rusqlite::Result
          SELECT source, source_file_key, -1, NULL, 0 FROM source_events",
         [],
     )?;
-    transaction.execute(
-        "UPDATE source_events SET legacy_pending = 1 WHERE source = ?1",
-        [SOURCE_CLAUDE],
-    )?;
+    // Rows absent from an already truncated source have no replacement.
+    // Keep them across future scans until a recognized event supersedes them.
+    transaction.execute("UPDATE source_events SET request_backfill_pending = 1", [])?;
+    if current.unwrap_or(0) < 4 {
+        transaction.execute(
+            "UPDATE source_events SET legacy_pending = 1 WHERE source = ?1",
+            [SOURCE_CLAUDE],
+        )?;
+    }
     if current.unwrap_or(0) < 3 {
         transaction.execute(
             "UPDATE source_events SET cache_write_unknown_tokens = max(cache_write_unknown_tokens, cache_write_tokens - cache_write_5m_tokens - cache_write_1h_tokens)", [],
@@ -2381,6 +2467,14 @@ fn ensure_source_event_columns(connection: &Connection) -> rusqlite::Result<()> 
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     for (name, definition) in [
+        (
+            "request_input_tokens",
+            "INTEGER CHECK(request_input_tokens >= 0)",
+        ),
+        (
+            "request_backfill_pending",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(request_backfill_pending IN (0,1))",
+        ),
         (
             "cache_write_5m_tokens",
             "INTEGER NOT NULL DEFAULT 0 CHECK(cache_write_5m_tokens >= 0)",
@@ -2612,6 +2706,10 @@ fn project_label(value: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "long_context_replay_test.rs"]
+mod long_context_replay_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -2660,7 +2758,7 @@ mod tests {
 
     fn claude_line(session: &str, message: &str, extra: &str) -> String {
         format!(
-            r#"{{"type":"assistant","sessionId":"{session}","uuid":"{message}","timestamp":"2026-08-28T00:00:00Z","cwd":"C:\\Users\\稚青\\private-project","message":{{"id":"{message}","model":"claude-test","content":"不应保存的对话正文 {extra}","usage":{{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40}}}}}}"#,
+            r#"{{"type":"assistant","sessionId":"{session}","uuid":"{message}","timestamp":"2026-08-28T00:00:00Z","cwd":"C:\\Users\\测试用户\\private-project","message":{{"id":"{message}","model":"claude-test","content":"不应保存的对话正文 {extra}","usage":{{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40}}}}}}"#,
         )
     }
 
@@ -2682,7 +2780,7 @@ mod tests {
                 "INSERT INTO session(id, directory, model) VALUES(?1, ?2, ?3)",
                 params![
                     "session-private",
-                    "C:\\Users\\稚青\\OpenCode Project",
+                    "C:\\Users\\测试用户\\OpenCode Project",
                     r#"{"modelID":"open-model"}"#
                 ],
             )
@@ -2700,6 +2798,7 @@ mod tests {
         let events = parse_claude_file(Path::new("fixture.jsonl"), lines);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].usage.total_tokens, 100);
+        assert_eq!(events[0].request_input_tokens, Some(60));
         assert_eq!(events[0].usage.cache_write_tokens, 30);
     }
 
@@ -2708,6 +2807,7 @@ mod tests {
         let lines = "{\"type\":\"assistant\",\"sessionId\":\"s\",\"uuid\":\"m\",\"timestamp\":\"2026-08-28T00:00:00Z\",\"message\":{\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":20,\"cache_creation\":{\"ephemeral_5m_input_tokens\":30,\"ephemeral_1h_input_tokens\":40},\"output_tokens\":50}}}\n";
         let events = parse_claude_file(Path::new("fixture.jsonl"), lines);
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_input_tokens, Some(100));
         assert_eq!(events[0].usage.cache_write_5m_tokens, 30);
         assert_eq!(events[0].usage.cache_write_1h_tokens, 40);
         assert_eq!(events[0].usage.cache_write_unknown_tokens, 0);
@@ -2731,6 +2831,116 @@ mod tests {
         })
         .to_string()
             + "\n"
+    }
+
+    #[test]
+    fn migrated_request_evidence_reconciles_across_dashboard_day_and_export() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let available = directory.path().join("available.jsonl");
+        let archived = directory.path().join("archived.jsonl");
+        let dated = |reply: &str, input: i64, caches: bool| {
+            let mut usage = serde_json::json!({"input_tokens": input, "output_tokens": 10});
+            if caches {
+                usage["cache_read_input_tokens"] = 10.into();
+                usage["cache_creation_input_tokens"] = 5.into();
+            }
+            serde_json::json!({"type":"assistant","sessionId":"session","timestamp":Local::now().to_rfc3339(),
+                "message":{"id":reply,"model":"tier-model","usage":usage}}).to_string() + "\n"
+        };
+        fs::write(
+            &available,
+            dated("small", 20, true) + &dated("long", 21, true) + &dated("partial", 40, false),
+        )
+        .unwrap();
+        fs::write(&archived, dated("archive", 50, true)).unwrap();
+        {
+            let mut index = MultiSourceIndex::open(&database).unwrap();
+            index
+                .scan_files(
+                    SOURCE_CLAUDE,
+                    &[available.clone(), archived.clone()],
+                    parse_claude_file,
+                    |_, _| {},
+                )
+                .unwrap();
+            index
+                .connection
+                .execute_batch(
+                    "ALTER TABLE source_events DROP COLUMN request_input_tokens;
+                UPDATE source_index_meta SET value='4' WHERE key='schema-version';",
+                )
+                .unwrap();
+        }
+        // Simulate one file that lost an otherwise complete historical line
+        // and another whose source has disappeared entirely.
+        let shortened = fs::read_to_string(&available).unwrap();
+        let shortened = shortened.lines().take(2).collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(&available, &shortened).unwrap();
+        fs::remove_file(archived).unwrap();
+        let sources = vec![SOURCE_CLAUDE.to_owned()];
+        let old = read_existing_export_events(&database, &sources, None).unwrap();
+        assert_eq!(old.len(), 4);
+        assert!(old.iter().all(|e| e.request_input_tokens.is_none()));
+        let mut index = MultiSourceIndex::open(&database).unwrap();
+        index
+            .scan_files(
+                SOURCE_CLAUDE,
+                std::slice::from_ref(&available),
+                parse_claude_file,
+                |_, _| {},
+            )
+            .unwrap();
+        // A later clean scan must preserve the rotated-out row as well.
+        fs::write(&available, shortened + "\n").unwrap();
+        index
+            .scan_files(SOURCE_CLAUDE, &[available], parse_claude_file, |_, _| {})
+            .unwrap();
+        let prices = pricing::PricingSettings {
+            models: vec![pricing::ModelPricingRule {
+                model_id: "tier-model".into(),
+                display_name: "tier-model".into(),
+                currency: "USD".into(),
+                input_per_million: Some(1_000_000.0),
+                cached_input_per_million: Some(1_000_000.0),
+                cache_write_per_million: Some(1_000_000.0),
+                output_per_million: Some(1_000_000.0),
+                peak_enabled: false,
+                long_context: Some(pricing::LongContextRule {
+                    threshold: 35,
+                    input_multiplier: 2.,
+                    output_multiplier: 1.5,
+                }),
+            }],
+            ..Default::default()
+        };
+        let source = index.aggregate_source_with_pricing(
+            SourceState::ready(SOURCE_CLAUDE, "Claude Code"),
+            &prices,
+        );
+        assert_eq!(source.total.total_tokens, 216);
+        // Base = 216; just one 36-input request adds 36 + 10 * .5.
+        assert_eq!(source.cost.usd, 257.);
+        assert_eq!(source.cost.long_context_unconfirmed_events, 2);
+        assert_eq!(source.by_project[0].cost, source.cost);
+        let day = Local::now().date_naive().to_string();
+        let mut daily = CostSummary::default();
+        for task in index.day_tasks_with_pricing(&day, &prices).unwrap() {
+            daily.add_assign(&task.cost);
+        }
+        assert_eq!(daily, source.cost);
+        let events = read_existing_export_events(&database, &sources, None).unwrap();
+        let mut export = CostSummary::default();
+        for row in events {
+            export.add_assign(&cost_for(
+                &row.model_label,
+                row.usage,
+                row.request_input_tokens,
+                row.occurred_at_ms,
+                &prices,
+            ));
+        }
+        assert_eq!(export, daily);
     }
 
     #[test]
@@ -2871,7 +3081,7 @@ mod tests {
         let backup = fs::read_dir(temporary.path())
             .unwrap()
             .flatten()
-            .find(|entry| entry.file_name().to_string_lossy().contains(".before-v4-"))
+            .find(|entry| entry.file_name().to_string_lossy().contains(".before-v5-"))
             .unwrap();
         let backup_connection =
             Connection::open_with_flags(backup.path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
@@ -3099,6 +3309,7 @@ mod tests {
     fn workbuddy_prefers_raw_usage_without_double_counting_fallbacks() {
         let trace = "{\"sessionId\":\"s\",\"timestamp\":1787875200000,\"providerData\":{\"requestModelId\":\"model\",\"rawUsage\":{\"prompt_tokens\":100,\"prompt_cache_hit_tokens\":20,\"prompt_cache_write_tokens\":10,\"completion_tokens\":30,\"total_tokens\":130},\"usage\":{\"inputTokens\":999,\"outputTokens\":999}}}";
         let events = parse_workbuddy_trace(Path::new("trace_one.json"), trace, &HashMap::new());
+        assert_eq!(events[0].request_input_tokens, Some(100));
         assert_eq!(events[0].usage.total_tokens, 130);
         assert_eq!(events[0].usage.input_tokens, 70);
     }
@@ -3432,6 +3643,7 @@ mod tests {
             trace,
             &HashMap::new(),
         );
+        assert_eq!(events[0].request_input_tokens, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].usage.input_tokens, 70);
         assert_eq!(events[0].usage.cached_input_tokens, 30);
@@ -3488,8 +3700,18 @@ mod tests {
         );
         let events = read_opencode_events(&database).expect("read OpenCode WAL");
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_input_tokens, Some(15));
         assert_eq!(events[0].usage.cache_write_tokens, 2);
         assert_eq!(events[0].usage.reasoning_output_tokens, 4);
+
+        writer.execute_batch(
+            r#"ALTER TABLE part ADD COLUMN message_id TEXT;
+             CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+             INSERT INTO message VALUES('reply','session-private','{"role":"assistant","modelID":"actual-model","providerID":"service"}');
+             UPDATE part SET message_id = 'reply';"#
+        ).unwrap();
+        let linked = read_opencode_events(&database).unwrap();
+        assert_eq!(linked[0].model_label, "actual-model");
 
         let mut index = MultiSourceIndex::open(&temporary.path().join("usage-index-v2.sqlite3"))
             .expect("open index");
@@ -3610,7 +3832,7 @@ mod tests {
             "TOP_SECRET_PROMPT_TEXT",
             "very-private-session",
             "very-private-message",
-            "C:\\Users\\稚青",
+            "C:\\Users\\测试用户",
         ] {
             assert!(!serialized.contains(private_value));
         }
@@ -3627,7 +3849,7 @@ mod tests {
             "TOP_SECRET_PROMPT_TEXT",
             "very-private-session",
             "very-private-message",
-            "C:\\Users\\稚青",
+            "C:\\Users\\测试用户",
         ] {
             assert!(!indexed_text.contains(private_value));
         }
@@ -3650,6 +3872,55 @@ mod tests {
     }
 
     #[test]
+    fn work_summaries_use_date_and_model_without_inventing_an_hour() {
+        let dated = LocalUsageEvent {
+            task_key: "fixture".into(),
+            occurred_at_ms: Some(Local::now().timestamp_millis()),
+            day_only: true,
+            request_input_tokens: None,
+            model_label: "work-model".into(),
+            project_label: "work-project".into(),
+            usage: crate::index::TokenUsage {
+                input_tokens: 80,
+                cached_input_tokens: 60,
+                output_tokens: 20,
+                total_tokens: 100,
+                ..Default::default()
+            },
+            cache_metrics_available: true,
+        };
+        let undated = LocalUsageEvent {
+            occurred_at_ms: None,
+            ..dated.clone()
+        };
+        let summary = crate::index::IncrementalIndex::open_in_memory()
+            .unwrap()
+            .aggregate()
+            .unwrap();
+        let source = codex_summary_with_pricing(
+            summary,
+            vec![dated.clone(), undated],
+            Some(0),
+            &pricing::PricingSettings::default(),
+        );
+        assert_eq!(source.total.total_tokens, 200);
+        assert_eq!(source.today.total_tokens, 100);
+        assert_eq!(source.today.input_tokens, 20);
+        assert_eq!(source.today.cached_input_tokens, 60);
+        assert_eq!(source.ranges.last7_days.daily_usage.len(), 1);
+        assert_eq!(
+            source.ranges.last30_days.by_project[0].usage.total_tokens,
+            100
+        );
+        assert_eq!(source.today_by_model[0].label, "work-model");
+        assert_eq!(source.ranges.last24_hours.usage.total_tokens, 0);
+        assert!(source.ranges.total.hourly_usage.is_empty());
+        let details = codex_day_tasks(vec![dated]);
+        assert_eq!(details[0].occurred_at_ms, None);
+        assert_eq!(details[0].task_label, "Work 会话用量汇总");
+    }
+
+    #[test]
     fn today_cost_and_models_exclude_events_without_a_reliable_timestamp() {
         let temporary = tempdir().expect("temp dir");
         let mut index = MultiSourceIndex::open(&temporary.path().join("usage-index-v2.sqlite3"))
@@ -3667,6 +3938,7 @@ mod tests {
                     identity: "dated".to_owned(),
                     occurred_at_ms: Some(Local::now().timestamp_millis()),
                     snapshot_ordinal: 0,
+                    request_input_tokens: None,
                     model_label: "claude-sonnet-4-20250514".to_owned(),
                     project_label: "fixture".to_owned(),
                     usage: current_usage,
@@ -3682,6 +3954,7 @@ mod tests {
                     identity: "undated".to_owned(),
                     occurred_at_ms: None,
                     snapshot_ordinal: 0,
+                    request_input_tokens: None,
                     model_label: "unknown-model".to_owned(),
                     project_label: "fixture".to_owned(),
                     usage: unpriced_usage,
@@ -3704,6 +3977,7 @@ mod tests {
                 cache_write_per_million: Some(3.75),
                 output_per_million: Some(15.0),
                 peak_enabled: false,
+                long_context: None,
             }],
         };
         let summary = index.aggregate_source_with_pricing(
@@ -3765,7 +4039,7 @@ mod tests {
 
     #[test]
     fn project_labels_never_keep_a_full_path() {
-        assert_eq!(project_label("C:\\Users\\稚青\\demo"), "demo");
+        assert_eq!(project_label("C:\\Users\\测试用户\\demo"), "demo");
     }
 
     #[test]

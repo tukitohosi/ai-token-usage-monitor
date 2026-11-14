@@ -118,6 +118,8 @@ pub(crate) struct DashboardSnapshot {
     pub(crate) plan_renewal_source: Option<&'static str>,
     pub(crate) reset_credits: Option<RateLimitResetCredits>,
     pub(crate) account_usage: Option<AccountUsageReadResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hosted_usage_coverage: Option<crate::hosted_usage::HostedUsageCoverage>,
     pub(crate) device_usage: Option<DeviceUsageSummary>,
     pub(crate) last_successful_at: Option<String>,
     pub(crate) refresh_progress: Option<RefreshProgress>,
@@ -144,6 +146,7 @@ impl DashboardSnapshot {
             plan_renewal_source: None,
             reset_credits: None,
             account_usage: None,
+            hosted_usage_coverage: None,
             device_usage: None,
             last_successful_at: None,
             refresh_progress: None,
@@ -157,22 +160,34 @@ impl DashboardSnapshot {
 
 pub(crate) fn read_dashboard_snapshot(
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> DashboardSnapshot {
+) -> (DashboardSnapshot, Option<AppServerClient>) {
     let read_started = Instant::now();
     let fetched_at = Utc::now().to_rfc3339();
     let mut client = match AppServerClient::connect(cancelled) {
         Ok(client) => client,
         Err(error) => {
-            return with_account_diagnostics(
-                connection_failure(error, fetched_at.clone()),
-                fetched_at,
-                read_started,
-                Vec::new(),
-            )
+            return (
+                with_account_diagnostics(
+                    connection_failure(error, fetched_at.clone()),
+                    fetched_at,
+                    read_started,
+                    Vec::new(),
+                ),
+                None,
+            );
         }
     };
-    let codex_version = version_from_user_agent(&client.server_user_agent);
+    let snapshot = read_connected_account(&mut client, fetched_at, read_started);
+    let authenticated = snapshot.account_identity.is_some();
+    (snapshot, authenticated.then_some(client))
+}
 
+fn read_connected_account(
+    client: &mut AppServerClient,
+    fetched_at: String,
+    read_started: Instant,
+) -> DashboardSnapshot {
+    let codex_version = version_from_user_agent(&client.server_user_agent);
     let account = match client.account_read() {
         Ok(account) => account,
         Err(error) => {
@@ -249,6 +264,7 @@ pub(crate) fn read_dashboard_snapshot(
             plan_renewal_source: None,
             reset_credits,
             account_usage: account_usage.ok(),
+            hosted_usage_coverage: None,
             device_usage: None,
             last_successful_at: Some(fetched_at.clone()),
             refresh_progress: None,
@@ -312,7 +328,7 @@ mod tests {
     #[test]
     #[ignore = "requires the locally installed and authenticated Codex app"]
     fn live_snapshot_uses_only_the_sanitized_dashboard_contract() {
-        let snapshot = read_dashboard_snapshot(Default::default());
+        let (snapshot, _) = read_dashboard_snapshot(Default::default());
         assert_eq!(snapshot.status, "ready");
         assert!(snapshot.fetched_at.is_some());
         assert!(snapshot.codex_version.is_some());

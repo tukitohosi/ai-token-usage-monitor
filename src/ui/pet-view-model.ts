@@ -43,6 +43,7 @@ export function buildPetUsageView(snapshot: DashboardSnapshot | null, now: numbe
     `今日全部来源：${formatExactTokens(usage?.today.totalTokens)}`,
     `今日 API 估算费用：${costLabel}`,
     unpriced ? `其中 ${formatExactTokens(unpriced)} 尚未定价，费用未计全。` : "费用按应用中已保存的价格估算。",
+    ...(cost?.longContextUnconfirmedEvents ? [`长上下文档位未确认，${cost.longContextUnconfirmedEvents} 条记录按基础档估算。`] : []),
     `本机用量更新时间：${formatDateTime(usage?.generatedAt ?? null)}`,
     ...quotas.map(quota => `${quota.title}：剩余 ${quota.remainingLabel}；重置 ${quota.resetDate}`),
     quotas.length ? `额度更新时间：${formatDateTime(quotaTime)}${stale ? "（旧数据）" : ""}` : unavailable,

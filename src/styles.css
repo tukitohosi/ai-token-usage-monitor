@@ -2702,6 +2702,9 @@ select, input[type="time"], input[type="date"], input[type="datetime-local"], in
 .model-price-status label { grid-template-columns: auto 100px; align-items: center; }
 .model-price-fields { display: grid; grid-template-columns: repeat(4,minmax(100px,1fr)); gap: 10px; margin-top: 17px; padding-top: 16px; border-top: 1px solid var(--border); }
 .price-field input::placeholder { color: var(--muted); }
+.model-long-context { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.model-long-context .peak-schedule-hint { margin: 8px 0; }
+.long-context-fields { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(135px,100%),1fr)); gap: 10px; }
 
 .app-shell[data-theme="light"] .activity-view-switch button.is-active { background: #fff; }
 .app-shell[data-theme="light"] .model-price-rank > span { color: #5848bd; }

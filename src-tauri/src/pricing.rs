@@ -28,6 +28,7 @@ pub(crate) struct PriceCatalogEntry {
     pub(crate) currency: String,
     pub(crate) source_label: String,
     pub(crate) tiers: Vec<PriceCatalogTier>,
+    pub(crate) long_context: Option<LongContextRule>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -68,6 +69,22 @@ impl Default for PeakPricingSchedule {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct LongContextRule {
+    pub(crate) threshold: i64,
+    pub(crate) input_multiplier: f64,
+    pub(crate) output_multiplier: f64,
+}
+
+impl LongContextRule {
+    pub(crate) fn is_valid(&self) -> bool {
+        (1..=9_007_199_254_740_991).contains(&self.threshold)
+            && self.input_multiplier.is_finite() && self.input_multiplier > 0.0
+            && self.output_multiplier.is_finite() && self.output_multiplier > 0.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ModelPricingRule {
     pub(crate) model_id: String,
     pub(crate) display_name: String,
@@ -77,6 +94,7 @@ pub(crate) struct ModelPricingRule {
     pub(crate) cache_write_per_million: Option<f64>,
     pub(crate) output_per_million: Option<f64>,
     pub(crate) peak_enabled: bool,
+    pub(crate) long_context: Option<LongContextRule>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -97,6 +115,7 @@ pub(crate) fn catalog(settings: &PricingSettings) -> Vec<PriceCatalogEntry> {
             aliases: Vec::new(),
             currency: rule.currency.clone(),
             source_label: "本机手动设置".to_owned(),
+            long_context: rule.long_context.clone(),
             tiers: vec![PriceCatalogTier {
                 label: "基础价格".to_owned(),
                 condition: if rule.peak_enabled {
@@ -128,6 +147,8 @@ pub(crate) fn catalog(settings: &PricingSettings) -> Vec<PriceCatalogEntry> {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PriceUsage {
+    /// Complete, inclusive input for one verified request, before any aggregation.
+    pub(crate) request_input_tokens: Option<i64>,
     pub(crate) input_tokens: i64,
     pub(crate) cached_input_tokens: i64,
     pub(crate) cache_write_5m_tokens: i64,
@@ -143,6 +164,7 @@ pub(crate) struct CostSummary {
     pub(crate) usd: f64,
     pub(crate) cny: f64,
     pub(crate) unpriced_tokens: i64,
+    pub(crate) long_context_unconfirmed_events: i64,
 }
 
 impl CostSummary {
@@ -150,6 +172,7 @@ impl CostSummary {
         self.usd += other.usd;
         self.cny += other.cny;
         self.unpriced_tokens += other.unpriced_tokens;
+        self.long_context_unconfirmed_events += other.long_context_unconfirmed_events;
     }
 }
 
@@ -169,48 +192,56 @@ pub(crate) fn estimate(
         };
     };
 
+    let mut input_multiplier = 1.0;
+    let mut output_multiplier = 1.0;
+    let mut unconfirmed = 0;
+    if let Some(long) = &rule.long_context {
+        match usage.request_input_tokens {
+            Some(input) if input > long.threshold => {
+                input_multiplier = long.input_multiplier;
+                output_multiplier = long.output_multiplier;
+            }
+            None if usage.total_tokens > 0 => unconfirmed = 1,
+            _ => {}
+        }
+    }
     let mut amount = 0.0;
+    // Some sources preserve a reported total even when only part of it has a breakdown.
+    let mut unclassified = usage.total_tokens.max(0);
     let mut unpriced = 0_i64;
-    for (tokens, rate) in [
-        (usage.input_tokens.max(0), rule.input_per_million),
+    for (tokens, rate, multiplier) in [
+        (usage.input_tokens.max(0), rule.input_per_million, input_multiplier),
         (
             usage.cached_input_tokens.max(0),
             rule.cached_input_per_million,
+            input_multiplier,
         ),
         (
             usage.cache_write_5m_tokens.max(0)
                 + usage.cache_write_1h_tokens.max(0)
                 + usage.cache_write_unknown_tokens.max(0),
             rule.cache_write_per_million,
+            input_multiplier,
         ),
-        (usage.output_tokens.max(0), rule.output_per_million),
+        (usage.output_tokens.max(0), rule.output_per_million, output_multiplier),
     ] {
+        unclassified = unclassified.saturating_sub(tokens);
         if tokens == 0 {
             continue;
         }
         if let Some(rate) = rate {
-            amount += tokens as f64 * rate / 1_000_000.0;
+            amount += tokens as f64 * rate / 1_000_000.0 * multiplier;
         } else {
             unpriced += tokens;
         }
     }
+    unpriced += unclassified.max(0);
 
     if rule.peak_enabled && is_peak_time(occurred_at_ms, &settings.peak) {
         amount *= settings.peak.multiplier;
     }
-    if rule.currency == "CNY" {
-        CostSummary {
-            usd: 0.0,
-            cny: amount,
-            unpriced_tokens: unpriced,
-        }
-    } else {
-        CostSummary {
-            usd: amount,
-            cny: 0.0,
-            unpriced_tokens: unpriced,
-        }
-    }
+    let (usd, cny) = if rule.currency == "CNY" { (0.0, amount) } else { (amount, 0.0) };
+    CostSummary { usd, cny, unpriced_tokens: unpriced, long_context_unconfirmed_events: unconfirmed }
 }
 
 fn is_peak_time(occurred_at_ms: Option<i64>, schedule: &PeakPricingSchedule) -> bool {
@@ -344,6 +375,7 @@ mod tests {
                 cache_write_per_million: None,
                 output_per_million: Some(20.0),
                 peak_enabled: false,
+                long_context: None,
             }],
         }
     }
@@ -366,10 +398,10 @@ mod tests {
     fn uses_only_manual_rules_and_keeps_missing_rates_unpriced() {
         let mut sample = small_usage();
         sample.cache_write_unknown_tokens = 100;
-        sample.total_tokens += 100;
+        sample.total_tokens += 160; // Also includes 60 tokens with no reported classification.
         let cost = estimate("manual-model", sample, Some(1), &settings());
         assert!((cost.usd - 0.0244).abs() < 0.000_001);
-        assert_eq!(cost.unpriced_tokens, 100);
+        assert_eq!(cost.unpriced_tokens, 160);
     }
 
     #[test]
@@ -530,5 +562,43 @@ mod tests {
         let entries = catalog(&settings());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source_label, "本机手动设置");
+    }
+
+    #[test]
+    fn long_context_uses_the_whole_request_and_combines_with_peak() {
+        let mut configured = settings();
+        let model = &mut configured.models[0];
+        model.long_context = Some(LongContextRule { threshold: 272_000, input_multiplier: 2.0, output_multiplier: 1.5 });
+        model.input_per_million = Some(10.0);
+        model.cached_input_per_million = Some(1.0);
+        model.cache_write_per_million = Some(12.5);
+        model.output_per_million = Some(50.0);
+        model.peak_enabled = true;
+        let mut event = PriceUsage {
+            input_tokens: 1_000, cached_input_tokens: 270_000, cache_write_5m_tokens: 700,
+            cache_write_1h_tokens: 200, cache_write_unknown_tokens: 100, output_tokens: 100,
+            total_tokens: 272_100, request_input_tokens: Some(272_000),
+        };
+        let short = estimate("manual-model", event, None, &configured);
+        assert!((short.usd - 0.2975).abs() < 1e-10);
+        let mut two_short_requests = short.clone();
+        two_short_requests.add_assign(&short);
+        assert!((two_short_requests.usd - 0.595).abs() < 1e-10);
+        event.cached_input_tokens += 1;
+        event.total_tokens += 1;
+        event.request_input_tokens = Some(272_001);
+        let long = estimate("manual-model", event, None, &configured);
+        assert!((long.usd - 0.592502).abs() < 1e-10);
+        configured.peak.time_zone = "UTC".into();
+        let peak = estimate("manual-model", event, Some(timestamp_ms("2026-11-13T12:00:00Z")), &configured);
+        assert!((peak.usd - 2.0 * long.usd).abs() < 1e-10);
+        event.request_input_tokens = None;
+        let uncertain = estimate("manual-model", event, None, &configured);
+        assert!((uncertain.usd - 0.297501).abs() < 1e-10);
+        assert_eq!(uncertain.long_context_unconfirmed_events, 1);
+        configured.models[0].long_context = None;
+        let disabled = estimate("manual-model", event, None, &configured);
+        assert_eq!(disabled.usd, uncertain.usd);
+        assert_eq!(disabled.long_context_unconfirmed_events, 0);
     }
 }

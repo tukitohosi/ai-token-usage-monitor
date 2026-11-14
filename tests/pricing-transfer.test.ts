@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergePricingImport, normalizePricingTransfer, parsePricingTransfer, pricingImportSummary, type PricingTransferDocumentV1 } from "../src/core/pricing-transfer.js";
+import { mergePricingImport, normalizeCliRules, normalizePricingTransfer, parsePricingTransfer, pricingImportSummary, type PricingTransferDocumentV1 } from "../src/core/pricing-transfer.js";
 
 function document(): PricingTransferDocumentV1 {
   return { format: "ai-token-pricing", version: 1, unit: "perMillionTokens", exportedAt: "2026-11-07T10:00:00Z", savedAt: null,
@@ -57,7 +57,7 @@ describe("pricing JSON transfer", () => {
     expect(mergePricingImport(current, document()).models).toHaveLength(3);
   });
   it.each([
-    ["format", "other"], ["version", 2], ["unit", "perToken"], ["exportedAt", "yesterday"], ["savedAt", "broken"], ["unexpected", true],
+    ["format", "other"], ["version", 3], ["unit", "perToken"], ["exportedAt", "yesterday"], ["savedAt", "broken"], ["unexpected", true],
   ])("rejects invalid %s", (key, value) => {
     expect(() => normalizePricingTransfer({ ...document(), [key]: value })).toThrow();
   });
@@ -80,5 +80,26 @@ describe("pricing JSON transfer", () => {
     expect(() => normalizePricingTransfer(badDate)).toThrow(/特殊日期/);
     const badWindow = document(); badWindow.peak.windows[0]!.weekdayStart = 0;
     expect(() => normalizePricingTransfer(badWindow)).toThrow(/星期/);
+  });
+  it("preserves a local long-context draft for v1 and uses each explicit v2 rule or null", () => {
+    const current = draft();
+    current.models[0]!.longContext = { threshold: "123", inputMultiplier: "2.", outputMultiplier: "1.6" };
+    expect(mergePricingImport(current, document()).models[0]!.longContext).toEqual(current.models[0]!.longContext);
+    const file = document();
+    const rule = { threshold: 272000, inputMultiplier: 2, outputMultiplier: 1.5 };
+    const v2 = { ...file, version: 2 as const, models: file.models.map((m, i) => ({ ...m, longContext: i ? rule : null })) };
+    const result = mergePricingImport(current, parsePricingTransfer(JSON.stringify(v2)));
+    expect(result.models[0]!.longContext).toBeNull();
+    expect(result.models[2]!.longContext).toEqual({ threshold: "272000", inputMultiplier: "2", outputMultiplier: "1.5" });
+    expect(() => normalizePricingTransfer({ ...file, version: 2 })).toThrow(/门槛/);
+  });
+  it.each([
+    { threshold: 0 }, { threshold: 0.5 }, { threshold: Number.MAX_SAFE_INTEGER + 1 },
+    { inputMultiplier: Number.NaN }, { outputMultiplier: 0 }, { inputMultiplier: Infinity },
+  ])("rejects invalid CLI and v2 long-context values %o", patch => {
+    const rule = { threshold: 272000, inputMultiplier: 2, outputMultiplier: 1.5, ...patch };
+    expect(() => normalizeCliRules([{ modelId: "test", longContext: rule }])).toThrow(/门槛|倍率/);
+    const file = document();
+    expect(() => normalizePricingTransfer({ ...file, version: 2, models: [{ ...file.models[0], longContext: rule }] })).toThrow(/门槛|倍率/);
   });
 });

@@ -11,6 +11,10 @@
 .pricing-transfer-stats strong { font-size: 26px; font-variant-numeric: tabular-nums; }
 .pricing-transfer-stats small { font-size: 12px; font-weight: 400; color: var(--text-soft); }
 .pricing-transfer-meta { font-size: 11px; }
+.cli-rule-preview { list-style: none; margin: 14px 0; padding: 0; }
+.cli-rule-preview li { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 13px; overflow-wrap: anywhere; }
+.cli-rule-preview li span, .cli-rule-preview li small { color: var(--text-soft); }
+.cli-rule-preview li small { grid-column: 1 / -1; }
 .pricing-transfer-peak { display: flex; align-items: flex-start; gap: 10px; padding: 16px; margin-top: 22px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; }
 .pricing-transfer-peak input { accent-color: var(--purple); margin: 3px 0 0; }
 .pricing-transfer-peak span { display: grid; gap: 7px; font-size: 13px; }

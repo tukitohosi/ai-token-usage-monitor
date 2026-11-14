@@ -31,12 +31,45 @@ pub(crate) enum AppServerError {
     Io,
     Timeout,
     Protocol,
-    Rpc { code: Option<i64> },
+    Rpc {
+        code: Option<i64>,
+        http_status: Option<u16>,
+        auth_required: bool,
+    },
 }
 
 impl AppServerError {
     pub(crate) fn is_unsupported_method(&self) -> bool {
-        matches!(self, Self::Rpc { code: Some(-32601) })
+        matches!(
+            self,
+            Self::Rpc {
+                code: Some(-32601),
+                ..
+            }
+        )
+    }
+
+    fn usage_diagnostic(&self) -> String {
+        match self {
+            Self::Rpc {
+                code,
+                http_status,
+                auth_required,
+            } => {
+                let mut kind = code.map_or_else(|| "rpc".into(), |n| format!("rpc{n}"));
+                if let Some(status) = http_status {
+                    kind.push_str(&format!("/http{status}"));
+                }
+                if *auth_required {
+                    kind.push_str("/authRequired");
+                }
+                kind
+            }
+            Self::NotFound => "cliMissing".into(),
+            Self::Io => "transport".into(),
+            Self::Timeout => "timeout".into(),
+            Self::Protocol => "invalidResponse".into(),
+        }
     }
 }
 
@@ -112,6 +145,20 @@ pub(crate) struct AccountUsageReadResult {
     pub(crate) thread_usage: Option<()>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ThreadUsageGroup {
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) speed: Option<String>,
+    pub(crate) net_new_input_tokens: Option<u64>,
+    pub(crate) cached_input_tokens: Option<u64>,
+    /// Includes cached input when the billing route reports both fields.
+    pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+    pub(crate) total_tokens: Option<u64>,
+}
+
 #[derive(Debug)]
 pub(crate) struct AccountState {
     pub(crate) account_present: bool,
@@ -131,6 +178,7 @@ pub(crate) struct AppServerClient {
     next_request_id: u64,
     rpc_methods: Vec<String>,
     cancelled: Arc<AtomicBool>,
+    workspace_account_id: Option<String>,
     pub(crate) server_user_agent: String,
 }
 
@@ -200,6 +248,7 @@ impl AppServerClient {
             next_request_id: 1,
             rpc_methods: Vec::new(),
             cancelled,
+            workspace_account_id: None,
             server_user_agent: String::new(),
         };
         let initialized = client.request(
@@ -211,7 +260,7 @@ impl AppServerClient {
                 "version": env!("CARGO_PKG_VERSION")
               },
               "capabilities": {
-                "experimentalApi": false,
+                "experimentalApi": true,
                 "requestAttestation": false
               }
             })),
@@ -226,11 +275,17 @@ impl AppServerClient {
     }
 
     pub(crate) fn account_read(&mut self) -> Result<AccountState, AppServerError> {
+        self.workspace_account_id = None;
         let value = self.request("account/read", Some(json!({ "refreshToken": false })))?;
         let _requires_openai_auth = value
             .get("requiresOpenaiAuth")
             .and_then(Value::as_bool)
             .ok_or(AppServerError::Protocol)?;
+        self.workspace_account_id = value
+            .pointer("/workspaceRouting/chatgptAccountId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
         Ok(AccountState {
             account_present: value
                 .get("account")
@@ -240,6 +295,10 @@ impl AppServerClient {
                 .filter(|v| !v.is_null())
                 .map(|v| blake3::hash(v.to_string().as_bytes()).to_hex().to_string()),
         })
+    }
+
+    pub(crate) fn workspace_account_id(&self) -> Option<&str> {
+        self.workspace_account_id.as_deref()
     }
 
     pub(crate) fn rate_limits_read(
@@ -252,6 +311,21 @@ impl AppServerClient {
     pub(crate) fn usage_read(&mut self) -> Result<AccountUsageReadResult, AppServerError> {
         let value = self.request("account/usage/read", Some(json!({})))?;
         Ok(sanitize_account_usage(&value))
+    }
+
+    pub(crate) fn thread_usage_read(
+        &mut self,
+        thread_id: &str,
+        timeout: Duration,
+    ) -> Result<Vec<ThreadUsageGroup>, String> {
+        let value = self
+            .request_with_timeout(
+                "account/usage/read",
+                Some(json!({ "threadId": thread_id })),
+                timeout.min(REQUEST_TIMEOUT),
+            )
+            .map_err(|error| error.usage_diagnostic())?;
+        parse_thread_usage(&value, thread_id)
     }
 
     pub(crate) fn account_rpc_methods(&self) -> Vec<String> {
@@ -276,8 +350,20 @@ impl AppServerClient {
     }
 
     fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value, AppServerError> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, AppServerError> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(AppServerError::Io);
+        }
+        if timeout.is_zero() {
+            return Err(AppServerError::Timeout);
         }
         if !ALLOWED_REQUEST_METHODS.contains(&method) {
             return Err(AppServerError::Protocol);
@@ -293,7 +379,7 @@ impl AppServerClient {
         }
         write_message(&mut self.stdin, &Value::Object(message))?;
 
-        wait_for_response(&self.receiver, id, &self.cancelled, REQUEST_TIMEOUT)
+        wait_for_response(&self.receiver, id, &self.cancelled, timeout)
     }
 }
 
@@ -320,8 +406,31 @@ fn wait_for_response(
                     continue;
                 }
                 if let Some(error) = value.get("error") {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let http_status = error
+                        .pointer("/data/status")
+                        .or_else(|| error.pointer("/data/statusCode"))
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u16::try_from(v).ok())
+                        .filter(|n| (400..600).contains(n))
+                        .or_else(|| {
+                            [400, 401, 403, 404, 408, 422, 429, 500, 502, 503, 504]
+                                .into_iter()
+                                .find(|n| {
+                                    message
+                                        .split(|c: char| !c.is_ascii_alphanumeric())
+                                        .any(|w| w == n.to_string())
+                                })
+                        });
                     return Err(AppServerError::Rpc {
                         code: error.get("code").and_then(Value::as_i64),
+                        http_status,
+                        auth_required: message.contains("authentication required")
+                            || message.contains("not authenticated"),
                     });
                 }
                 return value.get("result").cloned().ok_or(AppServerError::Protocol);
@@ -605,6 +714,61 @@ fn sanitize_account_usage(value: &Value) -> AccountUsageReadResult {
     }
 }
 
+fn parse_thread_usage(
+    response: &Value,
+    requested_thread: &str,
+) -> Result<Vec<ThreadUsageGroup>, String> {
+    let response = response.as_object().ok_or("invalidResponse")?;
+    let Some(usage) = response.get("threadUsage").filter(|value| !value.is_null()) else {
+        let account_data = response
+            .get("dailyUsageBuckets")
+            .is_some_and(Value::is_array)
+            || response
+                .get("summary")
+                .and_then(Value::as_object)
+                .is_some_and(|m| m.values().any(|v| !v.is_null()));
+        return Err(if account_data {
+            "accountOnly"
+        } else if response.contains_key("threadUsage") {
+            "threadUsageNull"
+        } else {
+            "threadUsageMissing"
+        }
+        .into());
+    };
+    if usage.get("threadId").and_then(Value::as_str) != Some(requested_thread) {
+        return Err("threadIdMismatch".into());
+    }
+    let rows = usage
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or("invalidGroups")?;
+    if rows.is_empty() {
+        return Err("groupsEmpty".into());
+    }
+    let groups = rows
+        .iter()
+        .map(|row| {
+            if !row.is_object() {
+                return Err("invalidGroups");
+            }
+            ThreadUsageGroup::deserialize(row).map_err(|_| "invalidGroups")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_tokens = groups.iter().any(|group| {
+        group.total_tokens.is_some()
+            || group.input_tokens.is_some()
+            || group.net_new_input_tokens.is_some()
+            || group.cached_input_tokens.is_some()
+            || group.output_tokens.is_some()
+    });
+    if has_tokens {
+        Ok(groups)
+    } else {
+        Err("noTokenFields".into())
+    }
+}
+
 fn safe_text(value: Option<&Value>) -> Option<String> {
     let text = value?.as_str()?.trim();
     if text.is_empty() {
@@ -751,6 +915,64 @@ mod tests {
         assert_eq!(result.summary.unwrap().lifetime_tokens, Some(42));
         assert_eq!(result.daily_usage_buckets.unwrap().len(), 1);
         assert_eq!(result.thread_usage, None);
+    }
+
+    #[test]
+    fn reads_only_the_requested_threads_cumulative_groups() {
+        let response = json!({
+            "summary": {"lifetimeTokens": 123_456},
+            "threadUsage": {
+                "threadId": "requested",
+                "groups": [
+                    {"model": "gpt-example", "reasoningEffort": "high", "speed": "fast",
+                     "netNewInputTokens": 2, "cachedInputTokens": 8, "inputTokens": 10,
+                     "outputTokens": 5, "totalTokens": 15},
+                    {"outputTokens": 0, "totalTokens": null}
+                ]
+            }
+        });
+        let groups = parse_thread_usage(&response, "requested").unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].total_tokens, Some(15));
+        assert_eq!(groups[0].input_tokens, Some(10));
+        assert_eq!(groups[0].cached_input_tokens, Some(8));
+        assert_eq!(groups[0].net_new_input_tokens, Some(2));
+        assert_eq!(groups[0].model.as_deref(), Some("gpt-example"));
+        assert_eq!(groups[0].reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(groups[0].speed.as_deref(), Some("fast"));
+        assert_eq!(groups[1].output_tokens, Some(0));
+        assert_eq!(groups[1].total_tokens, None);
+        assert_eq!(
+            parse_thread_usage(&response, "different").unwrap_err(),
+            "threadIdMismatch"
+        );
+    }
+
+    #[test]
+    fn unavailable_thread_counts_do_not_fall_back_to_the_account_or_zero() {
+        for (expected, response) in [
+            ("accountOnly", json!({"summary": {"lifetimeTokens": 300}})),
+            ("threadUsageNull", json!({"threadUsage": null})),
+            (
+                "groupsEmpty",
+                json!({"threadUsage": {"threadId": "t", "groups": []}}),
+            ),
+            (
+                "noTokenFields",
+                json!({"threadUsage": {"threadId": "t", "groups": [
+                    {"estimatedUsageCreditsMicros": 300, "totalTokens": null}
+                ]}}),
+            ),
+        ] {
+            assert_eq!(parse_thread_usage(&response, "t").unwrap_err(), expected);
+        }
+        for groups in [json!(null), json!([[]]), json!([{"totalTokens": -1}])] {
+            let response = json!({"threadUsage": {"threadId": "t", "groups": groups}});
+            assert_eq!(
+                parse_thread_usage(&response, "t").unwrap_err(),
+                "invalidGroups"
+            );
+        }
     }
 
     #[test]

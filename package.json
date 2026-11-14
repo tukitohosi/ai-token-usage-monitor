@@ -1,6 +1,6 @@
 {
   "name": "codex-usage-monitor",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Local-first AI quota, token activity, and cost monitor for Windows.",

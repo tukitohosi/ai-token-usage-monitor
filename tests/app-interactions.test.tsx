@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../src/App";
 import { MockDashboardAdapter } from "../src/ui/dashboard-adapter";
+import { getTodayWorkGap } from "../src/ui/dashboard-views";
 
 beforeEach(() => {
   Object.defineProperty(window, "matchMedia", {
@@ -75,7 +76,35 @@ describe("dashboard interactions", () => {
     expect(screen.getByText("Codex 模型消耗")).toBeTruthy();
     await user.click(within(screen.getByRole("group", { name: "Codex Token 时间范围" })).getByRole("button", { name: "30 天" }));
     expect(screen.getByText("Codex · 最近 30 天")).toBeTruthy();
-    expect(screen.getByText(/不会向 Codex 创建对话、发送消息或发起推理/)).toBeTruthy();
+    expect(screen.getByText(/本机会话日志、桌面用量记录和已同步的 Work 会话明细/)).toBeTruthy();
+  });
+
+  it("only warns about missing Work usage beside metrics that include today's Codex activity", async () => {
+    const now = new Date();
+    const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const coverage = { todayCandidates: 3, todayWithThreadUsage: 1, updatedForDate: date };
+    expect(getTodayWorkGap({ ...coverage, updatedForDate: "2001-01-01" }, now.getTime())).toBeNull();
+    expect(getTodayWorkGap({ ...coverage, todayWithThreadUsage: 3 }, now.getTime())).toBeNull();
+    expect(getTodayWorkGap({ ...coverage, updatedForDate: undefined }, now.getTime())).toBeNull();
+    expect(getTodayWorkGap({ ...coverage, todayWithThreadUsage: 0, scope: "catalogOnly" }, now.getTime())?.missing).toBeNull();
+    class WorkAdapter extends MockDashboardAdapter {
+      override async refresh() { return { ...await super.refresh(), hostedUsageCoverage: coverage }; }
+    }
+    const user = userEvent.setup();
+    render(<App adapter={new WorkAdapter("ready", 0)} />);
+    const warning = /今天有 3 个活跃 Work 会话，其中 2 个尚未取到 Token 明细/;
+    await user.click(await screen.findByRole("button", { name: "本机活动" }));
+    expect(await screen.findByText(warning)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Claude Code，状态：已就绪" }));
+    expect(screen.queryByText(warning)).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Codex Token" }));
+    expect(await screen.findByText(warning)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "费用" }));
+    expect(await screen.findByText(/当前费用只按已采集的 Token 估算/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("开始日期"), { target: { value: "2020-01-01" } });
+    fireEvent.change(screen.getByLabelText("结束日期"), { target: { value: "2020-01-01" } });
+    await user.click(screen.getByRole("button", { name: "应用日期" }));
+    await waitFor(() => expect(screen.queryByText(warning)).toBeNull());
   });
 
   it("supports selecting multiple AI sources", async () => {

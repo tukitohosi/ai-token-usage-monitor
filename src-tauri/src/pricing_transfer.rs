@@ -22,7 +22,7 @@ const UNIT: &str = "perMillionTokens";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PricingTransferDocumentV1 {
+pub(crate) struct PricingTransferDocument {
     pub(crate) format: String,
     pub(crate) version: u32,
     pub(crate) unit: String,
@@ -32,11 +32,11 @@ pub(crate) struct PricingTransferDocumentV1 {
     pub(crate) models: Vec<ModelPricingRule>,
 }
 
-impl PricingTransferDocumentV1 {
+impl PricingTransferDocument {
     fn from_saved(settings: PricingSettings) -> Self {
         Self {
             format: FORMAT.to_owned(),
-            version: 1,
+            version: 2,
             unit: UNIT.to_owned(),
             exported_at: Utc::now().to_rfc3339(),
             saved_at: settings.updated_at,
@@ -49,9 +49,9 @@ impl PricingTransferDocumentV1 {
         if self.format != FORMAT {
             return Err("这不是 AI Token 用量监控的定价文件。".into());
         }
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             return Err(format!(
-                "暂不支持定价文件版本 {}，请使用版本 1。",
+                "暂不支持定价文件版本 {}，请使用版本 1 或 2。",
                 self.version
             ));
         }
@@ -102,7 +102,7 @@ impl PricingTransferDocumentV1 {
     }
 }
 
-fn parse_document(bytes: &[u8]) -> Result<PricingTransferDocumentV1, String> {
+fn parse_document(bytes: &[u8]) -> Result<PricingTransferDocument, String> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err("定价文件不能超过 1 MiB。".into());
     }
@@ -113,6 +113,9 @@ fn parse_document(bytes: &[u8]) -> Result<PricingTransferDocumentV1, String> {
     // fields so a damaged file cannot silently erase a configured price.
     if let Some(models) = value.get("models").and_then(|models| models.as_array()) {
         for model in models {
+            if value.get("version").and_then(|v| v.as_u64()) == Some(2) && model.get("longContext").is_none() {
+                return Err("版本 2 的模型缺少 longContext；关闭长上下文加价请填写 null。".into());
+            }
             for field in [
                 "inputPerMillion",
                 "cachedInputPerMillion",
@@ -125,13 +128,13 @@ fn parse_document(bytes: &[u8]) -> Result<PricingTransferDocumentV1, String> {
             }
         }
     }
-    let document: PricingTransferDocumentV1 =
+    let document: PricingTransferDocument =
         serde_json::from_value(value).map_err(|error| format!("定价文件结构无效：{error}"))?;
     document.validate()?;
     Ok(document)
 }
 
-fn read_document(path: &Path) -> Result<PricingTransferDocumentV1, String> {
+fn read_document(path: &Path) -> Result<PricingTransferDocument, String> {
     let file = fs::File::open(path)
         .map_err(|_| "无法读取定价文件，请检查文件位置和读取权限。".to_owned())?;
     let mut bytes = Vec::new();
@@ -144,7 +147,7 @@ fn read_document(path: &Path) -> Result<PricingTransferDocumentV1, String> {
 #[tauri::command]
 pub(crate) async fn import_pricing_file(
     window: tauri::Window,
-) -> Result<Option<PricingTransferDocumentV1>, String> {
+) -> Result<Option<PricingTransferDocument>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let Some(path) = rfd::FileDialog::new()
             .set_parent(&window)
@@ -178,7 +181,7 @@ pub(crate) async fn export_pricing_file(
         let saved = runtime
             .read_pricing_settings()
             .map_err(|_| "无法读取已保存的模型定价。".to_owned())?;
-        let document = PricingTransferDocumentV1::from_saved(saved);
+        let document = PricingTransferDocument::from_saved(saved);
         document.validate()?;
         let bytes =
             serde_json::to_vec_pretty(&document).map_err(|_| "无法生成定价文件。".to_owned())?;
@@ -245,8 +248,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-    fn document() -> PricingTransferDocumentV1 {
-        PricingTransferDocumentV1::from_saved(PricingSettings {
+    fn document() -> PricingTransferDocument {
+        PricingTransferDocument::from_saved(PricingSettings {
             updated_at: Some("2026-11-07T10:00:00Z".into()),
             peak: PeakPricingSchedule::default(),
             models: vec![ModelPricingRule {
@@ -258,6 +261,9 @@ mod tests {
                 cache_write_per_million: Some(0.125),
                 output_per_million: Some(12.5),
                 peak_enabled: true,
+                long_context: Some(crate::pricing::LongContextRule {
+                    threshold: 272_000, input_multiplier: 2.0, output_multiplier: 1.5,
+                }),
             }],
         })
     }
@@ -270,11 +276,19 @@ mod tests {
         assert_eq!(original.models, parsed.models);
         assert_eq!(original.peak, parsed.peak);
         assert_eq!(original.saved_at, parsed.saved_at);
+        assert_eq!(parsed.version, 2);
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy["models"][0].as_object_mut().unwrap().remove("longContext");
+        assert!(parse_document(&serde_json::to_vec(&legacy).unwrap()).is_err());
+        legacy["version"] = json!(1);
+        let parsed = parse_document(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert!(parsed.models[0].long_context.is_none());
     }
     #[test]
     fn rejects_bad_versions_prices_duplicates_and_missing_fields() {
         for (field, value) in [
-            ("version", json!(2)),
+            ("version", json!(3)),
             ("unit", json!("perToken")),
             ("format", json!("other")),
             ("exportedAt", json!("yesterday")),

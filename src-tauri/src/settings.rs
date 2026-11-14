@@ -407,6 +407,7 @@ pub(crate) fn validate_pricing_settings(settings: &PricingSettings) -> Result<()
             || !valid_rate(rule.cached_input_per_million)
             || !valid_rate(rule.cache_write_per_million)
             || !valid_rate(rule.output_per_million)
+            || rule.long_context.as_ref().is_some_and(|long| !long.is_valid())
             || !identities.insert(rule.model_id.to_lowercase())
         {
             return Err(SettingsError::InvalidPricingSettings);
@@ -1086,6 +1087,7 @@ mod tests {
                 cache_write_per_million: None,
                 output_per_million: Some(8.0),
                 peak_enabled: true,
+                long_context: None,
             }],
         };
         let saved = write_pricing_settings(&path, &settings).expect("save pricing");

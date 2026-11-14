@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { MAX_PRICING_MODELS, pricingImportSummary, type PricingTransferDocumentV1 } from "../core/pricing-transfer";
+import { MAX_PRICING_MODELS, pricingImportSummary, type PricingImport } from "../core/pricing-transfer";
 import type { PricingDraft } from "./pricing-editor";
 import "./pricing-transfer-dialog.css";
 
 export function PricingTransferDialog({ document, draft, onConfirm, onClose }: {
-  document: PricingTransferDocumentV1;
+  document: PricingImport;
   draft: PricingDraft;
   onConfirm: (includePeak: boolean) => void;
   onClose: () => void;
@@ -15,6 +15,8 @@ export function PricingTransferDialog({ document, draft, onConfirm, onClose }: {
   const onCloseRef = useRef(onClose); onCloseRef.current = onClose;
   const summary = pricingImportSummary(draft, document);
   const overLimit = summary.total > MAX_PRICING_MODELS;
+  const localModels = new Map(draft.models.map(model => [model.modelId.trim().toLowerCase(), model]));
+  const fromCli = document.format === "claude-long-context";
   useEffect(() => {
     const previousFocus = window.document.activeElement instanceof HTMLElement ? window.document.activeElement : null;
     const previousOverflow = window.document.body.style.overflow;
@@ -34,12 +36,22 @@ export function PricingTransferDialog({ document, draft, onConfirm, onClose }: {
   }, []);
   return <div className="pricing-transfer-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <section ref={dialog} className="pricing-transfer-dialog" role="dialog" aria-modal="true" aria-labelledby="pricing-transfer-title" aria-describedby="pricing-transfer-description" tabIndex={-1}>
-      <header><div><p className="eyebrow">MODEL PRICING</p><h2 id="pricing-transfer-title">导入模型定价</h2></div><button ref={close} type="button" className="pricing-transfer-close" aria-label="关闭定价导入" onClick={onClose}>×</button></header>
-      <p id="pricing-transfer-description">合并到当前编辑内容，同名模型使用文件中的价格；其他本地模型保留。导入后仍需点击“保存价格并重算”才会生效。</p>
+      <header><div><p className="eyebrow">MODEL PRICING</p><h2 id="pricing-transfer-title">{fromCli ? "导入长上下文规则" : "导入模型定价"}</h2></div><button ref={close} type="button" className="pricing-transfer-close" aria-label="关闭定价导入" onClick={onClose}>×</button></header>
+      <p id="pricing-transfer-description">{fromCli
+        ? "将下列门槛和倍率加入草稿。已有模型保留单价、币种和高峰设置，新增模型的单价留空。保存价格并重算后生效。"
+        : `同名模型使用文件中的价格。${document.version === 1 ? "旧版文件保留本地长上下文规则。" : "文件中的长上下文开关、门槛和倍率一并导入。"}其他本地模型保留。导入后点击“保存价格并重算”生效。`}</p>
+      {fromCli ? <ul className="cli-rule-preview" aria-label="规则变更预览">{document.models.map(({ modelId, longContext }) => {
+        const local = localModels.get(modelId.trim().toLowerCase());
+        const previous = local?.longContext;
+        const unchanged = previous && Number(previous.threshold) === longContext.threshold && Number(previous.inputMultiplier) === longContext.inputMultiplier && Number(previous.outputMultiplier) === longContext.outputMultiplier;
+        const change = !local ? "新增模型和规则" : !previous ? "新增规则" : unchanged ? "规则相同" : "更新规则";
+        return <li key={modelId}><strong>{modelId}</strong><span>{change}</span><small>输入门槛 {longContext.threshold.toLocaleString("zh-CN")} Token · 输入 ×{longContext.inputMultiplier} · 输出 ×{longContext.outputMultiplier}</small></li>;
+      })}</ul> : <>
       <div className="pricing-transfer-stats" aria-label="导入变更"><div><span>新增模型</span><strong>{summary.added}</strong></div><div><span>覆盖模型</span><strong>{summary.overwritten}</strong></div><div><span>合并后模型</span><strong>{summary.total}<small> / 200</small></strong></div></div>
       <p className="pricing-transfer-meta">文件导出时间：{new Date(document.exportedAt).toLocaleString("zh-CN", { hour12: false })} · 单价单位：每百万 Token</p>
       <label className="pricing-transfer-peak"><input type="checkbox" checked={includePeak} onChange={event => setIncludePeak(event.target.checked)} /><span><strong>同时导入高峰规则</strong><small>包含时段、倍率、时区、特殊日期和导入模型的高峰开关。</small></span></label>
       {includePeak ? <p className="pricing-transfer-warning" role="note">文件中的高峰规则将替换当前规则，也会影响本地其他已开启高峰计费的模型。尚未加入列表的特殊日期会清空。</p> : <p className="pricing-transfer-hint">保留本地高峰规则及已有模型的高峰开关；新增模型默认关闭高峰计费。</p>}
+      </>}
       {overLimit && <p className="pricing-transfer-warning" role="alert">合并后超过 200 个模型上限，不能导入；当前编辑内容未改变。</p>}
       <footer><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="button" className="primary-button" disabled={overLimit} onClick={() => onConfirm(includePeak)}>导入到编辑页</button></footer>
     </section>

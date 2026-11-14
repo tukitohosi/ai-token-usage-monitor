@@ -23,6 +23,7 @@ import type {
   RefreshProgress,
   SourceHealthSummary,
   ThemePreference,
+  TokenCost,
   UsageDayDetail,
   UsageRange,
   UsageSourceSummary,
@@ -746,6 +747,34 @@ function AccountFacts({
   );
 }
 
+export function getTodayWorkGap(coverage: DashboardSnapshot["hostedUsageCoverage"], now: number) {
+  if (!coverage || coverage.updatedForDate !== localDateKey(new Date(now))) return null;
+  const { todayCandidates, todayWithThreadUsage } = coverage;
+  if (!Number.isSafeInteger(todayCandidates) || todayCandidates <= 0) return null;
+  if (coverage.scope === "catalogOnly") {
+    return { date: coverage.updatedForDate, total: todayCandidates, missing: null };
+  }
+  if (!Number.isSafeInteger(todayWithThreadUsage)
+    || todayWithThreadUsage < 0 || todayCandidates <= todayWithThreadUsage) return null;
+  return { date: coverage.updatedForDate, total: todayCandidates, missing: todayCandidates - todayWithThreadUsage };
+}
+
+type WorkGap = ReturnType<typeof getTodayWorkGap>;
+
+function selectedWorkGap(gap: WorkGap, selectedSources: SourceSelection, range: UsageRange, startDate: string, endDate: string) {
+  if (!gap || (selectedSources.length > 0 && !selectedSources.includes("codex"))) return null;
+  if (range === "custom" && !(startDate <= gap.date && gap.date <= endDate)) return null;
+  return gap;
+}
+
+function WorkCoverageNote({ gap, cost = false }: { gap: WorkGap; cost?: boolean }) {
+  if (!gap) return null;
+  const activity = gap.missing === null
+    ? `本机记录了 ${gap.total} 个今天有活动的 Work 会话，尚未核对会话用量。`
+    : `今天有 ${gap.total} 个活跃 Work 会话，其中 ${gap.missing} 个尚未取到 Token 明细。`;
+  return <p className="muted-copy" role="status">{activity}{cost ? "当前费用只按已采集的 Token 估算。" : "当前 Token 统计仅包含已采集的用量。"}</p>;
+}
+
 interface FilterProps {
   usage: DashboardSnapshot["deviceUsage"];
   range: UsageRange;
@@ -768,6 +797,7 @@ interface FilterProps {
 
 export function ActivityView({
   usage,
+  workGap,
   sourceHealth,
   range,
   onRangeChange,
@@ -794,6 +824,7 @@ export function ActivityView({
   onSaveProjectMergeRules,
   onOpenExport,
 }: FilterProps & {
+  workGap: WorkGap;
   sourceHealth: SourceHealthSummary[];
   summary: DeviceUsageRangeSummary | null;
   insightSummary: DeviceUsageRangeSummary | null;
@@ -819,7 +850,7 @@ export function ActivityView({
         <button type="button" className={activityMode === "codex" ? "is-active" : ""} aria-pressed={activityMode === "codex"} onClick={() => setActivityMode("codex")}>Codex Token</button>
       </div>
       {usage && activityMode === "codex" ? (
-        <CodexTokenView usage={usage} range={codexRange} onRangeChange={setCodexRange} />
+        <CodexTokenView usage={usage} workGap={workGap} range={codexRange} onRangeChange={setCodexRange} />
       ) : usage ? (
         <>
           <UnifiedFilters
@@ -844,6 +875,7 @@ export function ActivityView({
           {summary && (
             <ActivityDashboard
               summary={summary}
+              workGap={selectedWorkGap(workGap, selectedSources, range, appliedCustomStartDate, appliedCustomEndDate)}
               sources={usage.sources}
               range={range}
               rangeLabel={formatRangeLabel(range, appliedCustomStartDate, appliedCustomEndDate)}
@@ -884,10 +916,12 @@ export function ActivityView({
 
 function CodexTokenView({
   usage,
+  workGap,
   range,
   onRangeChange,
 }: {
   usage: DeviceUsageSummary;
+  workGap: WorkGap;
   range: Exclude<UsageRange, "custom">;
   onRangeChange: (range: Exclude<UsageRange, "custom">) => void;
 }) {
@@ -910,7 +944,7 @@ function CodexTokenView({
       <div className="codex-token-grid">
         <article className="content-card token-card codex-token-card">
           <header>
-            <div><p className="eyebrow">Codex · {rangeLabel}</p><h2>{formatTokens(summary.usage.totalTokens)} Token</h2></div>
+            <div><p className="eyebrow">Codex · {rangeLabel}</p><h2>{formatTokens(summary.usage.totalTokens)} Token</h2><WorkCoverageNote gap={workGap} /></div>
             <span className="soft-pill">缓存读入 {cacheShare === null ? "—" : formatPercent(cacheShare * 100)}</span>
           </header>
           <div className="token-body">
@@ -925,7 +959,7 @@ function CodexTokenView({
           {summary.byModel.length > 0 ? <ol>{summary.byModel.map((model) => <li key={model.key}><div><strong>{model.label}</strong><span>{formatTokens(model.usage.totalTokens)} Token</span></div><b>{formatPercent(summary.usage.totalTokens > 0 ? model.usage.totalTokens / summary.usage.totalTokens * 100 : 0)}</b></li>)}</ol> : <p className="muted-copy">该时间范围暂无模型明细。</p>}
         </article>
       </div>
-      <div className="privacy-callout"><Icon name="shield" /><div><strong>只读本机 Codex 用量</strong><p>此视图读取本机派生日志，不会向 Codex 创建对话、发送消息或发起推理。</p></div></div>
+      <div className="privacy-callout"><Icon name="shield" /><div><strong>Codex 用量来源</strong><p>汇总本机会话日志、桌面用量记录和已同步的 Work 会话明细。</p></div></div>
     </div>
   );
 }
@@ -1062,6 +1096,7 @@ function UnifiedFilters({
 
 function ActivityDashboard({
   summary,
+  workGap,
   sources,
   range,
   rangeLabel,
@@ -1073,6 +1108,7 @@ function ActivityDashboard({
   onSaveProjectMergeRules,
 }: {
   summary: DeviceUsageRangeSummary;
+  workGap: WorkGap;
   sources: UsageSourceSummary[];
   range: UsageRange;
   rangeLabel: string;
@@ -1123,6 +1159,7 @@ function ActivityDashboard({
             <h2 title={formatExactTokens(summary.usage.totalTokens)}>
               {formatTokens(summary.usage.totalTokens)} Token
             </h2>
+            <WorkCoverageNote gap={workGap} />
           </div>
           <span className="soft-pill">
             缓存读入{" "}
@@ -1673,6 +1710,7 @@ export function PricingView({
   message,
   onSave,
   onImport,
+  onImportCli,
   onExport,
   transferBusy = false,
 }: {
@@ -1686,6 +1724,7 @@ export function PricingView({
   message: string | null;
   onSave: () => Promise<void>;
   onImport?: () => void;
+  onImportCli?: () => void;
   onExport?: () => void;
   transferBusy?: boolean;
 }) {
@@ -1728,7 +1767,9 @@ export function PricingView({
         eyebrow="MANUAL API PRICING"
         title="模型定价"
         description="价格完全由你在本机维护；应用不再内置或自动回退到任何模型 API 价格。"
-        actions={<div className="pricing-actions"><span role="status">{dirty ? "有未保存修改" : "价格已保存"}</span>{onImport && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onImport}>导入 JSON</button>}{onExport && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onExport} title="导出已保存的整套配置，未保存修改不会包含在文件中">导出 JSON</button>}<button className="secondary-button" type="button" disabled={!dirty || isSaving || transferBusy} onClick={onDiscard}>放弃修改</button><button className="primary-button" type="button" disabled={isSaving || transferBusy || !dirty} onClick={() => void onSave()}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>{onRecalculate && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onRecalculate}>重试费用重算</button>}</div>}
+        actions={<div className="pricing-actions"><span role="status">{dirty ? "有未保存修改" : "价格已保存"}</span>
+          {onImportCli && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onImportCli}>从本机 Claude Code 导入长上下文规则</button>}
+          {onImport && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onImport}>导入 JSON</button>}{onExport && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onExport} title="导出已保存的整套配置，未保存修改不会包含在文件中">导出 JSON</button>}<button className="secondary-button" type="button" disabled={!dirty || isSaving || transferBusy} onClick={onDiscard}>放弃修改</button><button className="primary-button" type="button" disabled={isSaving || transferBusy || !dirty} onClick={() => void onSave()}>{isSaving ? "保存并重算中…" : "保存价格并重算"}</button>{onRecalculate && <button className="secondary-button" type="button" disabled={isSaving || transferBusy} onClick={onRecalculate}>重试费用重算</button>}</div>}
       />
       <article className="content-card peak-pricing-card">
         <header><div><p className="eyebrow">PEAK PRICING</p><h2>高峰期定价</h2><p>按指定时区、星期和时段计算；只有加入下方白名单的模型才会使用高峰倍率。</p></div><span className="soft-pill">跨午夜时段也支持</span></header>
@@ -1752,7 +1793,7 @@ export function PricingView({
                 </div>
               </div>
             ))}
-            {draft.peak.windows.length === 0 && <p className="muted-copy">当前没有高峰时段，所有日期均按常规定价。</p>}
+            {draft.peak.windows.length === 0 && <p className="muted-copy">当前没有高峰时段，高峰倍率不会生效。</p>}
           </div>
           <p className="peak-schedule-hint">跨午夜时段按用量发生当天的星期判断；例如选周一至周五时，周六凌晨不会进入高峰。</p>
         </div>
@@ -1767,7 +1808,7 @@ export function PricingView({
         </div>
         <div className="peak-model-selector">
           <div className="peak-model-selector__heading">
-            <div><strong>指定适用模型</strong><p>未选中的模型始终使用常规定价，不受高峰时段和倍率影响。</p></div>
+            <div><strong>指定适用模型</strong><p>选中的模型在高峰时段应用高峰倍率。</p></div>
             <span>{peakModelCount} 个模型</span>
           </div>
           <div className="peak-model-options" role="group" aria-label="高峰定价适用模型">
@@ -1779,7 +1820,7 @@ export function PricingView({
                   checked={model.peakEnabled}
                   onChange={(event) => updateModel(model.modelId, { peakEnabled: event.target.checked })}
                 />
-                <span><strong>{model.displayName}</strong><small>{model.peakEnabled ? "应用高峰倍率" : "仅常规定价"}</small></span>
+                <span><strong>{model.displayName}</strong><small>{model.peakEnabled ? "应用高峰倍率" : "高峰倍率关闭"}</small></span>
               </label>
             ))}
             {usedModels.length === 0 && <span className="muted-copy">发现使用过的模型后，可在这里指定高峰定价白名单。</span>}
@@ -1796,13 +1837,31 @@ export function PricingView({
             <article className="content-card model-price-card" key={model.modelId}>
               <header>
                 <div className="model-price-rank"><span>{String(index + 1).padStart(2, "0")}</span><div><h2>{model.displayName}</h2><p>{formatTokens(tokens)} Token · 累计消耗</p></div></div>
-                <div className="model-price-status"><span className={model.peakEnabled ? "is-peak-assigned" : "is-standard-only"}>{model.peakEnabled ? "高峰白名单" : "仅常规定价"}</span><span className={configured ? "is-configured" : "is-unpriced"}>{configured ? "已完整定价" : "仍有未定价项"}</span><label><span>币种</span><select aria-label={`${model.displayName} 币种`} value={model.currency} onChange={(event) => updateModel(model.modelId, { currency: event.target.value as "USD" | "CNY" })}><option value="USD">USD $</option><option value="CNY">CNY ¥</option></select></label></div>
+                <div className="model-price-status"><span className={model.peakEnabled ? "is-peak-assigned" : "is-standard-only"}>{model.peakEnabled ? "高峰白名单" : "高峰倍率关闭"}</span><span className={configured ? "is-configured" : "is-unpriced"}>{configured ? "已完整定价" : "仍有未定价项"}</span><label><span>币种</span><select aria-label={`${model.displayName} 币种`} value={model.currency} onChange={(event) => updateModel(model.modelId, { currency: event.target.value as "USD" | "CNY" })}><option value="USD">USD $</option><option value="CNY">CNY ¥</option></select></label></div>
               </header>
               <div className="model-price-fields">
                 {rateInput(model, "inputPerMillion", "新输入")}
                 {rateInput(model, "cachedInputPerMillion", "缓存读入")}
                 {rateInput(model, "cacheWritePerMillion", "缓存写入")}
                 {rateInput(model, "outputPerMillion", "输出")}
+              </div>
+              <div className="model-long-context">
+                <label className="peak-holiday-toggle">
+                  <input type="checkbox" aria-label={`${model.displayName} 长上下文加价`} checked={!!model.longContext}
+                    onChange={event => updateModel(model.modelId, { longContext: event.target.checked ? { threshold: "", inputMultiplier: "", outputMultiplier: "" } : null })} />
+                  <span>长上下文加价</span>
+                </label>
+                {model.longContext && <>
+                  <p className="peak-schedule-hint">单次请求的新输入、缓存读入和缓存写入合计严格超过门槛时，对整笔输入和输出分别应用倍率。</p>
+                  <div className="long-context-fields">
+                    {([["threshold", "输入门槛（Token）"], ["inputMultiplier", "输入倍率"], ["outputMultiplier", "输出倍率"]] as const).map(([field, label]) => (
+                      <label key={field} className="price-field"><span>{label}</span>
+                        <input type="text" inputMode={field === "threshold" ? "numeric" : "decimal"} aria-label={`${model.displayName} ${label}`}
+                          value={model.longContext![field]} onChange={event => updateModel(model.modelId, { longContext: { ...model.longContext!, [field]: event.target.value } })} />
+                      </label>
+                    ))}
+                  </div>
+                </>}
               </div>
             </article>
           );
@@ -1816,6 +1875,7 @@ export function PricingView({
 
 export function CostView({
   usage,
+  workGap,
   range,
   onRangeChange,
   selectedSources,
@@ -1835,7 +1895,7 @@ export function CostView({
   summary,
   onOpenPricing,
   onOpenExport,
-}: FilterProps & { summary: DeviceUsageRangeSummary | null; onOpenPricing: () => void; onOpenExport: () => void }) {
+}: FilterProps & { summary: DeviceUsageRangeSummary | null; workGap: WorkGap; onOpenPricing: () => void; onOpenExport: () => void }) {
   if (!usage || !summary)
     return (
       <section className="view-panel">
@@ -1887,6 +1947,7 @@ export function CostView({
         isLoadingCustomRange={isLoadingCustomRange}
         customRangeError={customRangeError}
       />
+      <WorkCoverageNote gap={selectedWorkGap(workGap, selectedSources, range, appliedCustomStartDate, appliedCustomEndDate)} cost />
       <div className="cost-kpis">
         <MetricCard
           eyebrow="USD 估算"
@@ -1953,6 +2014,7 @@ export function CostView({
           <span>USD {formatMoney("$", totals.usd)}</span>
           <span>CNY {formatMoney("¥", totals.cny)}</span>
           <span>未定价 {formatExactTokens(totals.unpricedTokens)}</span>
+          {!!totals.longContextUnconfirmedEvents && <span>长上下文档位未确认 · {totals.longContextUnconfirmedEvents} 条记录按基础档估算</span>}
         </footer>
       </article>
       <div className="privacy-callout">
@@ -2825,17 +2887,15 @@ function formatMoney(symbol: "$" | "¥", value: number): string {
   return `${symbol}${new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(value)}`;
 }
 function formatCostCompact(
-  cost: { usd: number; cny: number; unpricedTokens: number } | null | undefined,
+  cost: TokenCost | null | undefined,
 ): string {
   if (!cost) return "—";
   const parts: string[] = [];
   if (cost.usd > 0) parts.push(formatMoney("$", cost.usd));
   if (cost.cny > 0) parts.push(formatMoney("¥", cost.cny));
-  return parts.length
-    ? parts.join(" · ")
-    : cost.unpricedTokens > 0
-      ? "部分未定价"
-      : "$0.00";
+  if (!parts.length) parts.push(cost.unpricedTokens > 0 ? "部分未定价" : "$0.00");
+  if (cost.longContextUnconfirmedEvents) parts.push("长上下文档位未确认");
+  return parts.join(" · ");
 }
 function formatSourceCost(row: CostDetailRow): string {
   if (row.source.status === "ready") return formatCostCompact(row.cost);
